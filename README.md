@@ -1,150 +1,197 @@
 # KonomiTV 利用体験の改善 — 修正候補と検証結果
 
-KonomiTVと関連ライブラリについて、修正案とその検証結果をまとめています。個別に確認できる公開コードを先に示し、統合版で検証中の変更と未解決の問題を後に続けます。KonomiTV本体の配布リポジトリではありません。
+KonomiTVおよび関連ライブラリ（DPlayer、mpeg2toh264）について、PC・タブレット・スマートフォンをまたいでテレビライブや録画番組をストレスなく視聴できる体験（YouTube、Amazon Prime Video、Netflix等に匹敵する滑らかで途切れない再生）を目指した、不具合調査・修正候補・実機検証の記録です。
 
-不具合ごとの症状・進捗・解決の条件は、[Issue一覧](https://github.com/libratechw/konomitv-experience/issues)にまとめています。このREADMEでは、修正候補と検証の到達点を横断して説明します。
+※本リポジトリはKonomiTV本体の配布元ではありません。上流（本体および各ライブラリ）への改善提案と検証データの共有を目的としています。
 
-## 公開済みの修正候補
+進捗管理や個別の議論は[Issue一覧](https://github.com/libratechw/konomitv-experience/issues)が、検証指標と合格判定の定義は[測定方法（METHODOLOGY.md）](METHODOLOGY.md)が、詳細なログと技術的背景は[調査報告（REPORT.md）](REPORT.md)が正本です。
 
-2026年9月12日時点。以下は上流への提案を検討している変更で、採用済み・提出準備完了を意味しません。各リンク先でコードを確認できます。確認済みの効果と、取り込み判断に残る検証を併記しています。
+---
 
-### 画質切替後に古い映像のイベントが干渉する問題
+## KonomiTV とこのリポジトリについて
 
-**DPlayer：切替前のvideoから届くイベントと、遅れて返る`play()`の拒否を、切替後のvideoへ作用させない修正です。** Galaxyの比較試験では、現行videoのイベント・失敗処理、画質切替、全画面、キャプチャ、再生進行を維持しました。
+KonomiTVは、PCやスマートフォンのWebブラウザから地上波・BS・CSのリアルタイム視聴（TVライブ）や録画番組の視聴を行えるWebアプリケーションです。録画サーバー（EDCB等）やチューナーサービス（Mirakurun等）と連携し、HLSや独自再生エンジン（mpeg2toh264 / WebAssembly）による画質選択（Original / 1080p / 720p等）を提供しています。
 
-iOSの`InvalidStateError`やライブOriginal開始失敗への効果、同じvideoを使う`switchVideo()`は未確認です。後述の「切替中に押した再生・停止が引き継がれない問題」とは別の変更です。
+本プロジェクトでは、特に「再生が途中で止まる」「画質を切り替えるとエラーになる」「一時停止から復帰しない」といった視聴体験を損なう問題の解消に向けて、各コンポーネントの挙動を実機で計測・検証しています。
 
-[コード：ignore-stale-video-events](https://github.com/libratechw/DPlayer/tree/candidate/ignore-stale-video-events) · 検証対象 `8e49bb7`
+---
 
-### 画質切替ごとにエラー処理が重複登録される問題
+## 視聴環境と最初の再生（最短の手順と現実的な期待値）
 
-**KonomiTV：DPlayerのNative error handlerを、画質切替ごとではなくDPlayerごとに1回だけ登録します。** エラーの受付時とライブの待機後に、対象videoと再生backendが現在のものかを照合します。型検査・ESLint・提出前レビューを通過しています。
+### 想定・確認環境
+- **PC**: Windows（Chrome）、Mac（Safari）
+- **タブレット**: iPad Air（第5世代）、iPad mini（第6世代）
+- **スマートフォン**: iPhone 15、Android（Galaxy、POCO X3 GT）
 
-iOSでのHLS→Original反復切替、現行HLS videoのエラーによる再起動、待機中の画質切替・再生成について、実機確認が残っています。再起動連鎖の解消を実機で確認した段階ではありません。
+### 最初の再生と推奨設定
+1. **確実な再生開始**:
+   - 初期画質が「1080p」（HLS）の場合、多くの環境で最も安定して再生を開始できます。
+   - 一部の環境（iOS/iPadOSなど）では、初期画質を「Original」（mpeg2toh264）に設定していると、チャンネル選択後に自動で再生が始まらず、画面中央やコントローラーの再生ボタンを押す必要があります。
+2. **Original画質（無劣化ストリーム）の利用**:
+   - 画質切替やシーク時に一時的な停止やエラー（`InvalidStateError`等）が発生する場合があります。途中で停止した場合は、プレイヤーの再起動や画質の再選択で復帰することが確認されています。
+3. **一時停止と再開**:
+   - TVライブのOriginal画質で長時間（120秒など）一時停止した場合、停止状態は維持されますが、再開時に再生位置がライブ先端へリセットされる、または再生開始までに追加の操作が必要になることがあります。
 
-[コード：register-native-error-once](https://github.com/libratechw/KonomiTV/tree/candidate/register-native-error-once) · 検証対象 `03143a5`
+---
 
-### autoFilmの解析負荷を減らす
+## 利用者視点での主な症状と現在の到達点
 
-**mpeg2toh264：autoFilmの判定結果を変えずに、解析処理を短縮する変更です。** 4素材のオフライン解析で約6〜9%短縮し、Galaxyの診断でも同期解析時間の短縮を確認しました。
+### 1. TVライブ Original再生の開始不能・同期ガード
+- **利用者の目に見える症状**:
+  TVライブをOriginal画質で開始しようとした際、または1080pからOriginalへ切り替えた際に、バッファを読み込んだまま再生時刻が進まず画面が停止する現象が発生していました。
+- **原因と修正候補の範囲**:
+  DPlayer内部のライブ同期計算が、再生準備中に非有限値（NaN等）や負の値を算出し、それをvideo要素の再生位置に代入してしまうことが停止の一因となっていました。これを代入しないよう除外するガード処理を評価しています。
+- **現在の到達点と注意**:
+  iPad Air 5での消音自動測定（スクリプトからのplay呼び出し）では再生進行を確認し、iPhone 15やiPad mini 6の実機でも利用時の正常再生が観察されています。ただし、これは**同期ガードという局所的な修正候補の評価**であり、通常UIのタップによる開始確認や、未修正masterとの厳密な直接A/B比較は未完了です。**iOS全般の開始問題を包括的に解決したわけではありません。** また、Android（POCO）では未修正上流版でもこの開始不能は再現していません。
 
-これは解析時間の改善であり、全端末でコマ落ちや音ずれが減ることを示すものではありません。Windowsの同一runnerによる長時間比較、Galaxy以外の実表示、画素・可聴A/V同期の確認が残っています。
+### 2. TVライブの一時停止と再開
+- **利用者の目に見える症状**:
+  TVライブを一時停止したあと、再度再生ボタンを押しても映像が動かない、または再開までに長い待機時間が発生する。
+- **現在の到達点**:
+  停止状態の維持は確認できていますが、再生ボタン1回で確実に映像が復帰するかどうかは環境やタイミングに依存します。後述の未公開統合版において、切替中の論理状態を引き継ぐことで復帰率の改善を試みていますが、停止していた位置は失われ、最新時刻への再構築が発生します。
 
-[コード：autofilm-comb-score-indexing](https://github.com/libratechw/mpeg2toh264/tree/candidate/autofilm-comb-score-indexing) · `dcfe571` · [結果と限界](REPORT.md#autofilmの表示負荷)
+### 3. 画質切替・シーク時のエラー表示
+- **利用者の目に見える症状**:
+  録画やライブで画質を切り替えた際、あるいは連続してシークした際に、画面にエラーメッセージが表示されて再生が止まる。
+- **現在の到達点**:
+  DPlayer側で古いvideo要素のイベントを無視する修正（`candidate/ignore-stale-video-events`）や、KonomiTV側のエラーハンドラ多重登録を防ぐ修正（`candidate/register-native-error-once`）により、切替時の干渉を低減させています。ただし、Safariにおける`InvalidStateError`の根本解消には至っていません。
 
-### TSの欠損前に完成していた映像を残す
+---
 
-**mpeg2toh264：TS packetの欠落を検出したとき、既に完成したpictureまで捨てない修正です。** 2種類の欠損で映像sampleを10〜12枚多く保持し、Galaxyの1時間比較では、欠損1回あたりのbrowser drop中央値が13枚から2枚へ減りました。
+## 公開済みの修正候補（独立ブランチ一覧）
 
-正常TS、別の欠損、画素・可聴A/V同期の確認が残っています。異常区間の通過後にフレーム間隔が乱れる問題は、この修正で解消したとは判断していません。
+2026年9月12日時点。以下は上流への提案を検討している変更ですが、採用済みや提出準備完了を意味するものではありません。各候補のリンク先でコードを確認できます。検証内容（静的検証・オフライン検証・実機A/B）と、採用判断に残る未確認事項を分けて記載しています。
 
-[コード：preserve-complete-pictures-before-loss](https://github.com/libratechw/mpeg2toh264/tree/candidate/preserve-complete-pictures-before-loss) · `c3406ab`
+### 1. [DPlayer] 画質切替後に古い映像のイベントが干渉する問題
+- **コード**: [`candidate/ignore-stale-video-events`](https://github.com/libratechw/DPlayer/tree/candidate/ignore-stale-video-events)（検証対象: `8e49bb7`）
+- **内容**: 切替前のvideo要素から遅れて届くイベントや`play()`拒否が、切替後の新video要素を意図せずpauseさせる干渉を防ぎます。
+- **確認済み（実機A/B）**: Galaxyの比較試験で、旧videoのイベント中継（1回→0回）と拒否によるpause干渉（1回→0回）が解消し、現行videoの制御・画質切替・全画面・キャプチャ・再生進行が維持されることを確認しました。
+- **残る確認**: iOSでの`InvalidStateError`やライブOriginal開始失敗への効果、同じvideo要素を再利用する`switchVideo()`への影響は未確認です。
 
-### 描画待ちのフレームをまとめて捨てる処理を除く
+### 2. [KonomiTV] 画質切替ごとにエラー処理が重複登録される問題
+- **コード**: [`candidate/register-native-error-once`](https://github.com/libratechw/KonomiTV/tree/candidate/register-native-error-once)（検証対象: `03143a5`）
+- **内容**: DPlayerのNative error handlerを、画質切替ごとではなくDPlayer初期化時に1回だけ登録します。エラー受付時とライブ待機後に、対象videoと再生backendが現在のものかを照合します。
+- **確認済み（静的検証）**: 型検査、ESLint、提出前レビューを通過しています。
+- **残る確認**: iOSでのHLS→Original反復切替、現行HLS videoのエラーによる再起動、待機中の画質切替・再生成の実機確認が残っています。再起動連鎖の解消を実機で確認した段階ではありません。
 
-**mpeg2toh264：YADIFのqueue全消去と、queue内のslotを再利用するfallbackを削除する変更です。** 全6,386状態の列挙では、容量整理後のslot割当失敗は0件でした。正常60iの短時間試験でも既知の退行はありません。
+### 3. [mpeg2toh264] autoFilmの解析負荷を減らす
+- **コード**: [`candidate/autofilm-comb-score-indexing`](https://github.com/libratechw/mpeg2toh264/tree/candidate/autofilm-comb-score-indexing)（検証対象: `dcfe571`）
+- **内容**: comb score算出時の行参照をpixel loop外へ移し、判定結果を変えずに同期解析処理を短縮します。
+- **確認済み（オフライン検証・実機診断）**: 4素材のオフライン解析で約6〜9%の短縮と判定結果の一致を確認しました。Galaxyの実機診断でも同期解析時間（17.7ms→16.8ms）の短縮を確認しています。
+- **残る確認**: 解析処理時間の改善であり、全端末でのコマ落ちや音ずれ軽減を示すものではありません。Windowsの同一runnerによる全編再生比較では候補の短縮を確認できず、Galaxy以外の実表示、画素品質、可聴A/V同期の確認が残っています（[REPORT.mdのautoFilmの表示負荷](REPORT.md#autofilmの表示負荷)）。
 
-実機での改善効果、異常TSからの長時間復帰、Worker描画、可聴A/V同期は未確認です。状態列挙の成功だけで、実際の表示品質が改善するとは判断しません。
+### 4. [mpeg2toh264] TSの欠損前に完成していた映像を残す
+- **コード**: [`candidate/preserve-complete-pictures-before-loss`](https://github.com/libratechw/mpeg2toh264/tree/candidate/preserve-complete-pictures-before-loss)（検証対象: `c3406ab`）
+- **内容**: TS packet欠落を検出した際、欠落直前までに完成していたpictureまで破棄しないようにします。
+- **確認済み（オフライン検証・実機A/B）**: 2種類の欠損パターンで映像sampleが10〜12枚多く残ることをオフラインで確認しました。Galaxyの1時間比較では、欠損1回あたりのbrowser drop（`droppedVideoFrames`）中央値が13枚から2枚へ減少しました。
+- **残る確認**: 正常TS、別の欠損パターン、画素品質、可聴A/V同期は未確認です。異常区間通過後にフレーム間隔が乱れる問題（cadence不良）は、この修正で解消したとは判断していません。
 
-[コード：yadif-queue-fallback-removal](https://github.com/libratechw/mpeg2toh264/tree/candidate/yadif-queue-fallback-removal) · `2bc48a0`
+### 5. [mpeg2toh264] 描画待ちのフレームをまとめて捨てる処理を除く
+- **コード**: [`candidate/yadif-queue-fallback-removal`](https://github.com/libratechw/mpeg2toh264/tree/candidate/yadif-queue-fallback-removal)（検証対象: `2bc48a0`）
+- **内容**: YADIFのqueue全消去と、空きslot不足時にqueued slotを上書き再利用するfallbackを削除します。
+- **確認済み（静的網羅検証・単体テスト）**: 全6,386状態の列挙で、容量整理後のslot割当失敗が0件であることを確認しました。正常60iの短時間試験でも既知の退行はありません。
+- **残る確認**: 実機での改善効果、異常TSからの長時間復帰、Worker描画、可聴A/V同期は未確認です。状態列挙の成功だけで実際の表示品質が改善するとは判断しません。
 
-### 録画の終端でHTTP rangeが416になる場合の完了処理
+### 6. [mpeg2toh264] 録画の終端でHTTP rangeが416になる場合の完了処理
+- **コード**: [`candidate/complete-exhausted-http-range-v2`](https://github.com/libratechw/mpeg2toh264/tree/candidate/complete-exhausted-http-range-v2)（先端・dist `d011466` / source `9c0b1c7`、基点 `faf1464`）
+- **内容**: 既知のファイル総量以降へのrange要求がHTTP 416で拒否された場合に限り、変換済み出力を処理して再生を完了（EOF）させます。それ以外の失敗はエラーとして停止します。
+- **確認済み（自動テスト・静的検証）**: 実装を直接使う`test-range-eof`、型検査、既存テスト、ビルド、独立レビューを通過しています。
+- **残る確認**: iPadの録画Originalでの再現・効果確認、正常TS、画素品質、可聴A/V同期は未確認です。Safariの録画停止全般を解消する修正とは判断していません。
 
-**mpeg2toh264：既知のファイル総量以降へのrange要求がHTTP 416で拒否された場合に限り、変換済み出力を処理して再生を完了させます。** それ以外の失敗は、range位置を添えて従来どおり停止します。実装を直接使う`test-range-eof`、型検査、既存テスト、ビルド、独立レビューを通過しています。
-
-iPadの録画Originalでの再現・効果確認、正常TS、画素・可聴A/V同期は未確認です。
-
-[コード：complete-exhausted-http-range-v2](https://github.com/libratechw/mpeg2toh264/tree/candidate/complete-exhausted-http-range-v2) · 先端・dist `d011466` / source `9c0b1c7`（基点 `faf1464`）
+---
 
 ## 設計を再検討している公開案
 
 ### タッチ端末の中央操作ボタン表示
+- **コード**: [`candidate/touch-center-controls`](https://github.com/libratechw/KonomiTV/tree/candidate/touch-center-controls)（検証対象: `45d9a59`）
+- **確認済み（実機A/B）**: Galaxyの横画面・録画再生・中央実タップにおいて、CSSセレクタ補正により中央操作ボタンが表示されることを確認しました（[実機比較](results/galaxy-touch-center-controls-live-ab.json)）。
+- **課題と再検討**: 画面タップがUI表示ではなく再生・停止になる挙動があり、ボタン表示だけでなくデスクトップ／モバイルの操作判定を含めて見直しています。**この表示補正単独での取り込みは推奨していません。** POCOの実タップ、全画面、視認性、長時間操作は未確認です。Windowsは非タッチ表示のみ確認しています。
 
-KonomiTVの表示判定を補う変更では、Galaxyの横画面・録画再生・中央タップで操作ボタンが表示されることを確認しました。ただし、画面タップがUI表示ではなく再生・停止になる挙動もあり、ボタン表示だけでなくデスクトップ／モバイルの操作判定を含めて見直しています。**この表示補正だけを最終案として推奨しているわけではありません。**
+---
 
-POCOの実タップ、全画面、視認性、長時間操作は未確認です。Windowsは候補版の非タッチ表示のみ確認しています。
+## dogfood統合環境と検証中の修正
 
-[現行案：touch-center-controls](https://github.com/libratechw/KonomiTV/tree/candidate/touch-center-controls) · `45d9a59` · [実機比較](results/galaxy-touch-center-controls-live-ab.json)
+複数の変更を統合して評価する公開branchは[`dogfood/integration`](https://github.com/libratechw/KonomiTV/tree/dogfood/integration)です。
 
-## dogfoodで検証中の修正
-
-複数の変更を統合して評価する公開branchは、[KonomiTVの`dogfood/integration`](https://github.com/libratechw/KonomiTV/tree/dogfood/integration)です。個別修正の取り込み先ではありません。公開branchの構成は、その中の`Readme.md`を参照してください。
-
-**公開branchと、実機で測定した配備版は同一とは限りません。** 2026年9月12日の確認時点で公開先端は`9adfec3`ですが、以下の追加修正を測定した配備版はKonomiTV source `3b8aed1` / dist `e6d9cf7`、DPlayer `2499f05`です。このdistとDPlayerの変更はまだ公開していません。以下の結果は各節に記した版と条件に限り、公開branchの最新先端全体を保証しません。
+> **配備版に関する注意**: 実機測定を行った配備版（KonomiTV source `3b8aed1` / dist `e6d9cf7`、DPlayer `2499f05`）には**未公開のローカルコミット**が含まれており、公開branchの先端（`9adfec3`）と同一ではありません。以下の測定結果は記載した特定ビルド・条件に限定され、公開先端全体を保証するものではありません。また、dogfoodにのみ含まれる修正が将来独立候補として公開されるかは未定です。
 
 ### TVライブの一時停止と再開
+Original設定で120秒一時停止し、再生ボタンを1回押す試験です。「停止維持」「再開後の時刻進行」「停止位置の保持」を別指標として評価しています。
 
-以下は、停止保持の変更を入れた旧測定版source `3b8aed1` / dist `56f83a7`、DPlayer `2467f23`の結果です。2026年9月12日に測定しました。後述する画質切替中の操作意図の修正を追加する前の結果であり、新しい配備版の効果確認ではありません。
+- **旧測定版（KonomiTV source `3b8aed1` / dist `56f83a7`、DPlayer `2467f23`）**:
+  - POCO / Android Chrome（低遅延OFF/ON各2回、計4回）:
+    - 停止維持: 4/4（120秒待機中に勝手に再生されない）
+    - 再開後の時刻進行: OFF 2/2、ON 1/2（15秒以内に進行）
+    - 停止位置の保持: 0/4（全4件で再構築により停止位置喪失）
+  - Mac / Safari（低遅延OFF/ON各1回）: 120秒待機後、単一操作で再生時刻・フレーム数が進行。厳密な映像要求経路は未捕捉。
+  - 両環境とも物理表示、可聴音声、A/V同期は未確認です。
 
-Original設定で120秒一時停止し、再生ボタンを1回押す試験を行いました。
-
-| 環境 | 試行数 | 停止・再開の結果 |
-| --- | --- | --- |
-| POCO / Android Chrome | 低遅延OFF・ON各2回 | 待機中に勝手に再生されないことは4/4で確認。操作後15秒以内の復帰はOFF 2/2、ON 1/2。一方、再構築で停止時の再生位置は4/4で失われました。 |
-| Mac / Safari | 低遅延OFF・ON各1回 | 120秒待機後、単一操作で再生時刻・フレーム数が進行。厳密な映像要求経路は未捕捉。 |
-
-**停止を保つことと、再生ボタン1回で確実に復帰することは別で、後者は未解決です。** POCOのON失敗例では、操作直後のvideo交換後に時刻0のまま15秒停止しました。物理表示、可聴音声・A/V同期は両環境とも未確認です。少数試行の成功率を、旧版からの改善量とは扱いません。[比較版・条件・残課題](REPORT.md#tvライブの一時停止と再開)
-
-### 画質切替中に押した再生・停止が引き継がれない問題
-
-DPlayerの`switchQuality()`が切替開始時の`video.paused`を使い続け、途中の再生・停止操作を新しいvideoへ引き継がないことが原因仮説です。DPlayer自身が持つ論理的な停止状態を参照する実装候補は独立レビューを通過し、dogfoodへ配備しました。
-
-配備版はDPlayer `2499f05`、KonomiTV dist `e6d9cf7`です。いずれもローカルコミットで、コードはまだ公開していません。POCOでLive Originalを120秒一時停止し、低遅延OFF/ON各3回、計6回すべてで停止保持と再生ボタン1回による15秒以内の再生時刻の進行を確認しました。うち5回は再生操作後にもvideoが交換されましたが、その後に進行しました。
-
-停止位置は全6回で失われており、旧版にも成功例があるため、この件数だけで再現頻度の改善や問題全体の解消とは判断できません。物理表示・可聴音声・A/V同期・長時間安定性と、media errorからの復元を直接確認するテストも未確認です。上記の公開済み修正候補には含めず、[Issue #1の確定集計](https://github.com/libratechw/konomitv-experience/issues/1#issuecomment-5638943561)で採否を追跡します。
-
-開始時の追加操作についても訂正しました。自動遷移で視聴画面へ入った今回の試験では、ONだけでなくOFFも含む全6回で、自動では再生が始まらず、一時停止試験を始める前に再生ボタンを各1回押す必要がありました。120秒停止後の復帰操作は、それとは別の1回です。通常のチャンネル一覧から入った場合にも起きるかは未確認で、[開始時の問題（Issue #2）](https://github.com/libratechw/konomitv-experience/issues/2#issuecomment-5638943751)として分けています。
+- **新測定版（未公開: KonomiTV dist `e6d9cf7` / DPlayer `2499f05`）**:
+  - `switchQuality()`が開始時のnative `video.paused`を保持し続け、途中の操作意図が新videoへ引き継がれない仮説に対し、DPlayerが保持する論理状態（`this.paused`）を参照する修正をdogfood配備版に組み込みました。
+  - POCO / Android Chrome（低遅延OFF/ON各3回、計6回）:
+    - 停止維持: 6/6
+    - 再開後の時刻進行: 6/6（15秒以内に進行。うち5回は操作後にもvideoが交換された後に進行）
+    - 停止位置の保持: 0/6（全6件で停止位置喪失）
+    - 開始時の追加操作: 視聴画面へ自動遷移した全6回で自動再生が始まらず、一時停止試験の前に開始ボタンを各1回押す必要がありました（停止後の復帰操作とは別）。
+  - **残る確認**: 旧版にも成功例があり、この件数だけで再現頻度の改善や問題の全解消とは判断できません。物理表示、可聴音声、A/V同期、長時間安定性、media errorからの復旧テストは未確認です（[Issue #1 確定集計](https://github.com/libratechw/konomitv-experience/issues/1#issuecomment-5638943561)、[Issue #2 開始条件](https://github.com/libratechw/konomitv-experience/issues/2#issuecomment-5638943751)）。
 
 ### 統合版での録画Originalの短時間確認
+- 未公開の配備版（dist `e6d9cf7` / DPlayer `2499f05`）を用い、POCOのChromeで同一録画をOriginal画質で3回再生しました。
+- 対象録画へのHTTP 206応答、1秒以上の再生時刻進行、取得した状態（各試行5回の観測窓、計15回）にmedia errorがないことを確認し、3/3で通過しました（先行runner障害2件は分母から除外）。録画のため低遅延ON/OFFは条件外です。
+- **残る確認**: 個々の再生時刻やHTTP 206件数は集計に保存されておらず、実際の画面表示、可聴音声、A/V同期、実指タップ、長時間安定性は未確認です。Safariの録画停止解消や個別修正の効果を示す比較ではありません。
 
-2026年9月12日、上記のdist `e6d9cf7`／DPlayer `2499f05`を使い、POCOのChromeで同じ録画をOriginal画質で3回再生しました。3回とも、対象の録画要求へのHTTP 206応答、1秒以上の再生時刻の進行、取得した状態にmedia errorがないことを要求する判定条件を通過しました。状態取得は各試行5回で、試行数とは別です。録画再生なので低遅延ON/OFFは条件に含めていません。
-
-有効な製品試行は3/3、製品失敗は0です。先行するrunner障害2件は製品の再生に到達していないため、この分母に含めていません。3回とも画質設定の復元と、測定用タブ・接続の後片付けを確認しました。
-
-これは検証済みrunnerの判定条件を通過した短時間の証拠です。個々の再生時刻とHTTP 206の件数は集計に保存しておらず、実際の画面の見え方、可聴音声・A/V同期、実指タップ、引っ掛かり、長時間安定性は未確認です。Safariの録画停止の解消や、個別修正の効果を示す比較試験ではありません。
-
-### TVライブOriginalの開始時に不正な位置へ同期する問題
-
-DPlayerの同期先が非有限値や負の値のときに、videoへ代入しない変更をdogfoodへ反映しています。iPad Air 5では、消音状態で`HTMLMediaElement.play()`を直接呼ぶ自動測定で再生進行を比較しました。通常UIのタップによる開始を確認した試験ではありません。これとは別に、ユーザー自身がiPhone 15・iPad mini 6で、初期Original、画質・チャンネル切替、低遅延OFF/ONでの正常な再生を確認しました。
-
-ただし、未修正上流と単独候補の同条件比較は未完了です。POCOでは未修正上流版でも、開始不能は12試行で一度も再現していません。全環境共通の原因や修正効果とは判断していません。[実装と確認範囲](REPORT.md#tvライブoriginalの開始不能) · [iPadの測定集計](results/ipad-live-original-negative-sync-guard.json) · [Issue #3](https://github.com/libratechw/konomitv-experience/issues/3)
+---
 
 ## 継続して確認している問題
 
-- **初期設定Originalで自動開始しない問題**：iPhone・iPadでは再生ボタンが必要でした。この利用時の観測はビルドを特定しておらず、上記の統合版での再現確認とは扱いません。ボタンを押しても進まない開始不能や、一時停止後の復帰とは分けて調査します。[Issue #2](https://github.com/libratechw/konomitv-experience/issues/2)
-- **Windowsネイティブ環境のAMD VCE**：IdeaPadのTVライブ1080pを低遅延OFF/ON各1回測定し、再生時刻の進行と、その間のVCEEncCプロセスの稼働を確認しました。別に行った各30分のブラウザ状態監視では、画質ラベルがOriginalで再起動0でしたが、その間のVCE利用や映像の連続表示は未証明です。物理画面での見え方、可聴音声・A/V同期の確認が残り、VCEの長時間受入合格やLinuxのAMD runtime互換性は主張していません。[確認条件](REPORT.md#windowsネイティブ環境のvce再生)
-- **Safariの録画Original停止と、異常TS通過後の復帰**：ライブ開始や古いvideoのイベントを修正した結果だけで、これらも解消したとは判断していません。
-- **端末ごとの描画差**：Androidの描画を一律にメインスレッドへ移す案は、GalaxyとPOCOで結果が逆転したため撤回しました。
+- **初期設定Originalで自動開始しない問題**: iPhone・iPadでは再生ボタンが必要でした。利用時観察のビルドは特定されておらず、通常UI操作による他端末比較と原因特定を進めています（[Issue #2](https://github.com/libratechw/konomitv-experience/issues/2)）。
+- **Windowsネイティブ環境のAMD VCE**: IdeaPadのTVライブ1080pで再生時刻進行とVCEEncCプロセスの稼働（`--adapt-resolution 1920x1080`）を確認しました。別に行った画質ラベルOriginalでの各30分ブラウザ状態監視（再起動0）も確認していますが、30分間のVCE利用や映像の連続表示は未証明です。物理画面、可聴音声、A/V同期は未確認であり、VCEの長時間受入合格やLinuxのAMD runtime互換性を示すものではありません（[REPORT.mdのWindowsネイティブ環境のVCE再生](REPORT.md#windowsネイティブ環境のvce再生)）。
+- **Safariの録画Original停止と、異常TS通過後の復帰**: ライブ開始や古いvideoのイベントを修正した結果だけで、これらが解消したとは判断していません。
+- **端末ごとの描画差**: Androidの描画を一律メインスレッドへ移す案は、GalaxyとPOCOで結果が逆転したため撤回しました。
+
+---
 
 ## 既存PRへの検証材料
 
-Starletteの`FileResponse`切断処理は、既存の[PR #3390](https://github.com/Kludex/starlette/pull/3390)へ[実装と測定結果を共有](https://github.com/Kludex/starlette/pull/3390#issuecomment-5548572632)しました。KonomiTVでの影響は[Issue #279](https://github.com/tsukumijima/KonomiTV/issues/279)にも報告しています。
+- **Starletteの切断時ファイル送信継続問題**:
+  - クライアント切断後も`FileResponse`が送信を続ける挙動に対し、既存の公式PR [encode/starlette#3390](https://github.com/Kludex/starlette/pull/3390) へ[実装と測定結果を共有](https://github.com/Kludex/starlette/pull/3390#issuecomment-5548572632)しました。KonomiTVでの影響は [Issue #279](https://github.com/tsukumijima/KonomiTV/issues/279) に報告しています。
+  - Windowsの反復シークで復帰時間短縮を確認しましたが、効果は端末・素材・シーク位置に依存します（[REPORT.mdのHTTP Range切断](REPORT.md#http-range切断)）。
+  - 比較用branch [`codex/fix-file-response-disconnect`](https://github.com/libratechw/starlette/tree/codex/fix-file-response-disconnect) は検証材料として保持しており、独立した提出候補には含めません。
 
-Windowsの反復シーク試験では復帰時間の改善を確認しましたが、効果は端末・録画素材・シーク位置によって異なります。[比較条件と全結果](REPORT.md#http-range切断)を参照してください。[比較用branch](https://github.com/libratechw/starlette/tree/codex/fix-file-response-disconnect)は検証材料として保持し、別の提出候補には数えません。
+---
+
+## 再現報告・不具合報告について
+
+動作の不具合や改善要望を発見された場合は、[Issue一覧](https://github.com/libratechw/konomitv-experience/issues)へご報告ください。
+
+調査・再現の確度を高めるため、以下の情報を含めていただけますと大変助かります：
+1. **ご利用環境**: 端末名（例: iPad Air 5, Windows PC）、OSバージョン、ブラウザ（Chrome, Safari等）
+2. **再生条件**: TVライブか録画番組か、選択画質（Original, 1080p等）、低遅延モードのON/OFF
+3. **発生契機**: 再生開始時、画質切替直後、シーク直後、長時間再生中、一時停止からの再開時など
+4. **具体的な挙動**: エラーダイアログの文言（`InvalidStateError`など）、映像・音声の状態、操作を受け付けるか
+5. **復旧に必要だった操作**: 再生ボタンの再押下、画質再選択、プレイヤー再起動、ブラウザリロードなど
+
+---
 
 ## 詳細な証拠とコードの読み方
 
-- [調査報告](REPORT.md)：問題別の原因、比較条件、採否判断、残る確認。
-- [測定方法](METHODOLOGY.md)：指標と判定方法。
-- [公開結果](results/)：測定集計と元記録のhash。試行数と、1試行中の状態取得回数は区別します。
+- [調査報告（REPORT.md）](REPORT.md): 問題別の原因、比較条件、採否判断、残る確認の正本。
+- [測定方法（METHODOLOGY.md）](METHODOLOGY.md): 指標、復帰判定（`recoveryOutcome`）、合格条件の正本。
+- [公開結果（results/）](results/): 測定集計と元記録のhash。試行数と1試行中の状態取得回数を区別して記録。
 
-結果は測定したsource・dist・素材・runnerに対応付けます。診断コードや単体テストの成功を、KonomiTVでの実表示・音声・操作の合格へ読み替えません。公開候補は`candidate/`、測定専用は`diagnostic/`、統合評価は`dogfood/integration`で区別し、検証の進展だけではbranch名を変えません。
+結果は測定したsource・dist・素材・runnerに対応付けます。診断コードや単体テストの成功を、実表示・音声・操作の合格へ読み替えません。ブランチ名は公開候補を`candidate/`、測定専用を`diagnostic/`、統合評価を`dogfood/integration`で区別しています。
 
 <details>
 <summary>測定専用branchと過去の基準版</summary>
 
-[`diagnostic/worker-presentation-observability`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/worker-presentation-observability)は、`faf1464`の描画backend、rAF、描画submit、frame取込、presentation queue、output poolを同じ時系列で記録する診断branchです。source `24f9d98`とdist `3825261`で構成し、製品APIや修正候補にはしません。
+- [`diagnostic/worker-presentation-observability`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/worker-presentation-observability): 描画backend、rAF、描画submit、frame取込、queueを記録する診断branch。
+- [`diagnostic/autofilm-analysis-observability`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/autofilm-analysis-observability): `autoFilm`のGPU readback、field match、decimateとCPU内訳を記録する診断branch。
+- mpeg2toh264・KonomiTVの[`diagnostic/mse-operation-context`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/mse-operation-context)（KonomiTV側 `4b307e9` / mpeg2toh264側 `a3c0cd3`）および統合診断版[`diagnostic/dogfood-mse-operation-context`](https://github.com/libratechw/KonomiTV/tree/diagnostic/dogfood-mse-operation-context)（`748d0b0`）: iOS実機で最初に失敗するMSE操作とplayer世代を特定する診断branch。
 
-[`diagnostic/autofilm-analysis-observability`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/autofilm-analysis-observability)は、`autoFilm`のGPU readback、field match、decimateと、そのCPU内訳を記録する診断branchです。製品APIや修正候補にはせず、branch全体の取り込みも想定しません。
-
-mpeg2toh264とKonomiTVの[`diagnostic/mse-operation-context`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/mse-operation-context)は、MSE操作名、失敗時state、load開始からの経過、MediaSourceの接続状態を`InvalidStateError`へ対応付ける一組の診断branchです。KonomiTV側は[`4b307e9`](https://github.com/libratechw/KonomiTV/tree/diagnostic/mse-operation-context)、mpeg2toh264側は[`a3c0cd3`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/mse-operation-context)です。iPhone 15で再現したdogfoodのDPlayer修正とStarlette pinを保った統合診断版は、KonomiTVの[`diagnostic/dogfood-mse-operation-context`](https://github.com/libratechw/KonomiTV/tree/diagnostic/dogfood-mse-operation-context) `748d0b0`です。いずれもiOS実機で最初に失敗する操作と旧player・現行playerの世代を特定するためだけに使い、修正候補として取り込みません。
-
-branch全体を取り込まず、同じsourceのmain-thread / Worker比較と、計装あり・なしの表示挙動比較だけに使います。このREADMEの修正候補にないfork branchは、直接取り込み候補ではありません。
-
-Worker描画への移行後、最初の基準snapshotはmpeg2toh264 `faf1464`、KonomiTV `ea1962f`です。過去の結果はその版の記録として残し、現在の評価対象へ無条件に流用しません。mpeg2toh264の提案先は`tsukumijima/mpeg2toh264`の`main`を基準に、提出前に現行コードと既存の議論を確認します。
+これらは計装・比較専用であり、修正候補としての取り込みは想定していません。過去の基準snapshot（mpeg2toh264 `faf1464`、KonomiTV `ea1962f`）の結果はその版の記録として保持し、現在の評価対象へ無条件に流用しません。
 
 </details>
 
 ## 公開範囲
 
-録画データ自体は配布せず、fixtureはSHA-256と欠陥構造で識別します。`results/`にはLAN情報、録画名、ローカルpathを除いた結果を置きます。このリポジトリの文書とデータは[CC0 1.0](LICENSE)です。
+録画データ自体は配布せず、fixtureはSHA-256と欠陥構造で識別します。`results/`にはLAN情報、録画名、ローカルpathを除いた結果を配置しています。このリポジトリの文書とデータは[CC0 1.0](LICENSE)です。
