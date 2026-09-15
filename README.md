@@ -14,8 +14,9 @@ KonomiTV の `PlayerController` / `PlayerStore` が、利用者による停止�
 
 - 変更コミット: `fb4d74b30b19f02d8ad6f93bca1d0e7928717cf5`
 - オフライン: Node 20 の `live-pause-restart-contract.mjs` が pass
-- 共通入口の有界実機観測: Windows Chrome、Mac Safari、Linux Chrome、Android POCO、Galaxy `SM-X930` で pause → hold → 1 回のネイティブ play → 進行と、該当環境の Live Original `video/mp2t` HTTP 200・owned cleanup を確認
+- 共通入口の有界実機観測: Windows Chrome、Mac Safari、Linux Chrome、Android POCO、Galaxy `SM-X930` で pause → hold → 1 回の入力による play → 進行を確認
 - Galaxy の最新 run `20260915t103050253959z-galaxy-live-pause-hold10-resume`: 低遅延 ON、10.049 秒 hold、同一 route/timeOrigin、進行 10 サンプル、cleanup verified
+- Linux Chrome の最新 run `20260915t105317881597z-linux-live-pause-hold10-resume`: 低遅延 ON、10.004 秒 hold、66 サンプル、MPEGTS/events/PSI HTTP 200、owned Chrome cleanup verified
 
 iPad mini/Air の最新 Appium/WDA 試行は RemoteXPC 8111 の接続拒否、automation-mode timeout、`xcodebuild` code 65 によりタブ作成前に停止しました。これは測定環境のセットアップ阻害であり、製品再生失敗とは分類しません。
 
