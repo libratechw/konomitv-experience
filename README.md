@@ -38,6 +38,14 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 - **確認済み（静的検証）**: 型検査（TypeScript）、ESLint、提出前コードレビューを通過。
 - **残る未確認事項**: iOSでのHLS→Original反復切替、現行HLS videoエラー時の再起動連鎖防止、待機中の画質切替・再生成の実機検証は未完了。
 
+### [mpeg2toh264] トランスコード主要処理の計算負荷軽減（出力一致）
+
+- **ブランチ / 対象commit**: [`perf/bit-exact-transcode-hot-paths`](https://github.com/libratechw/mpeg2toh264/tree/perf/bit-exact-transcode-hot-paths)（検証対象: [`581f2b7`](https://github.com/libratechw/mpeg2toh264/commit/581f2b7)、base: [`faf1464`](https://github.com/libratechw/mpeg2toh264/commit/faf1464)）
+- **利用者への狙い**: Original再生時の変換負荷を、変換結果を変えずに軽減する。
+- **実装責任箇所と修正内容**: MPEG-2係数のVLCデコードinline化、H.264量子化処理のラスタ順化による参照負荷軽減、native量子化丸めの整理、CAVLCの不要ビットマスク除去およびluma入力の並び替え。変更前と同じ変換出力を保つ方針で、計算処理を最適化。
+- **確認済み**（オフライン）: 同一の約60秒素材による8組の交互比較で、全組の高速化を確認。同環境内の変更前後比において、Linux x86_64ネイティブ版で平均処理時間約23.2%短縮、Node.js上のWASM版で平均変換処理時間約7.7%短縮。WASM版は比較に用いた1素材、ネイティブ版は同素材を含む3素材で、変更前後の出力SHA-256一致を確認。
+- **残る未確認事項**: 本最適化単独での実機端末ブラウザにおけるWASM処理性能、および再生開始時間・シーク追随性・コマ落ち解消への直接的な改善効果は未確認。
+
 ### [mpeg2toh264] autoFilmの同期解析負荷軽減
 - **ブランチ / 対象commit**: [`candidate/autofilm-comb-score-indexing`](https://github.com/libratechw/mpeg2toh264/tree/candidate/autofilm-comb-score-indexing)（検証対象: [`dcfe571`](https://github.com/libratechw/mpeg2toh264/commit/dcfe571)）
 - **利用者に見える症状**: 24fps化（autoFilm）有効時にコマ落ちや処理遅延が発生する。
