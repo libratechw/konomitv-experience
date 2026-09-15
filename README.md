@@ -15,6 +15,15 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 
 各候補は上流への個別提案を想定してブランチを分離しています（※採用済みやPR作成完了を意味するものではありません）。
 
+### [DPlayer] ライブ同期計算の非有限・負値を`currentTime`へ渡さない
+- **候補**: `fix/guard-nonfinite-live-sync`（提出前のpresentation commit: `a937e92`、保全branchのHEAD: `66e5a69`）。この候補はDPlayerの5ファイルに限定され、KonomiTV本体や配備版を変更しません。
+- **利用者に見える症状**: iPad SafariでテレビのLive Originalを再生したとき、再生開始直後に映像が進まず、停止や再起動通知に至ることがあります。
+- **原因と責任範囲**: Safariなどのメディア層は、開始直後にdurationやseekableがまだ確定していない過渡的な値を返すことがあります。DPlayerの`sync()`はその値から同期先を計算し、有限値かつ0以上かを検査せず`video.currentTime`へ渡していました。Safari単独の仕様違反と断定する根拠はなく、未確定値を安全に扱う直接の修正対象はDPlayerです。
+- **Originalで表面化した理由と他画質との関係**: `sync()`はLive画質共通の入口です。Originalは`/original/mpegts`を`mpeg2toh264`で再生する直接TS経路、1080p等は`mpegts.js`/MSEと`canplay`・`MEDIA_INFO`・バッファ待ちを使う別の開始経路であるため、今回の過渡状態がOriginalで表面化しやすくなりました。他画質に同じガードが既に入っていた、または同じ問題が存在しない、とは判断していません。
+- **修正**: 同期先が`Number.isFinite(time) && time >= 0`を満たす場合だけsetterを呼び、不正値（`NaN`、`Infinity`、負値）はsetterを呼ばず既存の再生経路を継続します。
+- **確認済み**: 同一iPad AirのLive Originalでupstream/candidateを低遅延OFF→ON→OFFの3組比較。upstreamは3/3で不正値のsetter到達と進行停止、candidateは3/3で不正値のスキップと進行を確認しました。candidateのfixtureはChrome headlessで13/13件pass、baseではガード依存7件が失敗しました。
+- **残る未確認事項**: 物理画面、音声、A/V同期、体感上のコマ落ち、全端末・全画質への一般化、candidateの長時間品質は未確認です。実機診断用の観測コードは提出候補に含めていません。
+
 ### [DPlayer] 画質切替後の旧videoイベント干渉防止
 - **ブランチ / 対象commit**: [`candidate/ignore-stale-video-events`](https://github.com/libratechw/DPlayer/tree/candidate/ignore-stale-video-events)（検証対象: `8e49bb7`）
 - **利用者に見える症状**: 画質切替後に映像が意図せず一時停止（pause）したり、再生が不安定になる。
