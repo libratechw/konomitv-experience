@@ -74,6 +74,12 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 - **確認済み（自動テスト・静的検証）**: 直接検証テスト（`test-range-eof`）、型検査、既存テスト、ビルド、独立レビューを通過。
 - **残る未確認事項**: iPad実機の録画Original再生における再現・効果確認、正常TS・画素品質・可聴A/V同期は未確認。Safari特有の録画停止問題全般を解決するものではない。
 
+### [mpeg2toh264] 5つの改善候補の一括統合ブランチ
+
+upstream main [`faf1464`](https://github.com/tsukumijima/mpeg2toh264/commit/faf1464) を基点に、先行する5件の改善（処理最適化、comb score負荷軽減、TS欠損直前の完成ピクチャ保持、YADIF queue fallback削除、録画終端HTTP 416対応）をまとめて取り込めるよう集約した [`candidate/combined-improvements`](https://github.com/libratechw/mpeg2toh264/tree/candidate/combined-improvements) です。各候補の差分（処理最適化の5コミット＋他4候補の各1コミット）をそのまま線形に並べた9つのソースコミットと、統合ソースから再生成したdist専用の1コミット（計10コミット）で構成されています。
+
+各改善を一度に反映した上で実環境での検証を進めたいメンテナー向けの実装です。統合ブランチ上で268件のRustテスト、TypeScript型検査、各機能試験（IVTC/MSE/HTTP range EOF）、および各種ビルドの正常通過を確認しています。一方で、この組み合わせによる実機での再生品質、A/V同期、長時間稼働時の安定性や実際の性能効果は未確認のため、取り込み後に各利用環境で必要な実機検証を進めてください。
+
 ---
 
 ## 2. dogfood統合検証（[`dogfood/integration`](https://github.com/libratechw/KonomiTV/tree/dogfood/integration)）
