@@ -103,14 +103,6 @@ upstream main [`faf1464`](https://github.com/tsukumijima/mpeg2toh264/commit/faf1
 すべての変更を組み込んだdogfoodブランチの日常利用で問題は起きていませんが、依然としてコマ落ちは残ります。原因は調査中ですが、モバイル端末だとOriginal画質で再生していると端末が非常に熱くなるので、CPU負荷がまだまだ高すぎるのかもしれません。  
 また、個別のコミットに対して多数の端末での回帰テストなど、厳密な検証はできていないことをご了承ください。
 
-### [mpeg2toh264] otya128上流更新の選択的取り込み候補
-
-- **ブランチ / 対象commit**: [`upstream-take-20260920`](https://github.com/libratechw/mpeg2toh264/tree/upstream-take-20260920)（先端 [`4c955f7`](https://github.com/libratechw/mpeg2toh264/commit/4c955f7) / dist [`9f6aa09`](https://github.com/libratechw/mpeg2toh264/commit/9f6aa09) / source [`94e77a3`](https://github.com/libratechw/mpeg2toh264/commit/94e77a3)、基点: tsukumijima [`faf1464`](https://github.com/tsukumijima/mpeg2toh264/commit/faf1464)、取込対象: otya128 [`12d8dec`](https://github.com/otya128/mpeg2toh264/commit/12d8dec) までの20件）
-- **利用者に見える症状**: 新機能ではなく上流追従のための取り込み候補です。直接の症状対応ではありません。
-- **実装責任箇所と修正内容**: H.264/MBAFF性能改善・字幕保持修正・Firefox frame counters取得を選択的に取り込み、tsukumijima側のPMT再開処理・watchdog/worker機構へ適応。otyaのGPU film配線（`film`/`debug`オプション）は、`capture()`・worker描画・`autoFilm`を消すため不採用。`film` vs `autoFilm`の対応は上流の判断待ち項目として残し、KonomiTV側の移行変更は不要（依存pin差替えのみで成立）。
-- **確認済み（自動テスト・静的検証）**: Rustテスト249件（debug・release）、`test-video-frames` 9件、yadif型検査（main・worker）、ffmpeg framemd5による書換え2 fixtureの復号確認。公式KonomiTV masterへの依存差替えでinstall・typecheck・buildが通り、隔離配信でOriginalの連続再生を確認。実装者と独立したcriticalレビューを4往復し、最終判定はTakeable（指摘は全件解消）。
-- **残る未確認事項**: Firefox実機での動作、VideoToolbox/Safariでの新規ビットストリーム受容、MBAFF表の行単位照合、体感品質・可聴音声・A/V同期。
-
 ---
 
 > [!NOTE]
