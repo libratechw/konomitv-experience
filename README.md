@@ -54,54 +54,74 @@ Galaxyでもこの修正を組み込んだdogfoodブランチを日常利用し�
 Galaxyでもこの修正を組み込んだdogfoodブランチを日常利用していますが、不都合は起きていません。
 - **残る未確認事項**: iOSでのHLS→Original反復切替、現行HLS videoエラー時の再起動連鎖防止、待機中の画質切替・再生成の実機検証は未完了。幅広い端末での回帰テストも未実施。
 
-### [mpeg2toh264] トランスコード主要処理の計算負荷軽減（出力一致）
+### [mpeg2toh264] otya128上流の完全取込（2案）
 
-- **ブランチ / 対象commit**: [`perf/bit-exact-transcode-hot-paths`](https://github.com/libratechw/mpeg2toh264/tree/perf/bit-exact-transcode-hot-paths)（検証対象: [`581f2b7`](https://github.com/libratechw/mpeg2toh264/commit/581f2b7)、base: [`faf1464`](https://github.com/libratechw/mpeg2toh264/commit/faf1464)）
-- **利用者への狙い**: Original再生時の変換負荷を、変換結果を変えずに軽減する。
-- **実装責任箇所と修正内容**: MPEG-2係数のVLCデコードinline化、H.264量子化処理のラスタ順化による参照負荷軽減、native量子化丸めの整理、CAVLCの不要ビットマスク除去およびluma入力の並び替え。変更前と同じ変換出力を保つ方針で、計算処理を最適化。
-- **確認済み**（オフライン）: 同一の約60秒素材による8組の交互比較で、全組の高速化を確認。同環境内の変更前後比において、Linux x86_64ネイティブ版で平均処理時間約23.2%短縮、Node.js上のWASM版で平均変換処理時間約7.7%短縮。WASM版は比較に用いた1素材、ネイティブ版は同素材を含む3素材で、変更前後の出力SHA-256一致を確認。  
-Galaxyでもこの修正を組み込んだdogfoodブランチを日常利用していますが、不都合は起きていません。  
-- **残る未確認事項**: 本最適化単独での実機端末ブラウザにおけるWASM処理性能、および再生開始時間・シーク追随性・コマ落ち解消への直接的な改善効果は未確認。幅広い端末での回帰テストも未実施。
+- **候補ブランチ**: [`candidate/full-upstream-take`](https://github.com/libratechw/mpeg2toh264/tree/candidate/full-upstream-take)
+- **実装責任箇所と修正内容**: tsukumijima版 [`faf1464`](https://github.com/tsukumijima/mpeg2toh264/commit/faf1464) を基点に、otya128版コミット `7b008c6` までの21件の変更を統合した完全取込版です。上流のMBAFF対応・変換処理改善・GPU film・描画周期と表示予定時刻に基づく新スケジューラを取り込みつつ、tsukumijima版の公開API（`autoFilm`・キャプチャ・各種統計・WebWorker描画等）の互換性を維持しています。GPU filmおよびdebugは加算APIであり、既存の `autoFilm` の意味変更ではありません。
 
-### [mpeg2toh264] autoFilmの同期解析負荷軽減
+同一の統合ライブラリを基点とし、呼出側の変更範囲に応じて2つの選択肢を用意しています。共通ライブラリ自体は障害通知と明示的な再試行APIを提供するのみで、内部で設定を自動切替しません。②では呼出側（KonomiTV）が通知を受けてGPU要求を解除し、CPU autoFilm復帰を試みます。現在のdogfood環境は②を採用しています。
+
+| 案 | 構成 | 24fps（film）動作 | 障害時の挙動 / UI表示 |
+| :--- | :--- | :--- | :--- |
+| **① API互換案** | ライブラリのみ更新<br>公式KonomiTV（`62b2fc5`相当）依存更新 / DPlayer変更なし | 従来設定はCPU autoFilmを維持（GPU film/debugは加算API） | ライブラリは通知のみ提供。呼出側・DPlayerのUI表示変更なし |
+| **② 呼出側移行案** | 同一ライブラリ<br>＋ KonomiTV（[`candidate/gpu-film-migration`](https://github.com/libratechw/KonomiTV/tree/candidate/gpu-film-migration)）<br>＋ DPlayer（[`candidate/film-status`](https://github.com/libratechw/DPlayer/tree/candidate/film-status)） | 24fps設定からGPU filmを明示選択可能 | 障害通知を受けてGPU要求を解除しCPU autoFilmへの復帰を試みる。DPlayer上に状態表示 |
+
+- **確認済み**:
+  - **静的検証・ビルド**: Rustテスト274件（release 258件、doctest 16件）、TypeScript型検査、API・Worker時計・PiP・再試行・破棄処理の実ソース回帰を確認。クリーン環境での再ビルドによりライブラリ配布物（dist全41ファイル）のbyte完全一致を確認済み。両案でKonomiTVクライアントビルドおよび内包WASM/Workerの整合性を確認。
+  - **動作確認**: POCO実機の独立テストフィクスチャ（消音）にて、再生進行、シーク、キャプチャ、破棄・クリーンアップの正常動作を確認。
+  - **視聴確認（① API互換案）**: 公式KonomiTV環境へ本ライブラリのみを適用した実環境（ポート7075）において、筆者自身の視聴で「iPhone, iPad以外はかなり良好だね。」という感触を確認（※筆者による主観的な視聴確認であり、iPhone/iPadでの課題解決を示すものではありません。特定端末・ブラウザ・素材ごとの網羅的な評価データは未取得です）。
+- **残る未確認事項**:
+  - 最終版におけるSafariおよびFirefoxでの詳細な挙動検証、実ブラウザPiP動作、上流変更に伴うMBAFF行単位の映像比較。
+  - ②呼出側移行案における実機視聴の主観比較、および統制A/B比較。
+  - 全所有端末での網羅テスト、長時間連続再生、字幕表示、可聴音声・A/V同期の詳細確認。
+
+### [mpeg2toh264] 完全取込＋追加3件の一括統合ブランチ
+
+- **候補ブランチ**: [`candidate/combined-improvements`](https://github.com/libratechw/mpeg2toh264/tree/candidate/combined-improvements)
+- **実装責任箇所と修正内容**: 上記の完全取込ブランチ（`candidate/full-upstream-take`）を基点に、後述の未収録改善3件（CPU IVTC comb-score行参照最適化、TSパケット欠損直前の完成ピクチャ保持、録画終端HTTP 416の正常EOF完了処理）を統合した現行推奨ブランチです（ソース3コミット＋dist再生成1コミット）。旧基点（`faf1464`）向けの旧統合ブランチ（`4ec1102`）は [`archive/20260921/combined-improvements-before-fulltake`](https://github.com/libratechw/mpeg2toh264/tree/archive/20260921/combined-improvements-before-fulltake) へ保存し、本ブランチを新完全取込ベースへ更新しました。
+- **確認済み**:
+  - **静的検証・ビルド**: 新基点上でRust全体テスト、IVTCテスト、HTTP 416関連テスト（正常EOFを含む実read-loop 7ケース）、TypeScript型検査を通過。先端distはRust/WASMから再生成し内包WASMの整合性を確認。
+  - **動作確認（公開コミット・実機検証）**:
+    - 最終配備版（KonomiTV `4477647` / DPlayer `9759653` / mpeg2toh264 `38d7e85`）の7016で、POCOは録画Original（ミュージックステーション15232）の一時停止5秒・60秒シーク・再開後45秒進行・設定復元と終了処理を確認。Linux Chrome実デスクトップは録画Originalの33秒進行・1920×1080キャプチャ・主要画面表示（未捕捉例外0件）を確認しました。
+    - 同じmpeg2toh264・DPlayerを使う先行ビルド（`fc92834`）では、Windows Chrome（30秒）とMac Safari（約30秒）の録画pause/seek/play、およびPOCOのLive Original（低遅延ON/OFF各30秒）も確認しています。先行版には別依存のmpegts.jsのキャッシュ不一致があり、最終版での全端末再試験とは区別しています。
+    - 再生制御・通信・終了処理の機械確認であり、視聴体感やA/V同期の評価ではありません。iPad Airは信頼後も自動化セッション初期化で停止し、製品再生は未確認です。
+- **残る未確認事項**: 新基点における各修正単独の実機効果や性能改善率の測定。iPad Air・Firefoxでの再生検証と、全端末での回帰テスト。
+
+依存をコミットハッシュ固定のGit URLで指定し、インストールされたライブラリdist（mpeg2toh264全41ファイル・DPlayer全50ファイル）を対象コミットと照合しました。最終統合版はクリーン再ビルド・コミット済みdist・7016配信物の全236ファイルがbyte一致。②単独のクライアントは他235ファイルが一致し、`sw.js`のみprecache配列の順序差があります（URL/revision全234件と残りのコードは同一）。
+
+### [mpeg2toh264] 過去候補の整理とアーカイブ
+
+旧候補のうち以下の2件は、新基点において前提条件の変化や処理の重複が生じたため、元ブランチを削除しアーカイブタグへ移行しました（過去の測定結果自体を否定するものではなく、新基点における採用根拠が不足しているための整理です。過去の経緯は [README履歴（`0ed1449`）](https://github.com/libratechw/konomitv-experience/blob/0ed1449475b009d13be9dca1e962b1572858dd25/README.md) を参照してください）。
+
+| アーカイブタグ | 旧対象commit | 推奨一覧から外しアーカイブした理由 |
+| :--- | :--- | :--- |
+| [`archive/20260921/bit-exact-transcode-hot-paths`](https://github.com/libratechw/mpeg2toh264/tree/archive/20260921/bit-exact-transcode-hot-paths) | [`581f2b7`](https://github.com/libratechw/mpeg2toh264/commit/581f2b7) | 上流の変換最適化およびMBAFF変更と接触・重複し、旧パッチはそのまま適用不可（全内容が新基点に取り込まれたわけではありません）。過去の短縮率（23.2% / 7.7%）やbit-exact結果は新基点へ流用できないため、価値が残る部分は新基点を基準に再検討。 |
+| [`archive/20260921/yadif-queue-fallback-removal`](https://github.com/libratechw/mpeg2toh264/tree/archive/20260921/yadif-queue-fallback-removal) | [`2bc48a0`](https://github.com/libratechw/mpeg2toh264/commit/2bc48a0) | 上流新スケジューラの導入に伴い前提構造が変化し、旧パッチはそのまま適用不可。新構造でも全破棄やslot再利用処理自体は残っているため上流で問題解消済みではなく、旧6,386状態の解析を根拠に新キューの処理を除去することは不可。 |
+
+### [mpeg2toh264] 完全取込版に未収録の追加改善候補（個別参照用）
+
+以下の3件は単体完全取込版（`candidate/full-upstream-take`）には含まれず、統合ブランチ（`candidate/combined-improvements`）に収録されています。統合版において新基点でのビルド・型検査・単体テスト通過は確認していますが、個別ブランチは従来基点の実装参照として維持しており、新基点における各修正単独の実機効果測定は未実施です。
+
+#### [mpeg2toh264] autoFilmの同期解析負荷軽減
 - **ブランチ / 対象commit**: [`candidate/autofilm-comb-score-indexing`](https://github.com/libratechw/mpeg2toh264/tree/candidate/autofilm-comb-score-indexing)（検証対象: [`dcfe571`](https://github.com/libratechw/mpeg2toh264/commit/dcfe571)）
 - **利用者に見える症状**: 24fps化（autoFilm）有効時にコマ落ちや処理遅延が発生する。
-- **実装責任箇所と修正内容**: comb score算出時の行ポインタ参照をピクセル走査ループ外へ移動し、判定結果の等価性を保ったまま同期解析の計算時間を短縮。
-- **確認済み（オフライン・実機診断）**: 4素材のオフライン解析で約6〜9%の処理時間短縮と判定完全一致を確認。Galaxy実機診断でも同期解析時間短縮（17.7ms→16.8ms）を確認。  
-Galaxyでもこの修正を組み込んだdogfoodブランチを日常利用していますが、不都合は起きていません。
-- **残る未確認事項**: Windowsの同一runnerによる全編再生比較では短縮が確認できず。Galaxy以外の実表示品質、可聴A/V同期、コマ落ちへの直接寄与は未確認（[REPORT.md: autoFilmの表示負荷](REPORT.md#autofilmの表示負荷)）。幅広い端末での回帰テストも未実施。
+- **実装責任箇所と修正内容**: comb score算出時の行ポインタ参照をピクセル走査ループ外へ移動し、判定結果の等価性を保ったままCPU側の同期解析時間を短縮（※CPU版 `ivtc.ts` の最適化であり、完全取込版のGPU filmを高速化するものではありません。①のCPU既定経路や②のCPU復帰先として適用対象は残りますが、新基点における有効性や性能向上は未検証です）。
+- **確認済み（旧基点での測定）**: 4素材のオフライン解析で約6〜9%の処理時間短縮と判定完全一致を確認。旧版Galaxy実機診断でも同期解析時間短縮（17.7ms→16.8ms）を確認。旧版を組み込んだdogfoodブランチの日常利用では不都合は生じていませんでした。
+- **残る未確認事項**: 新基点での各修正単独の実機効果測定。Windowsの同一runnerによる全編再生比較では短縮が確認できず。Galaxy以外の実表示品質、可聴A/V同期、コマ落ちへの直接寄与は未確認（[REPORT.md: autoFilmの表示負荷](REPORT.md#autofilmの表示負荷)）。幅広い端末での回帰テスト。
 
-### [mpeg2toh264] TS欠損直前の完成ピクチャ保持
+#### [mpeg2toh264] TS欠損直前の完成ピクチャ保持
 - **ブランチ / 対象commit**: [`candidate/preserve-complete-pictures-before-loss`](https://github.com/libratechw/mpeg2toh264/tree/candidate/preserve-complete-pictures-before-loss)（検証対象: [`c3406ab`](https://github.com/libratechw/mpeg2toh264/commit/c3406ab)）
 - **利用者に見える症状**: パケット欠落を含む放送を受信した際、映像が大きく乱れる・飛ぶ。
-- **実装責任箇所と修正内容**: TSパケット欠落検知時、欠落直前までにデコードが完了していたpictureまで巻き込んで破棄しないよう保持処理を変更。
-- **確認済み（オフライン・実機A/B）**: 2種類の欠損パターンで映像sampleが10〜12枚多く残ることをオフライン確認。Galaxy実機1時間比較で欠損1回あたりの`droppedVideoFrames`中央値が13枚から2枚へ減少。  
-Galaxyでもこの修正を組み込んだdogfoodブランチを日常利用していますが、不都合は起きていません。目視でもパケット欠落箇所のカクつきは改善しています。
-- **残る未確認事項**: 幅広い端末での回帰テスト。
+- **実装責任箇所と修正内容**: TSパケット欠落検知時、欠落直前までに組み立て（パケット結合）が完了していた圧縮pictureまで巻き込んで破棄しないよう保持処理を変更（単体完全取込版には未収録、統合版に収録）。
+- **確認済み（旧基点での測定）**: 2種類の欠損パターンで映像sampleが10〜12枚多く残ることをオフライン確認。旧版Galaxy実機1時間比較で欠損1回あたりの`droppedVideoFrames`中央値が13枚から2枚へ減少。旧版を組み込んだdogfoodブランチの日常利用では不都合は起きておらず、パケット欠落箇所のカクつき緩和を確認していました。
+- **残る未確認事項**: 新基点での単独実機効果測定。幅広い端末での回帰テスト。
 
-### [mpeg2toh264] YADIF描画待ちキューの全破棄・上書き処理削除
-- **ブランチ / 対象commit**: [`candidate/yadif-queue-fallback-removal`](https://github.com/libratechw/mpeg2toh264/tree/candidate/yadif-queue-fallback-removal)（検証対象: [`2bc48a0`](https://github.com/libratechw/mpeg2toh264/commit/2bc48a0)）
-- **利用者に見える症状**: インターレース解除（YADIF）処理中に急激なフレームドロップや破綻が起きる。
-- **実装責任箇所と修正内容**: YADIFのqueue全消去、および空きslot枯渇時にqueued slotを上書き再利用するfallback分岐を削除。
-- **確認済み（静的網羅・単体テスト）**: 全6,386状態の列挙により、容量整理後のslot割当失敗が0件であることを確認。正常60i短時間試験で既知のデグレなし。  
-Galaxyでもこの修正を組み込んだdogfoodブランチを日常利用していますが、不都合は起きていません。
-- **残る未確認事項**: 状態列挙による安全性の確認にとどまり、実機での表示品質改善、異常TSからの長時間復帰、Worker描画、可聴A/V同期への寄与は未確認。幅広い端末での回帰テストも未実施。
-
-### [mpeg2toh264] 録画終端HTTP 416時の正常EOF完了処理
+#### [mpeg2toh264] 録画終端HTTP 416時の正常EOF完了処理
 - **ブランチ / 対象commit**: [`candidate/complete-exhausted-http-range-v2`](https://github.com/libratechw/mpeg2toh264/tree/candidate/complete-exhausted-http-range-v2)（先端・dist: [`d011466`](https://github.com/libratechw/mpeg2toh264/commit/d011466) / source: [`9c0b1c7`](https://github.com/libratechw/mpeg2toh264/commit/9c0b1c7)、基点: [`faf1464`](https://github.com/libratechw/mpeg2toh264/commit/faf1464)）
 - **利用者に見える症状**: 録画再生の末尾でエラーが表示される、または終了処理が完了しない。
-- **実装責任箇所と修正内容**: 既知のファイルサイズ以降へのRangeリクエストがHTTP 416（Range Not Satisfiable）で返された場合に限り、変換済みバッファをフラッシュして正常完了（EOF）として処理。それ以外のHTTPエラーは従来通り停止。
-- **確認済み（自動テスト・静的検証）**: 直接検証テスト（`test-range-eof`）、型検査、既存テスト、ビルドを通過。  
-Galaxyでもこの修正を組み込んだdogfoodブランチを日常利用していますが、不都合は起きていません。
+- **実装責任箇所と修正内容**: 既知のファイルサイズ以降へのRangeリクエストがHTTP 416（Range Not Satisfiable）で返された場合に限り、変換済みバッファをフラッシュして正常完了（EOF）として処理。描画経路（CPU/GPU）とは独立したHTTP入力層の修正（単体完全取込版には未収録、統合版に収録）。
+- **確認済み（旧基点での測定）**: 直接検証テスト（`test-range-eof`）、型検査、既存テスト、ビルドを通過。旧版を組み込んだdogfoodブランチの日常利用で不都合のないことを確認していました。
 - **残る未確認事項**: iPad実機の録画Original再生における再現・効果確認。幅広い端末での回帰テスト。
-
-### [mpeg2toh264] 5つの改善候補の一括統合ブランチ
-
-upstream main [`faf1464`](https://github.com/tsukumijima/mpeg2toh264/commit/faf1464) を基点に、先行する5件の改善（処理最適化、comb score負荷軽減、TS欠損直前の完成ピクチャ保持、YADIF queue fallback削除、録画終端HTTP 416対応）をまとめて取り込めるよう集約した [`candidate/combined-improvements`](https://github.com/libratechw/mpeg2toh264/tree/candidate/combined-improvements) です。各候補の差分（処理最適化の5コミット＋他4候補の各1コミット）をそのまま線形に並べた9つのソースコミットと、統合ソースから再生成したdist専用の1コミット（計10コミット）で構成されています。
-
-各改善を一度に反映した上で実環境での検証を進めたい場合向けの実装です。統合ブランチ上で268件のRustテスト、TypeScript型検査、各機能試験（IVTC/MSE/HTTP range EOF）、および各種ビルドの正常通過を確認しています。  
-すべての変更を組み込んだdogfoodブランチの日常利用で問題は起きていませんが、依然としてコマ落ちは残ります。原因は調査中ですが、モバイル端末だとOriginal画質で再生していると端末が非常に熱くなるので、CPU負荷がまだまだ高すぎるのかもしれません。  
-また、個別のコミットに対して多数の端末での回帰テストなど、厳密な検証はできていないことをご了承ください。
 
 ---
 
@@ -114,8 +134,8 @@ upstream main [`faf1464`](https://github.com/tsukumijima/mpeg2toh264/commit/faf1
 
 複数の修正を日常利用環境で横断評価するための統合ブランチです。
 
-> **配備ビルドの境界**:
-> 実機測定に用いた配備環境（KonomiTV source [`e6d9cf7`](https://github.com/libratechw/KonomiTV/commit/e6d9cf7)、DPlayer [`2499f05`](https://github.com/libratechw/DPlayer/commit/2499f05e1850690b3764bf9d6d66961078df134b)）は公開forkの[`dogfood/integration`](https://github.com/libratechw/KonomiTV/tree/dogfood/integration)に含まれます。ただし、配備イメージはビルド時点の固定スナップショットであり、ブランチ上のREADME更新等が配備済みコンテナへ遡って反映されるものではありません。以下の数値は特定環境下での測定結果です。
+> **配備ビルドの境界と現行構成**:
+> 以下のTVライブおよび録画再生の測定数値は、過去の固定スナップショット（KonomiTV [`e6d9cf7`](https://github.com/libratechw/KonomiTV/commit/e6d9cf7)、DPlayer [`2499f05`](https://github.com/libratechw/DPlayer/commit/2499f05e1850690b3764bf9d6d66961078df134b)）における記録です。現行の統合ブランチ（KonomiTV [`dogfood/integration`](https://github.com/libratechw/KonomiTV/tree/dogfood/integration)、DPlayer [`dogfood/integration`](https://github.com/libratechw/DPlayer/tree/dogfood/integration)）は②GPU film移行と新基点combined 3案を取り込んだ構成へ更新されており、過去の測定値を新配備の結果として流用するものではありません。
 
 ### TVライブ Original再生の同期ガード & 一時停止／再開（Live pause / resume）
 - **対象commit / 修正内容**:
