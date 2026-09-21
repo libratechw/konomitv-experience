@@ -59,7 +59,11 @@ Galaxyでもこの修正を組み込んだdogfoodブランチを日常利用し�
 - **候補ブランチ**: [`candidate/full-upstream-take`](https://github.com/libratechw/mpeg2toh264/tree/candidate/full-upstream-take)
 - **実装責任箇所と修正内容**: tsukumijima版 [`faf1464`](https://github.com/tsukumijima/mpeg2toh264/commit/faf1464) を基点に、otya128版コミット `7b008c6` までの21件の変更を統合した完全取込版です。上流のMBAFF対応・変換処理改善・GPU film・描画周期と表示予定時刻に基づく新スケジューラを取り込みつつ、tsukumijima版の公開API（`autoFilm`・キャプチャ・各種統計・WebWorker描画等）の互換性を維持しています。GPU filmおよびdebugは加算APIであり、既存の `autoFilm` の意味変更ではありません。
 
+表示予定時刻と描画周期に基づくスケジューラー改良により、フレームの出し遅れや不必要な破棄を抑え、コマ落ち改善を狙います。また、GPU filmは24fps化に必要な解析をGPU側で行い、CPU側の解析負荷を軽減するための変更です。GPU filmの呼び出し変更まで含む構成では描画スレッド時間の短縮を確認しましたが、全端末での滑らかさ改善までは確認していません。
+
 同一の統合ライブラリを基点とし、呼出側の変更範囲に応じて2つの選択肢を用意しています。共通ライブラリ自体は障害通知と明示的な再試行APIを提供するのみで、内部で設定を自動切替しません。②では呼出側（KonomiTV）が通知を受けてGPU要求を解除し、CPU autoFilm復帰を試みます。現在のdogfood環境は②を採用しています。
+
+本実装ではGPU film→従来のautoFilmへのフォールバックをKonomiTV側に担わせていますが、これをmpeg2toh264側で担う選択肢もあります。
 
 | 案 | 構成 | 24fps（film）動作 | 障害時の挙動 / UI表示 |
 | :--- | :--- | :--- | :--- |
@@ -79,7 +83,19 @@ Galaxyでもこの修正を組み込んだdogfoodブランチを日常利用し�
 
 GPU filmの呼び出し変更まで含めると、描画スレッド時間の短縮と一部端末でのCanvas出力頻度向上を確認しました。一方、ライブラリ更新だけでは一律の改善はなく、判定安定性や出力低下の課題も残ります。全端末での体感上の滑らかさの向上を実証したものではありません。
 
-- **比較対象**: 公式[KonomiTV `62b2fc5`](https://github.com/tsukumijima/KonomiTV/commit/62b2fc5)＋mpeg2toh264 `faf1464`（A）、Aの依存だけを完全取込候補[`c8fe232`](https://github.com/libratechw/mpeg2toh264/commit/c8fe232)へ更新してCPU autoFilmを維持（B）、B＋PlayerControllerのGPU film呼び出し・障害時CPU復帰処理（C）。DPlayerは全版で公式v1.33.1を維持し、状態表示・追加3改善・他のdogfood修正は含めていません。Cは②全体ではなく、呼び出し変更のみの比較です。
+公式版に対して、otya128版の変更を取り込む効果と、24fps化をGPU方式へ切り替える効果を分けて調べました。
+
+| 版 | 公式版からの変更 | 描画スケジューラー | 24fps設定ON時 |
+| :--- | :--- | :--- | :--- |
+| **A：取り込み前の公式版** | なし。測定時点の公式KonomiTVと公式mpeg2toh264 | 従来方式 | CPU autoFilm |
+| **B：上流変更を完全取り込み** | mpeg2toh264だけを更新。KonomiTVの呼び出しは変更しない | otya128の新方式を含む | CPU autoFilmを維持 |
+| **C：完全取り込み＋GPU film移行** | Bに加え、KonomiTVからGPU filmを選ぶよう変更。障害時はCPU復帰を試みる | Bと同じ | GPU film |
+
+Bの「CPU autoFilmを維持」は、描画スケジューラーも古いままという意味ではありません。Bにも新スケジューラー・変換処理改善・GPU filmのAPIは含まれますが、従来の呼び出しではCPU autoFilmが選ばれます。設定OFFでは、どの版も24fps化を行わず通常のデインターレース出力になります。
+
+- **24fps設定OFFのA/B比較**: 上流変更を取り込む前後の比較です。変換処理なども変わるため、新スケジューラー単独の効果ではありません。
+- **共通構成**: DPlayerは全版で公式v1.33.1を維持し、状態表示・追加3改善・他のdogfood修正は含めていません。Cは②全体ではなく、呼び出し変更のみの比較です。
+- **測定版の識別情報**: Aは公式[KonomiTV `62b2fc5`](https://github.com/tsukumijima/KonomiTV/commit/62b2fc5)＋mpeg2toh264 `faf1464`。B/Cは同じKonomiTVを基に、mpeg2toh264を完全取込候補[`c8fe232`](https://github.com/libratechw/mpeg2toh264/commit/c8fe232)へ更新しています。
 - **条件**: Linux実デスクトップChrome、Windows Chrome、POCO Chrome、Mac Safari。録画Original・字幕ON・コメント非表示で、同一素材・媒体区間、端末内の表示寸法を固定し、各条件60秒×2回を順序反転して測定（計56走行）。既存statsの読み取りのみで、追加rVFC/rAFループは使用していません。温度・動作周波数を固定したベンチマークではありません。
 
 音楽素材のCanvas出力fps（各試行の平均値、2回の範囲）。24fps設定OFF時はAとB、ON時はAとCを比較しています。
@@ -109,7 +125,7 @@ Canvas出力fpsは描画の書き込み頻度であり、実画面への提示�
   - **静的検証・ビルド**: 新基点上でRust全体テスト、IVTCテスト、HTTP 416関連テスト（正常EOFを含む実read-loop 7ケース）、TypeScript型検査を通過。先端distはRust/WASMから再生成し内包WASMの整合性を確認。
   - **動作確認（公開コミット・実機検証）**:
     - 最終配備版（KonomiTV `4477647` / DPlayer `9759653` / mpeg2toh264 `38d7e85`）の7016で、POCOは録画Original（ミュージックステーション15232）の一時停止5秒・60秒シーク・再開後45秒進行・設定復元と終了処理を確認。Linux Chrome実デスクトップは録画Originalの33秒進行・1920×1080キャプチャ・主要画面表示（未捕捉例外0件）を確認しました。
-    - 同じmpeg2toh264・DPlayerを使う先行ビルド（`fc92834`）では、Windows Chrome（30秒）とMac Safari（約30秒）の録画pause/seek/play、およびPOCOのLive Original（低遅延ON/OFF各30秒）も確認しています。先行版には別依存のmpegts.jsのキャッシュ不一致があり、最終版での全端末再試験とは区別しています。
+    - 同じmpeg2toh264・DPlayerを使う先行ビルド（`fc92834`）では、Windows Chrome（30秒）とMac Safari（約30秒）の録画pause/seek/play、およびPOCOのLive Original（低遅延ON/OFF各30秒）も確認しています。
     - 再生制御・通信・終了処理の機械確認であり、視聴体感やA/V同期の評価ではありません。iPad Airは信頼後も自動化セッション初期化で停止し、製品再生は未確認です。
 - **残る未確認事項**: 新基点における各修正単独の実機効果や性能改善率の測定。iPad Air・Firefoxでの再生検証と、全端末での回帰テスト。
 
