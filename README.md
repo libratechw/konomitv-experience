@@ -82,14 +82,18 @@ GPU filmの呼び出し変更まで含めると、描画スレッド時間の短
 - **比較対象**: 公式[KonomiTV `62b2fc5`](https://github.com/tsukumijima/KonomiTV/commit/62b2fc5)＋mpeg2toh264 `faf1464`（A）、Aの依存だけを完全取込候補[`c8fe232`](https://github.com/libratechw/mpeg2toh264/commit/c8fe232)へ更新してCPU autoFilmを維持（B）、B＋PlayerControllerのGPU film呼び出し・障害時CPU復帰処理（C）。DPlayerは全版で公式v1.33.1を維持し、状態表示・追加3改善・他のdogfood修正は含めていません。Cは②全体ではなく、呼び出し変更のみの比較です。
 - **条件**: Linux実デスクトップChrome、Windows Chrome、POCO Chrome、Mac Safari。録画Original・字幕ON・コメント非表示で、同一素材・媒体区間、端末内の表示寸法を固定し、各条件60秒×2回を順序反転して測定（計56走行）。既存statsの読み取りのみで、追加rVFC/rAFループは使用していません。温度・動作周波数を固定したベンチマークではありません。
 
-音楽素材・24fps設定ON時のCanvas出力fps（各試行の平均値、2回の範囲）:
+音楽素材のCanvas出力fps（各試行の平均値、2回の範囲）。24fps設定OFF時はAとB、ON時はAとCを比較しています。
 
-| 端末・ブラウザ | A：公式CPU | C：完全取込＋GPU呼び出し | 留意点 |
-| :--- | ---: | ---: | :--- |
-| Linux Chrome | 52.1–52.2 | 52.1–52.8 | 平均fpsはほぼ同じ。missedは増加 |
-| Windows Chrome | 54.3–54.5 | 59.7–59.9 | Canvas書き込み頻度は向上 |
-| POCO Chrome | 25.7–28.0 | 44.9–54.3 | 元videoのdrop増加も併存。試行差が大きい |
-| Mac Safari | 46.2–46.3 | 50.9–51.2 | Canvas書き込み頻度は向上 |
+| 端末・設定 | A：公式版 | 比較版 | 留意点 |
+| :--- | ---: | :--- | :--- |
+| Linux Chrome・OFF | 54.6–54.8 | B: 53.0–57.5 | 改善方向が一定しない |
+| Linux Chrome・ON | 52.1–52.2 | C: 52.1–52.8 | 平均fpsはほぼ同じ。missedは増加 |
+| Windows Chrome・OFF | 59.9 | B: 59.5–59.9 | ほぼ同水準 |
+| Windows Chrome・ON | 54.3–54.5 | C: 59.7–59.9 | Canvas書き込み頻度は向上 |
+| POCO Chrome・OFF | 59.5–59.7 | B: 57.2–58.0 | 2回とも低下 |
+| POCO Chrome・ON | 25.7–28.0 | C: 44.9–54.3 | 元videoのdrop増加も併存。試行差が大きい |
+| Mac Safari・OFF | 35.8–54.2 | B: 50.6–51.3 | 公式版の変動が大きく、優位は未確定 |
+| Mac Safari・ON | 46.2–46.3 | C: 50.9–51.2 | Canvas書き込み頻度は向上 |
 
 Canvas出力fpsは描画の書き込み頻度であり、実画面への提示や体感上の滑らかさを直接示すものではありません。この音楽ON条件ではBを測定していないため、依存更新単独とGPU呼び出し変更の寄与は分離できません。
 
