@@ -1,0 +1,307 @@
+diff --git a/packages/yadif/src/deinterlace.ts b/packages/yadif/src/deinterlace.ts
+index 80dea6612e90cb04925eb915a30a8cd97480bf96..d8811ce0f09e1d4cf2da947eec4f35bffe8d4e4a 100644
+--- a/packages/yadif/src/deinterlace.ts
++++ b/packages/yadif/src/deinterlace.ts
+@@ -133,6 +133,23 @@ interface FrameObservation {
+   height: number;
+ }
+ 
++interface AutoFilmAnalysisTiming {
++  atMs: number;
++  analysisDrawSubmitMs: number;
++  analysisReadbackMs: number;
++  unpackLumaMs: number;
++  fieldMatchMs: number;
++  sampleDrawSubmitMs: number;
++  sampleReadbackMs: number;
++  decimateMs: number;
++  totalMs: number;
++}
++
++interface AutoFilmAnalysisDiagnostic {
++  enabled: boolean;
++  samples: AutoFilmAnalysisTiming[];
++}
++
+ /** The draw path that produced the picture still represented by the canvas. */
+ type PresentedPicture =
+   | { kind: "texture"; texture: WebGLTexture; flip: boolean }
+@@ -1523,6 +1540,15 @@ export class Deinterlacer extends EventTarget {
+     const cur = (this.#head + HISTORY - 1) % HISTORY;
+     const prev = (this.#head + 1) % HISTORY;
+     const isTopFieldFirst = this.#topFieldFirst;
++    // This hook exists only in the diagnostic build and is intentionally not
++    // part of the package API.
++    const diagnostic = (
++      globalThis as typeof globalThis & {
++        __YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__?: AutoFilmAnalysisDiagnostic;
++      }
++    ).__YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__;
++    const measure = diagnostic?.enabled === true;
++    const startedAt = measure ? performance.now() : 0;
+ 
+     // One GPU draw and readback supplies the three luma frames without moving
+     // full-resolution RGBA pictures through JavaScript.
+@@ -1538,6 +1564,7 @@ export class Deinterlacer extends EventTarget {
+     gl.uniform2i(analysisLocation.size, this.#width, this.#height);
+     gl.viewport(0, 0, FILM_ANALYSIS_WIDTH, FILM_ANALYSIS_HEIGHT);
+     gl.drawArrays(gl.TRIANGLES, 0, 3);
++    const analysisSubmittedAt = measure ? performance.now() : 0;
+     gl.readPixels(
+       0,
+       0,
+@@ -1547,6 +1574,7 @@ export class Deinterlacer extends EventTarget {
+       gl.UNSIGNED_BYTE,
+       target.pixels,
+     );
++    const analysisReadAt = measure ? performance.now() : 0;
+     const { previousLuma, currentLuma, nextLuma } = target;
+     for (let pixel = 0; pixel < previousLuma.length; pixel++) {
+       const offset = pixel * 4;
+@@ -1554,6 +1582,7 @@ export class Deinterlacer extends EventTarget {
+       currentLuma[pixel] = target.pixels[offset + 1] ?? 0;
+       nextLuma[pixel] = target.pixels[offset + 2] ?? 0;
+     }
++    const unpackedAt = measure ? performance.now() : 0;
+     const fieldMatch = this.#ivtc.fieldMatch(
+       previousLuma,
+       currentLuma,
+@@ -1561,6 +1590,7 @@ export class Deinterlacer extends EventTarget {
+       isTopFieldFirst,
+       this.#filmCombThreshold,
+     );
++    const fieldMatchedAt = measure ? performance.now() : 0;
+ 
+     // Decimate returns the selected RGB weave to YUV 4:2:0 sample density, so
+     // brightness noise and colour-only changes share FFmpeg's metric scale.
+@@ -1575,6 +1605,7 @@ export class Deinterlacer extends EventTarget {
+       fieldMatch.match === "p" ? 0 : fieldMatch.match === "c" ? 1 : 2,
+     );
+     gl.drawArrays(gl.TRIANGLES, 0, 3);
++    const sampleSubmittedAt = measure ? performance.now() : 0;
+     gl.readPixels(
+       0,
+       0,
+@@ -1584,7 +1615,21 @@ export class Deinterlacer extends EventTarget {
+       gl.UNSIGNED_BYTE,
+       target.pixels,
+     );
++    const sampleReadAt = measure ? performance.now() : 0;
+     const decimate = this.#ivtc.decimate(target.pixels);
++    const decimatedAt = measure ? performance.now() : 0;
++    if (measure)
++      diagnostic.samples.push({
++        atMs: startedAt,
++        analysisDrawSubmitMs: analysisSubmittedAt - startedAt,
++        analysisReadbackMs: analysisReadAt - analysisSubmittedAt,
++        unpackLumaMs: unpackedAt - analysisReadAt,
++        fieldMatchMs: fieldMatchedAt - unpackedAt,
++        sampleDrawSubmitMs: sampleSubmittedAt - fieldMatchedAt,
++        sampleReadbackMs: sampleReadAt - sampleSubmittedAt,
++        decimateMs: decimatedAt - sampleReadAt,
++        totalMs: decimatedAt - startedAt,
++      });
+     this.#match = fieldMatch.match;
+     this.#combScore = fieldMatch.combScore;
+     this.#isCombed = fieldMatch.isCombed;
+diff --git a/packages/yadif/src/ivtc.ts b/packages/yadif/src/ivtc.ts
+index 443e85801902f79c5dcbe6d04fe4410740f1073a..3f3d5dcc7e2471f1325eff519d7ada7c19d2a59a 100644
+--- a/packages/yadif/src/ivtc.ts
++++ b/packages/yadif/src/ivtc.ts
+@@ -16,6 +16,25 @@ export interface FieldMatchResult {
+   luma: Uint8Array;
+ }
+ 
++interface AutoFilmAnalysisDiagnostic {
++  enabled: boolean;
++  fieldMatchSamples: Array<{
++    atMs: number;
++    compareFieldsMs: number;
++    scoreWeaveMs: number;
++    combScoreMs: number;
++    resultWeaveMs: number;
++    totalMs: number;
++  }>;
++  decimateSamples: Array<{
++    atMs: number;
++    differenceMs: number;
++    sampleCopyMs: number;
++    cycleDecisionMs: number;
++    totalMs: number;
++  }>;
++}
++
+ /** The decimate result for the frame currently being analysed. */
+ export interface DecimateResult {
+   cycleIndex: number;
+@@ -74,23 +93,43 @@ export class FFmpegIVTC {
+     isTopFieldFirst: boolean,
+     combedPixelLimit = FFmpegIVTC.COMBED_PIXEL_LIMIT,
+   ): FieldMatchResult {
++    const diagnostic = (
++      globalThis as typeof globalThis & {
++        __YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__?: AutoFilmAnalysisDiagnostic;
++      }
++    ).__YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__;
++    const measure = diagnostic?.enabled === true;
++    const startedAt = measure ? performance.now() : 0;
+     const field = isTopFieldFirst ? 1 : 0;
+     const frames = { p: previous, c: current, n: next } as const;
+ 
+     // pc_n first chooses p or c with FFmpeg's motion-aware comparison, then
+     // lets n replace it only through the full comb-matching check
+     let match = this.#compareFields("c", "p", field, frames);
++    const comparedAt = measure ? performance.now() : 0;
+     // checkmm calculates only the candidates it visits, so the port keeps the
+     // same lazy score cache around its p/c result and n rescue candidate
+     const combScores = new Map<FilmMatch, number>();
++    let scoreWeaveMs = 0;
++    let combScoreMs = 0;
+     const score = (candidate: FilmMatch): number => {
+       const cached = combScores.get(candidate);
+       if (cached !== undefined) return cached;
+-      const value = FFmpegIVTC.#combedScore(
+-        this.weave(previous, current, next, candidate, isTopFieldFirst),
+-        this.#width,
+-        this.#height,
++      const weaveStartedAt = measure ? performance.now() : 0;
++      const luma = this.weave(
++        previous,
++        current,
++        next,
++        candidate,
++        isTopFieldFirst,
+       );
++      const weaveFinishedAt = measure ? performance.now() : 0;
++      const value = FFmpegIVTC.#combedScore(luma, this.#width, this.#height);
++      const scoreFinishedAt = measure ? performance.now() : 0;
++      if (measure) {
++        scoreWeaveMs += weaveFinishedAt - weaveStartedAt;
++        combScoreMs += scoreFinishedAt - weaveFinishedAt;
++      }
+       combScores.set(candidate, value);
+       return value;
+     };
+@@ -109,16 +148,35 @@ export class FFmpegIVTC {
+     const combScore = score(match);
+     const isCombed = combScore >= combedPixelLimit;
+     if (isCombed) match = "c";
++    const resultWeaveStartedAt = measure ? performance.now() : 0;
++    const luma = this.weave(previous, current, next, match, isTopFieldFirst);
++    const finishedAt = measure ? performance.now() : 0;
++    if (measure)
++      diagnostic.fieldMatchSamples.push({
++        atMs: startedAt,
++        compareFieldsMs: comparedAt - startedAt,
++        scoreWeaveMs,
++        combScoreMs,
++        resultWeaveMs: finishedAt - resultWeaveStartedAt,
++        totalMs: finishedAt - startedAt,
++      });
+     return {
+       match,
+       combScore,
+       isCombed,
+-      luma: this.weave(previous, current, next, match, isTopFieldFirst),
++      luma,
+     };
+   }
+ 
+   /** Apply FFmpeg's mixed decimate threshold to a live five-frame window. */
+   decimate(sample: Uint8Array): DecimateResult {
++    const diagnostic = (
++      globalThis as typeof globalThis & {
++        __YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__?: AutoFilmAnalysisDiagnostic;
++      }
++    ).__YADIF_AUTOFILM_ANALYSIS_DIAGNOSTIC__;
++    const measure = diagnostic?.enabled === true;
++    const startedAt = measure ? performance.now() : 0;
+     const cycleIndex = this.#cycleIndex;
+     const metric = this.#previousSample
+       ? FFmpegIVTC.#difference(
+@@ -131,6 +189,7 @@ export class FFmpegIVTC {
+           maxBlockDifference: Infinity,
+           totalDifference: Infinity,
+         };
++    const differenceFinishedAt = measure ? performance.now() : 0;
+     this.#metrics.push(metric);
+ 
+     // The completed preceding cycle supplies the candidate phase, but the
+@@ -145,7 +204,9 @@ export class FFmpegIVTC {
+     // this live cycle at input rate while its metrics establish the new one
+     if (isPredictedDuplicate && !shouldDrop) this.#activeDropIndex = null;
+     const dropIndex = this.#activeDropIndex;
++    const copyStartedAt = measure ? performance.now() : 0;
+     this.#previousSample = sample.slice();
++    const copyFinishedAt = measure ? performance.now() : 0;
+     this.#cycleIndex++;
+ 
+     let nextDropIndex = this.#activeDropIndex;
+@@ -187,6 +248,17 @@ export class FFmpegIVTC {
+       this.#cycleIndex = 0;
+     }
+ 
++    const finishedAt = measure ? performance.now() : 0;
++    if (measure)
++      diagnostic.decimateSamples.push({
++        atMs: startedAt,
++        differenceMs: differenceFinishedAt - startedAt,
++        sampleCopyMs: copyFinishedAt - copyStartedAt,
++        cycleDecisionMs:
++          copyStartedAt - differenceFinishedAt + finishedAt - copyFinishedAt,
++        totalMs: finishedAt - startedAt,
++      });
++
+     return {
+       cycleIndex,
+       maxBlockDifference: metric.maxBlockDifference,
+@@ -439,21 +511,38 @@ export class FFmpegIVTC {
+   /** Calculate fieldmatch's vertical comb mask and overlapping 16x16 score. */
+   static #combedScore(luma: Uint8Array, width: number, height: number): number {
+     const mask = new Uint8Array(width * height);
+-    const sample = (x: number, y: number): number =>
+-      luma[Math.max(0, Math.min(height - 1, y)) * width + x] ?? 0;
+     // The five-tap vertical filter marks pixels whose alternating-line energy
+     // exceeds FFmpeg's default cthresh on both adjacent lines
+     for (let y = 0; y < height; y++) {
++      const currentRow = y * width;
++      const previousRow =
++        Math.max(0, Math.min(height - 1, y === 0 ? 1 : y - 1)) * width;
++      const nextRow =
++        Math.max(
++          0,
++          Math.min(height - 1, y === height - 1 ? height - 2 : y + 1),
++        ) * width;
++      const farPreviousRow =
++        Math.max(0, Math.min(height - 1, y < 2 ? (y === 0 ? 2 : 3) : y - 2)) *
++        width;
++      const farNextRow =
++        Math.max(
++          0,
++          Math.min(
++            height - 1,
++            y + 2 >= height
++              ? y === height - 1
++                ? height - 3
++                : height - 4
++              : y + 2,
++          ),
++        ) * width;
+       for (let x = 0; x < width; x++) {
+-        const current = sample(x, y);
+-        const previous = sample(x, y === 0 ? 1 : y - 1);
+-        const next = sample(x, y === height - 1 ? height - 2 : y + 1);
+-        const farPrevious =
+-          y < 2 ? sample(x, y === 0 ? 2 : 3) : sample(x, y - 2);
+-        const farNext =
+-          y + 2 >= height
+-            ? sample(x, y === height - 1 ? height - 3 : height - 4)
+-            : sample(x, y + 2);
++        const current = luma[currentRow + x] ?? 0;
++        const previous = luma[previousRow + x] ?? 0;
++        const next = luma[nextRow + x] ?? 0;
++        const farPrevious = luma[farPreviousRow + x] ?? 0;
++        const farNext = luma[farNextRow + x] ?? 0;
+         const hasAdjacentDifference =
+           y === 0
+             ? Math.abs(current - next) > FFmpegIVTC.COMB_THRESHOLD

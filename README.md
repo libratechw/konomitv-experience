@@ -128,18 +128,20 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 ## 5. 外部ライブラリ（Starlette）切断問題の検証材料
 
 - **問題の所在**: クライアント切断後も`FileResponse`がバックグラウンドで不要な送信を継続し、シーク復帰性能を圧迫する問題。
-- **状況**: 上流PR [encode/starlette#3390](https://github.com/Kludex/starlette/pull/3390) へ[検証データを提供](https://github.com/Kludex/starlette/pull/3390#issuecomment-5548572632)。KonomiTV側の影響は [KonomiTV Issue #279](https://github.com/tsukumijima/KonomiTV/issues/279) にて報告。
-- **検証ブランチ**: [`codex/fix-file-response-disconnect`](https://github.com/libratechw/starlette/tree/codex/fix-file-response-disconnect) は検証用材料として保持し、独自PRとしては提出しません。
+- **状況**: 上流PR [encode/starlette#3390](https://github.com/Kludex/starlette/pull/3390) へ[検証データを提供](https://github.com/Kludex/starlette/pull/3390#issuecomment-5548572632)。KonomiTV側の影響は [KonomiTV Issue #279](https://github.com/tsukumijima/KonomiTV/issues/279) にて報告。なお、切断対策の上流PR [encode/starlette#3523](https://github.com/Kludex/starlette/pull/3523) はマージ済み。
+- **検証コード**: [`codex/fix-file-response-disconnect`](https://github.com/libratechw/starlette/commit/17e3955f997c2f271a08057fe649abadcc482f77)（固定commit: [`17e3955`](https://github.com/libratechw/starlette/commit/17e3955f997c2f271a08057fe649abadcc482f77)、差分: [results/starlette-file-response-disconnect.patch](results/starlette-file-response-disconnect.patch)）は検証用材料として保持し、独自PRとしては提出しません。
 
 ---
 
 ## 6. 検証アーティファクトと診断コードの参照
 
-### 診断・計測専用ブランチ（取り込み対象外）
-以下のブランチは問題切り分けと観測ログ取得のための計装コードであり、上流へのマージは想定していません。
-- [`diagnostic/worker-presentation-observability`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/worker-presentation-observability): 描画backend、rAF、submit、フレーム取込キューの記録。
-- [`diagnostic/autofilm-analysis-observability`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/autofilm-analysis-observability): `autoFilm`のGPU readback、field match、decimate処理時間内訳の計測。
-- [`diagnostic/mse-operation-context`](https://github.com/libratechw/mpeg2toh264/tree/diagnostic/mse-operation-context)（KonomiTV: [`4b307e9`](https://github.com/libratechw/KonomiTV/commit/4b307e9) / mpeg2toh264: [`a3c0cd3`](https://github.com/libratechw/mpeg2toh264/commit/a3c0cd3)）および統合診断版[`diagnostic/dogfood-mse-operation-context`](https://github.com/libratechw/KonomiTV/tree/diagnostic/dogfood-mse-operation-context)（[`748d0b0`](https://github.com/libratechw/KonomiTV/commit/748d0b0)）: iOS実機におけるMSE操作失敗箇所の特定。
+### 診断・計測用差分（取り込み対象外）
+
+問題切り分けと観測ログ取得のための計装コードであり、上流へのマージは想定していません。固定コミットおよびソース差分（生成済みdistは含みません）として保存されています。基点・適用手順・SHA256一覧は [results/retired-public-branches-20261005.json](results/retired-public-branches-20261005.json) を参照してください。
+
+- [`diagnostic/worker-presentation-observability`](https://github.com/libratechw/mpeg2toh264/commit/485838acb022da16aa74b2b4dc53bbd5ed3f5a1a)（固定commit: [`485838a`](https://github.com/libratechw/mpeg2toh264/commit/485838acb022da16aa74b2b4dc53bbd5ed3f5a1a)、差分: [results/mpeg2toh264-worker-presentation-observability.patch](results/mpeg2toh264-worker-presentation-observability.patch)）: 描画backend、rAF、submit、フレーム取込キューの記録。
+- [`diagnostic/autofilm-analysis-observability`](https://github.com/libratechw/mpeg2toh264/commit/89e2e04941212f76349f0a32c78de54314abc908)（固定commit: [`89e2e04`](https://github.com/libratechw/mpeg2toh264/commit/89e2e04941212f76349f0a32c78de54314abc908)、差分: [results/mpeg2toh264-autofilm-analysis-observability.patch](results/mpeg2toh264-autofilm-analysis-observability.patch)）: `autoFilm`のGPU readback、field match、decimate処理時間内訳の計測。
+- [`diagnostic/mse-operation-context`](https://github.com/libratechw/mpeg2toh264/commit/a3c0cd3dc9cae8c6c1493427f6a762dd4de8b25c)（KonomiTV: [`4b307e9`](https://github.com/libratechw/KonomiTV/commit/4b307e9) / mpeg2toh264: [`a3c0cd3`](https://github.com/libratechw/mpeg2toh264/commit/a3c0cd3dc9cae8c6c1493427f6a762dd4de8b25c)、差分: [results/mpeg2toh264-mse-operation-context.patch](results/mpeg2toh264-mse-operation-context.patch)）および統合診断版[`diagnostic/dogfood-mse-operation-context`](https://github.com/libratechw/KonomiTV/commit/748d0b0c969a654a015f075f05f67042fc972db9)（[`748d0b0`](https://github.com/libratechw/KonomiTV/commit/748d0b0c969a654a015f075f05f67042fc972db9)、差分: [results/konomitv-dogfood-mse-operation-context.patch](results/konomitv-dogfood-mse-operation-context.patch)）: iOS実機におけるMSE操作失敗箇所の特定。
 
 ### データの扱いについて
 - 過去の基準版（mpeg2toh264 [`faf1464`](https://github.com/libratechw/mpeg2toh264/commit/faf1464)、KonomiTV [`ea1962f`](https://github.com/libratechw/KonomiTV/commit/ea1962f)）の測定データは特定条件の記録として保持し、現行コードへの無条件な当てはめは行いません。

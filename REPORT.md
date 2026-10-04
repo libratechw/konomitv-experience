@@ -290,7 +290,7 @@ Starletteが切断後もファイル送信を続ける問題に対し、送信�
 
 低電力Windowsの隔離KonomiTVで、3MiB受信後に切断するRange要求を200回繰り返すと、Starlette基準版は応答が走行後半ほど悪化しました。`codex/fix-file-response-disconnect`では、ASGI disconnect後にfile送信を止めることで同じ悪化を再現しませんでした。[200要求の比較](results/windows-range-abort-starlette-fix-200.json)と[単体回帰試験](results/file-response-disconnect-starlette-fix.json)を公開しています。
 
-Starletteには同じ問題を扱う[PR #3390](https://github.com/Kludex/starlette/pull/3390)があります。独自PRは作らず、比較実装、テスト、ベンチマーク、loopback再測定を[PRコメント](https://github.com/Kludex/starlette/pull/3390#issuecomment-5548572632)として共有しました。`codex/fix-file-response-disconnect`は、その検証材料として保持しています。
+Starletteには同じ問題を扱う[PR #3390](https://github.com/Kludex/starlette/pull/3390)があります。独自PRは作らず、比較実装、テスト、ベンチマーク、loopback再測定を[PRコメント](https://github.com/Kludex/starlette/pull/3390#issuecomment-5548572632)として共有しました。`codex/fix-file-response-disconnect`の検証材料は、固定commit [`17e3955`](https://github.com/libratechw/starlette/commit/17e3955f997c2f271a08057fe649abadcc482f77) および差分 [results/starlette-file-response-disconnect.patch](results/starlette-file-response-disconnect.patch) として保持しています。
 
 KonomiTVへの実視聴影響は、測定結果を添えて[Issue #279](https://github.com/tsukumijima/KonomiTV/issues/279)へ報告しました。
 

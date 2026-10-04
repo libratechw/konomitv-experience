@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-05",
+  "purpose": "Historical diagnostic code; not an adoption recommendation.",
+  "patch_format": "git diff --binary --full-index",
+  "excluded_paths": [
+    "**/dist/**"
+  ],
+  "replay": {
+    "workspace": "Clean checkout of each entry's repository at base_commit.",
+    "check": "git apply --check <patch>",
+    "apply": "git apply <patch>",
+    "scope": "Source, tests, manifests and documentation only; generated distributions are excluded."
+  },
+  "entries": [
+    {
+      "repository": "https://github.com/libratechw/mpeg2toh264",
+      "retired_branch": "diagnostic/worker-presentation-observability",
+      "base_commit": "faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "recorded_tip": "485838acb022da16aa74b2b4dc53bbd5ed3f5a1a",
+      "source_patch": "mpeg2toh264-worker-presentation-observability.patch",
+      "source_patch_sha256": "f440bb9dc12f2027e144d838513c952f7f1514a8e6da7d7a64816b633eaeda55"
+    },
+    {
+      "repository": "https://github.com/libratechw/mpeg2toh264",
+      "retired_branch": "diagnostic/autofilm-analysis-observability",
+      "base_commit": "faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "recorded_tip": "89e2e04941212f76349f0a32c78de54314abc908",
+      "source_patch": "mpeg2toh264-autofilm-analysis-observability.patch",
+      "source_patch_sha256": "2816f32abfce3f96f3bf9f55079d1bd8d233dff51e3a42aa6f196909a61b9f9d"
+    },
+    {
+      "repository": "https://github.com/libratechw/mpeg2toh264",
+      "retired_branch": "diagnostic/mse-operation-context",
+      "base_commit": "faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "recorded_tip": "a3c0cd3dc9cae8c6c1493427f6a762dd4de8b25c",
+      "source_patch": "mpeg2toh264-mse-operation-context.patch",
+      "source_patch_sha256": "6e5e68496be71b8b2facf50cc3bc35428f824f74fb7cf2f25f9ebf4094e0fe38"
+    },
+    {
+      "repository": "https://github.com/libratechw/KonomiTV",
+      "retired_branch": "diagnostic/dogfood-mse-operation-context",
+      "historical_note": "The archived Readme.md names an earlier mpeg2toh264 revision (52bedade). Use client/package.json and client/yarn.lock for the recorded dependency (a3c0cd3); the historical patch is preserved unchanged.",
+      "base_commit": "ea1962f84c22265c1d31081dfe41cc3b53e9a555",
+      "recorded_tip": "748d0b0c969a654a015f075f05f67042fc972db9",
+      "source_patch": "konomitv-dogfood-mse-operation-context.patch",
+      "source_patch_sha256": "2c96245147e86b7cc9e23fe46fcef6a9a1dc09b6eadca9286467fc488ac5eb49"
+    },
+    {
+      "repository": "https://github.com/libratechw/starlette",
+      "retired_branch": "codex/fix-file-response-disconnect",
+      "base_commit": "75735e144dca0551c2ff7eba3582355cda42da92",
+      "recorded_tip": "17e3955f997c2f271a08057fe649abadcc482f77",
+      "source_patch": "starlette-file-response-disconnect.patch",
+      "source_patch_sha256": "814de17ebb92b55d1e65b726c9a082a1a8bb201fa80b464e6f2b03cf0c342fdb"
+    }
+  ]
+}

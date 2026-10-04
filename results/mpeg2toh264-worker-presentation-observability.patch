@@ -1,0 +1,858 @@
+diff --git a/packages/yadif/src/deinterlace.ts b/packages/yadif/src/deinterlace.ts
+index 80dea6612e90cb04925eb915a30a8cd97480bf96..c83f8a12c7a7a65ff52f09142904af16a2cb702b 100644
+--- a/packages/yadif/src/deinterlace.ts
++++ b/packages/yadif/src/deinterlace.ts
+@@ -36,6 +36,11 @@ import type {
+   WorkerRenderingOptions,
+   WorkerVideoState,
+ } from "./worker-protocol.js";
++import {
++  appendWorkerTrace,
++  recordEngineTrace,
++  setTraceBackend,
++} from "./render-trace.js";
+ 
+ let bundledWorkerURL: string | URL | null = null;
+ 
+@@ -372,6 +377,7 @@ export class Deinterlacer extends EventTarget {
+   #lastLoopAt = 0;
+   /** ページ側で requestVideoFrameCallback() の停止を監視する requestAnimationFrame()。 */
+   #frameWatchdogHandle: number | null = null;
++  #lastFrameWatchdogAt = 0;
+   /** The gap between animation frames: as near as the page gets to the screen. */
+   #refreshMs = DEFAULT_REFRESH_MS;
+   /** The `<div>` this put around the element, so it can be taken away again. */
+@@ -427,6 +433,7 @@ export class Deinterlacer extends EventTarget {
+   #displayCanvasTransferred = false;
+   #workerFrameID = 0;
+   #workerFrameInFlight = false;
++  #workerFrameSentAt: { id: number; atMs: number } | null = null;
+   #workerAcceptedFrame = false;
+   #pendingWorkerFrame: PendingWorkerFrame | null = null;
+   #captureID = 0;
+@@ -479,6 +486,13 @@ export class Deinterlacer extends EventTarget {
+     this.#rendering = externalHost ? "main" : (options.rendering ?? "auto");
+     this.#workerURL = options.workerUrl ?? bundledWorkerURL;
+     this.#workerState = this.#rendering === "main" ? "main" : "idle";
++    if (!externalHost)
++      setTraceBackend(
++        this.#rendering,
++        this.#workerState === "main" ? "main" : "starting",
++        this.#workerGeneration,
++        this.#workerState === "main" ? "configured-main" : "configured-auto",
++      );
+     this.#displayCanvas = externalHost
+       ? (externalHost.canvas as unknown as HTMLCanvasElement)
+       : document.createElement("canvas");
+@@ -738,11 +752,17 @@ export class Deinterlacer extends EventTarget {
+       "transferControlToOffscreen" in HTMLCanvasElement.prototype;
+     if (!canTransfer) {
+       if (this.#rendering === "auto") {
+-        this.#fallBackToMain();
++        this.#fallBackToMain("capability-fallback");
+         return false;
+       }
+       this.#workerState = "failed";
+       this.#running = false;
++      setTraceBackend(
++        this.#rendering,
++        "failed",
++        this.#workerGeneration,
++        "required-worker-unavailable",
++      );
+       return true;
+     }
+     this.#startWorker();
+@@ -755,6 +775,7 @@ export class Deinterlacer extends EventTarget {
+     this.#worker?.terminate();
+     this.#worker = null;
+     this.#workerFrameInFlight = false;
++    this.#workerFrameSentAt = null;
+     this.#workerAcceptedFrame = false;
+     let canvas = this.#displayCanvas;
+     // 初回は公開済みの要素をそのまま使い、片方向転送済みの canvas を復旧する場合だけ新しい要素へ差し替える。
+@@ -772,6 +793,12 @@ export class Deinterlacer extends EventTarget {
+ 
+     const generation = ++this.#workerGeneration;
+     this.#workerState = "starting";
++    setTraceBackend(
++      this.#rendering,
++      "starting",
++      generation,
++      this.#workerRestarted ? "worker-restarting" : "worker-starting",
++    );
+     let worker: Worker;
+     let offscreen: OffscreenCanvas;
+     try {
+@@ -814,6 +841,12 @@ export class Deinterlacer extends EventTarget {
+     switch (notification.type) {
+       case "ready":
+         this.#workerState = "active";
++        setTraceBackend(
++          this.#rendering,
++          "worker",
++          this.#workerGeneration,
++          "worker-ready",
++        );
+         if (this.#running) {
+           this.#request();
+           this.#startFrameWatchdog();
+@@ -825,6 +858,18 @@ export class Deinterlacer extends EventTarget {
+       case "consumed": {
+         this.#workerFrameInFlight = false;
+         this.#workerAcceptedFrame = true;
++        const acknowledgedAt = performance.now();
++        const sent = this.#workerFrameSentAt;
++        recordEngineTrace({
++          kind: "worker-bridge",
++          atMs: acknowledgedAt,
++          stage: "acknowledged",
++          id: notification.id,
++          relatedId: null,
++          durationMs:
++            sent?.id === notification.id ? acknowledgedAt - sent.atMs : null,
++        });
++        this.#workerFrameSentAt = null;
+         const pending = this.#pendingWorkerFrame;
+         this.#pendingWorkerFrame = null;
+         if (pending) this.#sendWorkerFrame(pending);
+@@ -845,6 +890,9 @@ export class Deinterlacer extends EventTarget {
+         this.#onStats?.(stats);
+         break;
+       }
++      case "diagnostic-batch":
++        appendWorkerTrace(notification.batch, this.#workerGeneration);
++        break;
+       case "capture": {
+         const request = this.#captureRequests.get(notification.id);
+         this.#captureRequests.delete(notification.id);
+@@ -870,7 +918,7 @@ export class Deinterlacer extends EventTarget {
+       this.#rendering === "auto" &&
+       !this.#workerRestarted
+     ) {
+-      this.#fallBackToMain();
++      this.#fallBackToMain("initialization-fallback");
+       return;
+     }
+     this.#rejectCaptureRequests(message);
+@@ -881,6 +929,12 @@ export class Deinterlacer extends EventTarget {
+     }
+     console.error(`Deinterlacer Worker stopped: ${message}`);
+     this.#workerState = "failed";
++    setTraceBackend(
++      this.#rendering,
++      "failed",
++      this.#workerGeneration,
++      "worker-terminal-failure",
++    );
+     this.#worker?.terminate();
+     this.#worker = null;
+     this.#closePendingWorkerFrame();
+@@ -888,7 +942,7 @@ export class Deinterlacer extends EventTarget {
+   }
+ 
+   /** Worker を自動選択できなかった場合は元のメインスレッド用 canvas へ戻す。 */
+-  #fallBackToMain(): void {
++  #fallBackToMain(reason: string): void {
+     const mainCanvas = this.#renderCanvas as HTMLCanvasElement;
+     mainCanvas.className = this.#displayCanvas.className;
+     const style = this.#displayCanvas.getAttribute("style");
+@@ -902,6 +956,7 @@ export class Deinterlacer extends EventTarget {
+     this.#worker?.terminate();
+     this.#worker = null;
+     this.#workerState = "main";
++    setTraceBackend(this.#rendering, "main", this.#workerGeneration, reason);
+     this.#closePendingWorkerFrame();
+     if (this.#running) {
+       this.#request();
+@@ -976,6 +1031,12 @@ export class Deinterlacer extends EventTarget {
+     this.#worker?.postMessage({ type: "destroy" } satisfies WorkerCommand);
+     this.#worker?.terminate();
+     this.#worker = null;
++    setTraceBackend(
++      this.#rendering,
++      "failed",
++      this.#workerGeneration,
++      "destroyed",
++    );
+     this.#closePendingWorkerFrame();
+     this.#rejectCaptureRequests("the deinterlacer was destroyed");
+     this.#renderCanvas.removeEventListener(
+@@ -1123,6 +1184,8 @@ export class Deinterlacer extends EventTarget {
+     now: DOMHighResTimeStamp,
+     metadata: FrameObservation,
+   ): void {
++    const id = ++this.#workerFrameID;
++    const constructionStartedAt = performance.now();
+     let frame: VideoFrame;
+     try {
+       frame = new VideoFrame(this.#video, {
+@@ -1136,23 +1199,43 @@ export class Deinterlacer extends EventTarget {
+         !this.#workerAcceptedFrame &&
+         !this.#workerRestarted
+       ) {
+-        this.#fallBackToMain();
++        this.#fallBackToMain("video-frame-fallback");
+         this.#processFrame(now, metadata);
+       } else {
+         this.#workerFailed(message);
+       }
+       return;
+     }
++    const offeredAt = performance.now();
++    recordEngineTrace({
++      kind: "worker-bridge",
++      atMs: offeredAt,
++      stage: "offered",
++      id,
++      relatedId: null,
++      durationMs: offeredAt - constructionStartedAt,
++    });
+     const pending: PendingWorkerFrame = {
+-      id: ++this.#workerFrameID,
++      id,
+       frame,
+       now,
+       metadata,
+       video: this.#workerVideoState(),
+     };
+     if (this.#workerFrameInFlight) {
++      const replacedId = this.#pendingWorkerFrame?.id ?? null;
++      const pendingCloseStartedAt = performance.now();
+       this.#pendingWorkerFrame?.frame.close();
++      const pendingStoredAt = performance.now();
+       this.#pendingWorkerFrame = pending;
++      recordEngineTrace({
++        kind: "worker-bridge",
++        atMs: pendingStoredAt,
++        stage: replacedId === null ? "pending-set" : "pending-replaced",
++        id,
++        relatedId: replacedId,
++        durationMs: pendingStoredAt - pendingCloseStartedAt,
++      });
+       return;
+     }
+     this.#sendWorkerFrame(pending);
+@@ -1168,9 +1251,21 @@ export class Deinterlacer extends EventTarget {
+     this.#workerFrameInFlight = true;
+     const command: WorkerCommand = { type: "frame", ...pending };
+     try {
++      const sendStartedAt = performance.now();
+       worker.postMessage(command, [pending.frame]);
++      const sentAt = performance.now();
++      this.#workerFrameSentAt = { id: pending.id, atMs: sentAt };
++      recordEngineTrace({
++        kind: "worker-bridge",
++        atMs: sentAt,
++        stage: "sent",
++        id: pending.id,
++        relatedId: null,
++        durationMs: sentAt - sendStartedAt,
++      });
+     } catch (error) {
+       this.#workerFrameInFlight = false;
++      this.#workerFrameSentAt = null;
+       pending.frame.close();
+       const message = error instanceof Error ? error.message : String(error);
+       // 最初のフレーム転送失敗は機能不足として扱い、実動後の障害だけを再構築の対象にする。
+@@ -1179,7 +1274,7 @@ export class Deinterlacer extends EventTarget {
+         !this.#workerAcceptedFrame &&
+         !this.#workerRestarted
+       ) {
+-        this.#fallBackToMain();
++        this.#fallBackToMain("transfer-fallback");
+         this.#processFrame(pending.now, pending.metadata);
+       } else {
+         this.#workerFailed(message);
+@@ -1198,6 +1293,13 @@ export class Deinterlacer extends EventTarget {
+       this.#lastObservedVideoFrames,
+       this.#video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0,
+     );
++    recordEngineTrace({
++      kind: "frame-ingest",
++      atMs: now,
++      mediaTime: metadata.mediaTime,
++      presentedFrames: metadata.presentedFrames,
++      path: "callback",
++    });
+     this.#ingestFrame(now, metadata);
+     this.#request();
+   };
+@@ -1218,6 +1320,13 @@ export class Deinterlacer extends EventTarget {
+     metadata: FrameObservation,
+     frame: VideoFrame,
+   ): void {
++    recordEngineTrace({
++      kind: "frame-ingest",
++      atMs: now,
++      mediaTime: metadata.mediaTime,
++      presentedFrames: metadata.presentedFrames,
++      path: "worker-transfer",
++    });
+     this.#frameSource = frame;
+     try {
+       this.#processFrame(now, metadata);
+@@ -1648,7 +1757,17 @@ export class Deinterlacer extends EventTarget {
+     if (target === null) {
+       this.#presentedPicture = { kind: "film" };
+       this.#setVisible(true);
+-      if (countOutput) this.#outputSinceReport++;
++      if (countOutput) {
++        this.#outputSinceReport++;
++        recordEngineTrace({
++          kind: "draw-submit",
++          atMs: performance.now(),
++          rafAtMs: null,
++          scheduledAtMs: null,
++          queueDepthAfter: this.#queue.length,
++          path: "film-direct",
++        });
++      }
+     }
+   }
+ 
+@@ -1718,6 +1837,10 @@ export class Deinterlacer extends EventTarget {
+       this.#presentedPicture?.kind === "texture"
+         ? this.#presentedPicture.texture
+         : null;
++    const shownSlotIndex = this.#outputs.findIndex(
++      (candidate) => candidate?.texture === shownTexture,
++    );
++    const shownSlot = shownSlotIndex < 0 ? null : shownSlotIndex;
+     const queuedSlots = new Set(this.#queue.map(({ slot }) => slot));
+     for (let offset = 1; offset <= OUTPUT_POOL_LENGTH; offset++) {
+       const slot = (this.#outputHead + offset) % OUTPUT_POOL_LENGTH;
+@@ -1732,8 +1855,32 @@ export class Deinterlacer extends EventTarget {
+     const oldest = this.#queue[0];
+     if (oldest) {
+       const output = this.#outputs[oldest.slot];
+-      if (output && output.texture !== shownTexture) return oldest.slot;
++      if (output && output.texture !== shownTexture) {
++        recordEngineTrace({
++          kind: "slot-pressure",
++          atMs: performance.now(),
++          outcome: "oldest",
++          resultSlot: oldest.slot,
++          outputPoolLength: this.#outputs.length,
++          initializedOutputs: this.#outputs.filter(Boolean).length,
++          outputHead: this.#outputHead,
++          shownSlot,
++          queuedSlots: [...queuedSlots],
++        });
++        return oldest.slot;
++      }
+     }
++    recordEngineTrace({
++      kind: "slot-pressure",
++      atMs: performance.now(),
++      outcome: "none",
++      resultSlot: null,
++      outputPoolLength: this.#outputs.length,
++      initializedOutputs: this.#outputs.filter(Boolean).length,
++      outputHead: this.#outputHead,
++      shownSlot,
++      queuedSlots: [...queuedSlots],
++    });
+     return null;
+   }
+ 
+@@ -1754,10 +1901,11 @@ export class Deinterlacer extends EventTarget {
+   #onLoop = (now: DOMHighResTimeStamp): void => {
+     this.#loopHandle = null;
+     if (!this.#running || this.#lost) return;
++    const loopGap = this.#lastLoopAt > 0 ? now - this.#lastLoopAt : null;
+     // Short ordinary gaps identify the refresh interval, while a long task
+     // only moves the estimate gradually until regular animation resumes.
+-    if (this.#lastLoopAt > 0) {
+-      const gap = now - this.#lastLoopAt;
++    if (loopGap !== null) {
++      const gap = loopGap;
+       if (gap >= 1 && gap <= MAX_PERIOD_MS) {
+         this.#refreshMs =
+           gap < this.#refreshMs
+@@ -1766,6 +1914,29 @@ export class Deinterlacer extends EventTarget {
+       }
+     }
+     this.#lastLoopAt = now;
++    const shownTexture =
++      this.#presentedPicture?.kind === "texture"
++        ? this.#presentedPicture.texture
++        : null;
++    const shownSlotIndex = this.#outputs.findIndex(
++      (candidate) => candidate?.texture === shownTexture,
++    );
++    recordEngineTrace({
++      kind: "raf",
++      atMs: now,
++      gapMs: loopGap,
++      queueDepth: this.#queue.length,
++      refreshMs: this.#refreshMs,
++      outputPoolLength: this.#outputs.length,
++      initializedOutputs: this.#outputs.filter(Boolean).length,
++      outputHead: this.#outputHead,
++      shownSlot: shownSlotIndex < 0 ? null : shownSlotIndex,
++      queue: this.#queue.map(({ slot, at, duration }) => ({
++        slot,
++        atMs: at,
++        durationMs: duration,
++      })),
++    });
+     if (this.#workerState === "main") this.#present(now);
+     this.#loopHandle = this.#requestAnimationFrame(this.#onLoop);
+   };
+@@ -1792,6 +1963,7 @@ export class Deinterlacer extends EventTarget {
+       this.#lost
+     )
+       return;
++    this.#lastFrameWatchdogAt = 0;
+     this.#frameWatchdogHandle = requestAnimationFrame(this.#onFrameWatchdog);
+   }
+ 
+@@ -1800,12 +1972,20 @@ export class Deinterlacer extends EventTarget {
+     if (this.#frameWatchdogHandle !== null)
+       cancelAnimationFrame(this.#frameWatchdogHandle);
+     this.#frameWatchdogHandle = null;
++    this.#lastFrameWatchdogAt = 0;
+   }
+ 
+   /** requestAnimationFrame() ごとにフレーム通知の停止を検査し、次の監視を予約する。 */
+   #onFrameWatchdog = (now: DOMHighResTimeStamp): void => {
+     this.#frameWatchdogHandle = null;
+     if (!this.#running || this.#lost) return;
++    recordEngineTrace({
++      kind: "page-raf",
++      atMs: now,
++      gapMs:
++        this.#lastFrameWatchdogAt > 0 ? now - this.#lastFrameWatchdogAt : null,
++    });
++    this.#lastFrameWatchdogAt = now;
+     this.#recoverFrameCallback(now);
+     this.#frameWatchdogHandle = requestAnimationFrame(this.#onFrameWatchdog);
+   };
+@@ -1842,6 +2022,13 @@ export class Deinterlacer extends EventTarget {
+       totalVideoFrames,
+     );
+     this.#lastFallbackAt = now;
++    recordEngineTrace({
++      kind: "frame-ingest",
++      atMs: now,
++      mediaTime,
++      presentedFrames: Math.max(this.#lastPresented + 1, totalVideoFrames),
++      path: "watchdog",
++    });
+     this.#ingestFrame(now, {
+       mediaTime,
+       presentedFrames: Math.max(this.#lastPresented + 1, totalVideoFrames),
+@@ -1878,8 +2065,17 @@ export class Deinterlacer extends EventTarget {
+     this.#queue.shift();
+     const begin = performance.now();
+     this.#show(ready.slot);
+-    this.#showMsSinceReport += performance.now() - begin;
++    const presentedAt = performance.now();
++    this.#showMsSinceReport += presentedAt - begin;
+     this.#showFramesSinceReport++;
++    recordEngineTrace({
++      kind: "draw-submit",
++      atMs: presentedAt,
++      rafAtMs: now,
++      scheduledAtMs: ready.at,
++      queueDepthAfter: this.#queue.length,
++      path: "scheduled",
++    });
+   }
+ 
+   /** Copy one of the filtered pictures onto the canvas. */
+@@ -1893,7 +2089,17 @@ export class Deinterlacer extends EventTarget {
+   #showVideo(): void {
+     this.#push();
+     const texture = this.#textures[this.#head];
+-    if (texture) this.#showTexture(texture, true);
++    if (texture) {
++      this.#showTexture(texture, true);
++      recordEngineTrace({
++        kind: "draw-submit",
++        atMs: performance.now(),
++        rafAtMs: null,
++        scheduledAtMs: null,
++        queueDepthAfter: this.#queue.length,
++        path: "progressive",
++      });
++    }
+     // Progressive frames are not neighbours of the next interlaced frame.
+     this.#frames = 0;
+   }
+@@ -2077,7 +2283,17 @@ export class Deinterlacer extends EventTarget {
+     if (target === null) {
+       this.#presentedPicture = { kind: "yadif", flush, second };
+       this.#setVisible(true);
+-      if (countOutput) this.#outputSinceReport++;
++      if (countOutput) {
++        this.#outputSinceReport++;
++        recordEngineTrace({
++          kind: "draw-submit",
++          atMs: performance.now(),
++          rafAtMs: null,
++          scheduledAtMs: null,
++          queueDepthAfter: this.#queue.length,
++          path: flush ? "flush" : "yadif-direct",
++        });
++      }
+     }
+   }
+ 
+@@ -2444,6 +2660,14 @@ export class Deinterlacer extends EventTarget {
+         this.#outputHead = slot;
+         this.#render(true, false, output.framebuffer);
+         this.#show(slot);
++        recordEngineTrace({
++          kind: "draw-submit",
++          atMs: performance.now(),
++          rafAtMs: null,
++          scheduledAtMs: null,
++          queueDepthAfter: this.#queue.length,
++          path: "flush",
++        });
+       } else {
+         this.#render(true, false, null);
+       }
+diff --git a/packages/yadif/src/render-trace.ts b/packages/yadif/src/render-trace.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..74f210d68243317ecd91d8187f431a61c11de5a5
+--- /dev/null
++++ b/packages/yadif/src/render-trace.ts
+@@ -0,0 +1,241 @@
++const TRACE_LIMIT = 8192;
++
++export type TraceBackend = "starting" | "worker" | "main" | "failed";
++export type TraceRequestedBackend = "auto" | "worker" | "main";
++
++export interface TraceBackendState {
++  requested: TraceRequestedBackend;
++  active: TraceBackend;
++  generation: number;
++  reason: string;
++}
++
++export type EngineRenderTraceEvent =
++  | {
++      kind: "raf";
++      sequence: number;
++      atMs: number;
++      gapMs: number | null;
++      queueDepth: number;
++      refreshMs: number;
++      outputPoolLength: number;
++      initializedOutputs: number;
++      outputHead: number;
++      shownSlot: number | null;
++      queue: Array<{ slot: number; atMs: number; durationMs: number }>;
++    }
++  | {
++      kind: "draw-submit";
++      sequence: number;
++      atMs: number;
++      rafAtMs: number | null;
++      scheduledAtMs: number | null;
++      queueDepthAfter: number;
++      path:
++        "scheduled" | "film-direct" | "yadif-direct" | "progressive" | "flush";
++    }
++  | {
++      kind: "frame-ingest";
++      sequence: number;
++      atMs: number;
++      mediaTime: number;
++      presentedFrames: number;
++      path: "callback" | "watchdog" | "worker-transfer";
++    }
++  | {
++      kind: "slot-pressure";
++      sequence: number;
++      atMs: number;
++      outcome: "oldest" | "none";
++      resultSlot: number | null;
++      outputPoolLength: number;
++      initializedOutputs: number;
++      outputHead: number;
++      shownSlot: number | null;
++      queuedSlots: number[];
++    }
++  | {
++      kind: "worker-bridge";
++      sequence: number;
++      atMs: number;
++      stage:
++        | "offered"
++        | "pending-set"
++        | "pending-replaced"
++        | "sent"
++        | "acknowledged";
++      id: number;
++      relatedId: number | null;
++      durationMs: number | null;
++    }
++  | {
++      kind: "worker-frame";
++      sequence: number;
++      atMs: number;
++      id: number;
++      receiveAtMs: number;
++      ingestMs: number;
++      closeMs: number;
++      totalMs: number;
++    }
++  | {
++      kind: "page-raf";
++      sequence: number;
++      atMs: number;
++      gapMs: number | null;
++    };
++
++type EngineRenderTraceInput =
++  | Omit<Extract<EngineRenderTraceEvent, { kind: "raf" }>, "sequence">
++  | Omit<Extract<EngineRenderTraceEvent, { kind: "draw-submit" }>, "sequence">
++  | Omit<Extract<EngineRenderTraceEvent, { kind: "frame-ingest" }>, "sequence">
++  | Omit<Extract<EngineRenderTraceEvent, { kind: "worker-bridge" }>, "sequence">
++  | Omit<Extract<EngineRenderTraceEvent, { kind: "worker-frame" }>, "sequence">
++  | Omit<Extract<EngineRenderTraceEvent, { kind: "page-raf" }>, "sequence">
++  | Omit<
++      Extract<EngineRenderTraceEvent, { kind: "slot-pressure" }>,
++      "sequence"
++    >;
++
++export type RenderTraceEvent =
++  | (EngineRenderTraceEvent & {
++      realm: "worker" | "main";
++      generation: number;
++      timeOriginMs: number;
++    })
++  | {
++      kind: "backend";
++      sequence: number;
++      realm: "main";
++      generation: number;
++      timeOriginMs: number;
++      atMs: number;
++      requested: TraceRequestedBackend;
++      active: TraceBackend;
++      reason: string;
++    };
++
++export interface RenderTraceBatch {
++  timeOriginMs: number;
++  events: EngineRenderTraceEvent[];
++  droppedEvents: number;
++}
++
++interface PageRenderTrace {
++  readonly schemaVersion: 2;
++  readonly backend: TraceBackendState;
++  readonly droppedEvents: number;
++  drain(): { events: RenderTraceEvent[]; droppedEvents: number };
++}
++
++declare global {
++  // This global exists only in the diagnostic build and is intentionally not
++  // part of the package API.
++  var __YADIF_RENDER_TRACE__: PageRenderTrace | undefined;
++}
++
++let sequence = 0;
++let droppedEvents = 0;
++let engineEvents: EngineRenderTraceEvent[] = [];
++let pageEvents: RenderTraceEvent[] = [];
++const backend: TraceBackendState = {
++  requested: "auto",
++  active: "starting",
++  generation: 0,
++  reason: "module-loaded",
++};
++
++function appendPageEvent(event: RenderTraceEvent): void {
++  if (pageEvents.length === TRACE_LIMIT) {
++    pageEvents.shift();
++    droppedEvents++;
++  }
++  pageEvents.push(event);
++}
++
++export function recordEngineTrace(event: EngineRenderTraceInput): void {
++  const value = { ...event, sequence: ++sequence } as EngineRenderTraceEvent;
++  if (typeof document !== "undefined") {
++    appendPageEvent({
++      ...value,
++      realm: "main",
++      generation: backend.generation,
++      timeOriginMs: performance.timeOrigin,
++    });
++    return;
++  }
++  if (engineEvents.length === TRACE_LIMIT) {
++    engineEvents.shift();
++    droppedEvents++;
++  }
++  engineEvents.push(value);
++}
++
++export function drainEngineTrace(): RenderTraceBatch {
++  const result = {
++    timeOriginMs: performance.timeOrigin,
++    events: engineEvents,
++    droppedEvents,
++  };
++  engineEvents = [];
++  droppedEvents = 0;
++  return result;
++}
++
++export function appendWorkerTrace(
++  batch: RenderTraceBatch,
++  generation: number,
++): void {
++  for (const event of batch.events) {
++    appendPageEvent({
++      ...event,
++      realm: "worker",
++      generation,
++      timeOriginMs: batch.timeOriginMs,
++    });
++  }
++  droppedEvents += batch.droppedEvents;
++}
++
++export function setTraceBackend(
++  requested: TraceRequestedBackend,
++  active: TraceBackend,
++  generation: number,
++  reason: string,
++): void {
++  backend.requested = requested;
++  backend.active = active;
++  backend.generation = generation;
++  backend.reason = reason;
++  if (typeof document !== "undefined") {
++    appendPageEvent({
++      kind: "backend",
++      sequence: ++sequence,
++      realm: "main",
++      generation,
++      timeOriginMs: performance.timeOrigin,
++      atMs: performance.now(),
++      requested,
++      active,
++      reason,
++    });
++  }
++}
++
++if (typeof document !== "undefined") {
++  globalThis.__YADIF_RENDER_TRACE__ = {
++    schemaVersion: 2,
++    get backend() {
++      return { ...backend };
++    },
++    get droppedEvents() {
++      return droppedEvents;
++    },
++    drain() {
++      const result = { events: pageEvents, droppedEvents };
++      pageEvents = [];
++      droppedEvents = 0;
++      return result;
++    },
++  };
++}
+diff --git a/packages/yadif/src/worker-protocol.ts b/packages/yadif/src/worker-protocol.ts
+index f38e6cb1df18ceb0a431d19952b2de17340c8b22..b88320b161010fc63372251aa977e008cd141eb4 100644
+--- a/packages/yadif/src/worker-protocol.ts
++++ b/packages/yadif/src/worker-protocol.ts
+@@ -1,4 +1,5 @@
+ import type { DeinterlaceStats, Scan, VideoState } from "./deinterlace.js";
++import type { RenderTraceBatch } from "./render-trace.js";
+ 
+ /** ページ側で観測した1枚の復号フレームに付随する情報。 */
+ interface WorkerFrameObservation {
+@@ -65,4 +66,5 @@ export type WorkerNotification =
+   | { type: "consumed"; id: number }
+   | { type: "visibility"; visible: boolean }
+   | { type: "stats"; stats: Omit<DeinterlaceStats, "dropped"> }
++  | { type: "diagnostic-batch"; batch: RenderTraceBatch }
+   | { type: "capture"; id: number; image: ImageBitmap | null };
+diff --git a/packages/yadif/src/worker.ts b/packages/yadif/src/worker.ts
+index 9b411a13b204cab711c9e561efb7166a727c9400..1999ea0dc46d55ea6beaf1a1c58daf62b7cf9083 100644
+--- a/packages/yadif/src/worker.ts
++++ b/packages/yadif/src/worker.ts
+@@ -11,6 +11,7 @@ import type {
+   WorkerRenderingOptions,
+   WorkerVideoState,
+ } from "./worker-protocol.js";
++import { drainEngineTrace, recordEngineTrace } from "./render-trace.js";
+ 
+ const workerScope = self as unknown as DedicatedWorkerGlobalScope;
+ 
+@@ -81,6 +82,13 @@ class WorkerVideo extends EventTarget {
+ let video: WorkerVideo | null = null;
+ let deinterlacer: Deinterlacer | null = null;
+ let destroying = false;
++let traceTimer: number | null = null;
++
++function flushRenderTrace(): void {
++  const batch = drainEngineTrace();
++  if (batch.events.length > 0 || batch.droppedEvents > 0)
++    post({ type: "diagnostic-batch", batch });
++}
+ 
+ /** Worker が所有する requestAnimationFrame() へ共通描画エンジンの表示ループを接続する。 */
+ function requestWorkerAnimationFrame(callback: FrameRequestCallback): number {
+@@ -136,13 +144,16 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
+       deinterlacer.scan = command.scan;
+       deinterlacer.videoTimeline = command.videoTimeline;
+       deinterlacer.enabled = command.enabled;
++      traceTimer = workerScope.setInterval(flushRenderTrace, 250);
+       post({ type: "ready" });
+       return;
+     }
+     if (!video || !deinterlacer) return;
+     switch (command.type) {
+-      case "frame":
++      case "frame": {
++        const receivedAt = performance.now();
+         video.update(command.video);
++        const ingestStartedAt = performance.now();
+         try {
+           // ページと Worker の performance は時刻原点が一致する保証がないため、表示予定は描画ループと同じ Worker の時計で作る。
+           deinterlacer.ingestExternalFrame(
+@@ -151,10 +162,23 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
+             command.frame,
+           );
+         } finally {
++          const ingestEndedAt = performance.now();
++          const closeStartedAt = performance.now();
+           command.frame.close();
++          const closedAt = performance.now();
++          recordEngineTrace({
++            kind: "worker-frame",
++            atMs: closedAt,
++            id: command.id,
++            receiveAtMs: receivedAt,
++            ingestMs: ingestEndedAt - ingestStartedAt,
++            closeMs: closedAt - closeStartedAt,
++            totalMs: closedAt - receivedAt,
++          });
+           post({ type: "consumed", id: command.id });
+         }
+         break;
++      }
+       case "settings":
+         applySettings(deinterlacer, command.options);
+         break;
+@@ -184,6 +208,9 @@ workerScope.onmessage = (event: MessageEvent<WorkerCommand>) => {
+         break;
+       case "destroy":
+         destroying = true;
++        if (traceTimer !== null) workerScope.clearInterval(traceTimer);
++        traceTimer = null;
++        flushRenderTrace();
+         deinterlacer.destroy();
+         deinterlacer = null;
+         video = null;

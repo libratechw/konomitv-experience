@@ -1,0 +1,342 @@
+diff --git a/benchmarks/README.md b/benchmarks/README.md
+index d3d0637f472c8eb5db68f7c1575ea2b8a4101831..4c51964b77a52a8913b6d5ed786c722c30990319 100644
+--- a/benchmarks/README.md
++++ b/benchmarks/README.md
+@@ -77,9 +77,9 @@ uv run pytest benchmarks/streaming_response_benchmark.py --codspeed
+ ## File responses
+ 
+ The file benchmark measures `FileResponse` with fallback reads,
+-`http.response.pathsend`, and a single byte range. File creation happens outside
+-the measured region, while response construction, stat, and delivery happen
+-inside it.
++`http.response.pathsend`, and a single byte range on current and legacy ASGI
++versions. File creation happens outside the measured region, while response
++construction, stat, and delivery happen inside it.
+ 
+ Run it locally with:
+ 
+diff --git a/benchmarks/file_response_benchmark.py b/benchmarks/file_response_benchmark.py
+index 8220e39ff832bc94fd14a99477edb07205df8cba..69e4ed69294d3801c91f4a848de6eaf00476185f 100644
+--- a/benchmarks/file_response_benchmark.py
++++ b/benchmarks/file_response_benchmark.py
+@@ -3,10 +3,11 @@ from __future__ import annotations
+ from dataclasses import dataclass
+ from pathlib import Path
+ 
++import anyio
+ import pytest
+ from pytest_codspeed.plugin import BenchmarkFixture
+ 
+-from benchmarks._utils import ASGIRunner
++from benchmarks._utils import ASGIRunner, unreadable_receive
+ from starlette.datastructures import Headers
+ from starlette.responses import FileResponse
+ from starlette.types import Message, Receive, Scope, Send
+@@ -22,6 +23,7 @@ class BenchmarkCase:
+     pathsend: bool = False
+     range_header: bytes | None = None
+     expected_size: int | None = None
++    spec_version: str = "2.5"
+ 
+ 
+ CASES = (
+@@ -29,6 +31,16 @@ CASES = (
+     BenchmarkCase("fallback-10MiB", 10 * MiB),
+     BenchmarkCase("pathsend-10MiB", 10 * MiB, pathsend=True),
+     BenchmarkCase("range-64KiB", 10 * MiB, range_header=b"bytes=262144-327679", expected_size=64 * KiB),
++    BenchmarkCase("legacy-fallback-1KiB", KiB, spec_version="2.3"),
++    BenchmarkCase("legacy-fallback-10MiB", 10 * MiB, spec_version="2.3"),
++    BenchmarkCase("legacy-pathsend-10MiB", 10 * MiB, pathsend=True, spec_version="2.3"),
++    BenchmarkCase(
++        "legacy-range-64KiB",
++        10 * MiB,
++        range_header=b"bytes=262144-327679",
++        expected_size=64 * KiB,
++        spec_version="2.3",
++    ),
+ )
+ 
+ 
+@@ -45,7 +57,7 @@ def http_scope(case: BenchmarkCase) -> Scope:
+     extensions: dict[str, dict[str, object]] = {"http.response.pathsend": {}} if case.pathsend else {}
+     return {
+         "type": "http",
+-        "asgi": {"version": "3.0", "spec_version": "2.5"},
++        "asgi": {"version": "3.0", "spec_version": case.spec_version},
+         "http_version": "1.1",
+         "method": "GET",
+         "scheme": "http",
+@@ -60,8 +72,14 @@ def http_scope(case: BenchmarkCase) -> Scope:
+     }
+ 
+ 
++async def no_disconnect() -> Message:
++    await anyio.sleep_forever()
++    return {}  # pragma: no cover
++
++
+ def dispatch(runner: ASGIRunner, app: FileApp, case: BenchmarkCase) -> list[Message]:
+-    return runner.run(app, http_scope(case))
++    receive = no_disconnect if case.spec_version == "2.3" else unreadable_receive
++    return runner.run(app, http_scope(case), receive)
+ 
+ 
+ @pytest.fixture(scope="module", autouse=True)
+@@ -111,3 +129,4 @@ def test_file_response(
+     benchmark.extra_info["file_bytes"] = case.file_size
+     benchmark.extra_info["response_bytes"] = expected_size
+     benchmark.extra_info["pathsend"] = case.pathsend
++    benchmark.extra_info["asgi_spec_version"] = case.spec_version
+diff --git a/docs/responses.md b/docs/responses.md
+index e6b0a1935fc5656c557c6b6f428b6529b4a4db38..5662d30c879f299bf48d472c6069fc9022388256 100644
+--- a/docs/responses.md
++++ b/docs/responses.md
+@@ -192,6 +192,8 @@ range unit is supported.
+ If the request includes a `Range` header, and the file exists, the response will be a `206 Partial Content` response
+ with the requested range of bytes. If the range is invalid, the response will be a `416 Range Not Satisfiable` response.
+ 
++File responses stop streaming and close the file when the client disconnects.
++
+ ## Third party responses
+ 
+ #### [EventSourceResponse](https://github.com/sysid/sse-starlette)
+diff --git a/starlette/responses.py b/starlette/responses.py
+index 47b698e4c143700c356297afc4d04525465a030d..d907a217ee7f0fc1dd3ca28269ef3ab8e54a6339 100644
+--- a/starlette/responses.py
++++ b/starlette/responses.py
+@@ -6,7 +6,8 @@ import json
+ import os
+ import stat
+ import sys
+-from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping, Sequence
++from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
++from contextlib import asynccontextmanager
+ from datetime import datetime
+ from email.utils import format_datetime, formatdate
+ from functools import partial
+@@ -363,7 +364,8 @@ class FileResponse(Response):
+         http_if_range = headers.get("if-range")
+ 
+         if http_range is None or (http_if_range is not None and not self._should_use_range(http_if_range)):
+-            await self._handle_simple(send, send_header_only, send_pathsend)
++            send_file = partial(self._handle_simple, send, send_header_only, send_pathsend)
++            monitor_disconnect = stat_result.st_size > self.chunk_size
+         else:
+             try:
+                 ranges = self._parse_range_header(http_range, stat_result.st_size)
+@@ -374,16 +376,52 @@ class FileResponse(Response):
+                 return await response(scope, receive, send)
+ 
+             if len(ranges) == 0:
+-                await self._handle_simple(send, send_header_only, send_pathsend)
++                send_file = partial(self._handle_simple, send, send_header_only, send_pathsend)
++                monitor_disconnect = stat_result.st_size > self.chunk_size
+             elif len(ranges) == 1:
+                 start, end = ranges[0]
+-                await self._handle_single_range(send, start, end, stat_result.st_size, send_header_only)
++                send_file = partial(self._handle_single_range, send, start, end, stat_result.st_size, send_header_only)
++                send_pathsend = False
++                monitor_disconnect = end - start > self.chunk_size
+             else:
+-                await self._handle_multiple_ranges(send, ranges, stat_result.st_size, send_header_only)
++                send_file = partial(self._handle_multiple_ranges, send, ranges, stat_result.st_size, send_header_only)
++                send_pathsend = False
++                monitor_disconnect = True
++
++        if scope_type != "http" or send_header_only or send_pathsend or not monitor_disconnect:
++            await send_file()
++        else:
++            spec_version = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
++            if spec_version >= (2, 4):
++                await send_file()
++            else:
++                # Before ASGI 2.4, send() may silently return after a disconnect.
++                # Stop reading the file even when sending does not raise an error.
++                async with create_collapsing_task_group() as task_group:
++
++                    async def stream_file() -> None:
++                        await send_file()
++                        task_group.cancel_scope.cancel()
++
++                    task_group.start_soon(stream_file)
++                    while True:
++                        if (await receive())["type"] == "http.disconnect":
++                            task_group.cancel_scope.cancel()
++                            break
+ 
+         if self.background is not None:
+             await self.background()
+ 
++    @asynccontextmanager
++    async def _open_file(self) -> AsyncIterator[anyio.AsyncFile[bytes]]:
++        file = await anyio.open_file(self.path, mode="rb")
++        try:
++            yield file
++        finally:
++            # Disconnect cancels the reader's scope, but close must still run.
++            with anyio.CancelScope(shield=True):
++                await file.aclose()
++
+     async def _handle_simple(self, send: Send, send_header_only: bool, send_pathsend: bool) -> None:
+         await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+         if send_header_only:
+@@ -391,7 +429,7 @@ class FileResponse(Response):
+         elif send_pathsend:
+             await send({"type": "http.response.pathsend", "path": str(self.path)})
+         else:
+-            async with await anyio.open_file(self.path, mode="rb") as file:
++            async with self._open_file() as file:
+                 more_body = True
+                 while more_body:
+                     chunk = await file.read(self.chunk_size)
+@@ -408,7 +446,7 @@ class FileResponse(Response):
+         if send_header_only:
+             await send({"type": "http.response.body", "body": b"", "more_body": False})
+         else:
+-            async with await anyio.open_file(self.path, mode="rb") as file:
++            async with self._open_file() as file:
+                 await file.seek(start)
+                 more_body = True
+                 while more_body:
+@@ -436,7 +474,7 @@ class FileResponse(Response):
+         if send_header_only:
+             await send({"type": "http.response.body", "body": b"", "more_body": False})
+         else:
+-            async with await anyio.open_file(self.path, mode="rb") as file:
++            async with self._open_file() as file:
+                 for start, end in ranges:
+                     await send({"type": "http.response.body", "body": header_generator(start, end), "more_body": True})
+                     await file.seek(start)
+diff --git a/tests/test_responses.py b/tests/test_responses.py
+index fa20795d51dc8ab9bf4e28e44aeb85e77e0b1316..a66dc14a47fe0a366fabdedd3aecb4834f97796d 100644
+--- a/tests/test_responses.py
++++ b/tests/test_responses.py
+@@ -395,6 +395,118 @@ async def test_file_response_with_pathsend(tmpdir: Path) -> None:
+     )
+ 
+ 
++@pytest.mark.anyio
++@pytest.mark.parametrize("spec_version", ["2.0", "2.3"])
++@pytest.mark.parametrize("range_header", [None, b"bytes=0-", b"bytes=0-262143,327680-524287"])
++async def test_file_response_stops_on_disconnect(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spec_version: str, range_header: bytes | None
++) -> None:
++    path = tmp_path / "fixture.bin"
++    path.write_bytes(b"x" * (8 * FileResponse.chunk_size))
++    disconnected = anyio.Event()
++    file_closed = anyio.Event()
++    submitted = 0
++    background_ran = False
++    open_file = anyio.open_file
++
++    class TrackedFile:
++        def __init__(self, file: anyio.AsyncFile[bytes]) -> None:
++            self.file = file
++
++        async def read(self, size: int) -> bytes:
++            return await self.file.read(size)
++
++        async def seek(self, offset: int) -> int:
++            return await self.file.seek(offset)
++
++        async def aclose(self) -> None:
++            await anyio.sleep(0)
++            await self.file.aclose()
++            file_closed.set()
++
++    async def tracked_open_file(*args: Any, **kwargs: Any) -> TrackedFile:
++        return TrackedFile(await open_file(*args, **kwargs))
++
++    monkeypatch.setattr(anyio, "open_file", tracked_open_file)
++
++    async def receive() -> Message:
++        await disconnected.wait()
++        return {"type": "http.disconnect"}
++
++    async def send(message: Message) -> None:
++        nonlocal submitted
++        if message["type"] == "http.response.body":
++            submitted += len(message.get("body", b""))
++            if submitted >= FileResponse.chunk_size:
++                disconnected.set()
++
++    async def cleanup() -> None:
++        nonlocal background_ran
++        assert file_closed.is_set()
++        background_ran = True
++        path.unlink()
++
++    response = FileResponse(path, background=BackgroundTask(cleanup))
++    headers = [] if range_header is None else [(b"range", range_header)]
++    with anyio.fail_after(1):
++        await response(
++            {"type": "http", "method": "GET", "headers": headers, "asgi": {"spec_version": spec_version}},
++            receive,
++            send,
++        )
++    assert file_closed.is_set()
++    assert submitted < 4 * FileResponse.chunk_size, (
++        "Disconnect must stop the response before reading the remaining ranges."
++    )
++    assert background_ran
++    assert not path.exists()
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("range_header", [None, b"bytes=0-65535"])
++async def test_file_response_does_not_monitor_single_chunk(tmp_path: Path, range_header: bytes | None) -> None:
++    path = tmp_path / "fixture.bin"
++    path.write_bytes(b"x" * FileResponse.chunk_size)
++
++    async def receive() -> Message:
++        raise AssertionError("A single-chunk response does not benefit from disconnect monitoring.")  # pragma: no cover
++
++    async def send(message: Message) -> None:
++        pass
++
++    headers = [] if range_header is None else [(b"range", range_header)]
++    await FileResponse(path)(
++        {"type": "http", "method": "GET", "headers": headers, "asgi": {"spec_version": "2.3"}},
++        receive,
++        send,
++    )
++
++
++@pytest.mark.anyio
++async def test_file_response_asgi_24_uses_send_error(tmp_path: Path) -> None:
++    path = tmp_path / "fixture.bin"
++    path.write_bytes(b"x" * (8 * FileResponse.chunk_size))
++    submitted = 0
++
++    async def receive() -> Message:
++        raise AssertionError("ASGI 2.4 reports disconnect through send().")  # pragma: no cover
++
++    async def send(message: Message) -> None:
++        nonlocal submitted
++        if message["type"] == "http.response.body":
++            submitted += len(message.get("body", b""))
++            raise OSError("Disconnected")
++
++    response = FileResponse(path)
++    with pytest.raises(OSError, match="Disconnected"):
++        await response(
++            {"type": "http", "method": "GET", "headers": [], "asgi": {"spec_version": "2.4"}},
++            receive,
++            send,
++        )
++    assert submitted == FileResponse.chunk_size
++
++
+ def test_set_cookie(test_client_factory: TestClientFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+     # Mock time used as a reference for `Expires` by stdlib `SimpleCookie`.
+     mocked_now = dt.datetime(2037, 1, 22, 12, 0, 0, tzinfo=dt.timezone.utc)
+@@ -1000,7 +1112,8 @@ async def test_file_response_multi_small_chunk_size(readme_file: Path) -> None:
+     start_message: dict[str, Any] = {}
+ 
+     async def receive() -> Message:
+-        raise NotImplementedError("Should not be called!")
++        await anyio.sleep_forever()
++        return {}  # pragma: no cover
+ 
+     async def send(message: Message) -> None:
+         if message["type"] == "http.response.start":

@@ -1,0 +1,129 @@
+diff --git a/Readme.md b/Readme.md
+index ea092f794991cd745651e8820dca757f38c997dd..d65aa580e4ff0f5135eb79a481f5971220098daf 100644
+--- a/Readme.md
++++ b/Readme.md
+@@ -1,4 +1,28 @@
+ 
++> [!WARNING]
++> **このbranchは、KonomiTVを日常利用しながら複数componentの変更を統合検証するdogfood版です。branch全体をupstreamへ取り込むことは想定していません。**
++>
++> **配備状態：EVO-X2の専用環境へ試験配備中。** 録画Original、ライブのOriginal→720p→Original往復、異常終了後の自動復帰を確認しています。VCEEncCは実ライブで終了するため、配備設定ではFFmpegを使います。720pの実機試験では1280×720で再生が進み、`docker stats`のCPU使用率は56.20〜59.70%でした。EVO-X2再起動後の自動起動と、複数ストリームを同時に変換する場合の余力は未確認です。
++
++このbranchはKonomiTV `ea1962f84c22265c1d31081dfe41cc3b53e9a555`を基点に、次の変更を固定しています。
++
++| component | commit | 内容 |
++| --- | --- | --- |
++| DPlayer | [`8e49bb76cdd14a69fa5e822d2d1e5800c4aaa512`](https://github.com/libratechw/DPlayer/commit/8e49bb76cdd14a69fa5e822d2d1e5800c4aaa512) | 画質切替後に旧videoのeventや`play()`失敗が現行videoへ作用する経路を除く候補 |
++| mpeg2toh264 | [`52bedadecf8f0e58195a3a94254f14c78e3ae0c5`](https://github.com/libratechw/mpeg2toh264/commit/52bedadecf8f0e58195a3a94254f14c78e3ae0c5) | iOSの`InvalidStateError`へMSE operationと失敗時stateを追加する診断版 |
++| Starlette | [`17e3955f997c2f271a08057fe649abadcc482f77`](https://github.com/libratechw/starlette/commit/17e3955f997c2f271a08057fe649abadcc482f77) | `FileResponse`がASGI 2.4未満のクライアント切断後にfileを読み続ける問題への参照実装 |
++
++生成した主要client assetは次のとおりです。
++
++| asset | SHA-256 |
++| --- | --- |
++| `PlayerController-C4vhFqYf.js` | `2d578edbd26981c17d1b6b252c1928c8a9b1465c6e4e8f58bcfbff4c346b9a3b` |
++| `worker-CpkyDHSk.CZ-06WIb.js` | `f2b03987f00cbc93b5a2b24a1134240b20ec4ffe27f5c6b6d45a0279fa31eff0` |
++
++DPlayer候補はbuild・testとGalaxyでの画質切替A/Bを通過しています。Starlette変更は単体test、backend直結試験、2素材のWindows実視聴比較を完了しています。mpeg2toh264の変更は診断情報の追加であり、iOSの再生停止を修正するものではありません。
++
++既知の未解決問題は、iPhone / iPadでOriginalへ切り替えた際の`InvalidStateError`と、GalaxyのライブOriginalでWorker描画が大きくコマ落ちする現象です。EVO-X2ではVCEEncCのOpenCL経路が実ライブを処理できないため、dogfood環境をFFmpegへ切り替えました。FFmpegによる1ストリームの画質往復は確認済みですが、複数ストリームの同時変換は未確認です。日常利用で得た観察は再現条件の探索に使い、固定条件の正式測定とは分けて扱います。
++
+ # <img width="350" src="https://user-images.githubusercontent.com/39271166/134050201-8110f076-a939-4b62-8c86-7beaa3d4728c.png" alt="KonomiTV Logo">　<!-- omit in toc -->
+ 
+ <img width="100%" src="https://github.com/user-attachments/assets/6971f354-0418-4305-bf6d-b061142ffec6">
+diff --git a/client/package.json b/client/package.json
+index 9b12dd7419c07c73dde45e3715037bfa9277d6ea..eb2bc736ae05fc59d67f92ba552102459a4df244 100644
+--- a/client/package.json
++++ b/client/package.json
+@@ -25,12 +25,12 @@
+         "comlink": "^4.4.1",
+         "copy-image-clipboard": "^2.1.2",
+         "dayjs": "^1.11.13",
+-        "dplayer": "github:tsukumijima/DPlayer#v1.33.1",
++        "dplayer": "github:libratechw/DPlayer#8e49bb76cdd14a69fa5e822d2d1e5800c4aaa512",
+         "floating-vue": "^5.2.2",
+         "hls.js": "^1.6.9",
+         "idb": "^8.0.3",
+         "mitt": "^3.0.1",
+-        "mpeg2toh264": "github:tsukumijima/mpeg2toh264#52a3db5e8fb9833e6cade2167097849c668bdb1f",
++        "mpeg2toh264": "github:libratechw/mpeg2toh264#a3c0cd3dc9cae8c6c1493427f6a762dd4de8b25c",
+         "mpegts.js": "github:tsukumijima/mpegts.js#c69a71c809b6e0a53f7101455333f8b3d98460d0",
+         "nanoid": "^5.1.16",
+         "ohash": "^1.1.3",
+diff --git a/client/yarn.lock b/client/yarn.lock
+index e9dd0941478fec7a8f0d4ec2c8a325914976205d..18b0e52f5402e8275259ea927a415bf9547ac160 100644
+--- a/client/yarn.lock
++++ b/client/yarn.lock
+@@ -2440,9 +2440,9 @@ dotenv@^16.3.1:
+   resolved "https://registry.yarnpkg.com/dotenv/-/dotenv-16.6.1.tgz#773f0e69527a8315c7285d5ee73c4459d20a8020"
+   integrity sha512-uBq4egWHTcTt33a72vpSG0z3HnPuIl6NqYcTrKEg2azoEyl2hpW0zqlxysq2pK9HlDIHyHyakeYaYnSAwd8bow==
+ 
+-"dplayer@github:tsukumijima/DPlayer#v1.33.1":
++"dplayer@github:libratechw/DPlayer#8e49bb76cdd14a69fa5e822d2d1e5800c4aaa512":
+   version "1.33.1"
+-  resolved "https://codeload.github.com/tsukumijima/DPlayer/tar.gz/a5f847877eada1390456aea4ed7da8e31b4c166e"
++  resolved "https://codeload.github.com/libratechw/DPlayer/tar.gz/8e49bb76cdd14a69fa5e822d2d1e5800c4aaa512"
+   dependencies:
+     aribb24.js "~1.11.5"
+     axios "^1.7.2"
+@@ -3970,9 +3970,9 @@ mitt@^3.0.1:
+   resolved "https://registry.yarnpkg.com/mitt/-/mitt-3.0.1.tgz#ea36cf0cc30403601ae074c8f77b7092cdab36d1"
+   integrity sha512-vKivATfr97l2/QBCYAkXYDbrIWPM2IIKEl7YPhjCvKlG3kE2gm+uBo6nEXK3M5/Ffh/FLpKExzOQ3JJoJGFKBw==
+ 
+-"mpeg2toh264@github:tsukumijima/mpeg2toh264#52a3db5e8fb9833e6cade2167097849c668bdb1f":
++"mpeg2toh264@github:libratechw/mpeg2toh264#a3c0cd3dc9cae8c6c1493427f6a762dd4de8b25c":
+   version "0.0.1"
+-  resolved "https://codeload.github.com/tsukumijima/mpeg2toh264/tar.gz/52a3db5e8fb9833e6cade2167097849c668bdb1f"
++  resolved "https://codeload.github.com/libratechw/mpeg2toh264/tar.gz/a3c0cd3dc9cae8c6c1493427f6a762dd4de8b25c"
+ 
+ mpegts.js@^1.7.3, "mpegts.js@github:tsukumijima/mpegts.js#c69a71c809b6e0a53f7101455333f8b3d98460d0":
+   version "1.8.0"
+diff --git a/server/poetry.lock b/server/poetry.lock
+index 324f3265f869f0a4e8921a28b1818c6dcb756848..9eefbeb33035cfe769dad3cbf89333372d0a4e6c 100644
+--- a/server/poetry.lock
++++ b/server/poetry.lock
+@@ -3312,17 +3312,21 @@ version = "1.6.0"
+ description = "The little ASGI library that shines."
+ optional = false
+ python-versions = ">=3.10"
+-files = [
+-    {file = "starlette-1.6.0-py3-none-any.whl", hash = "sha256:a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c"},
+-    {file = "starlette-1.6.0.tar.gz", hash = "sha256:d4e3ac5e546444960c710297a3c9fc3f7ebae1b7e963f3d36173b49da535be9b"},
+-]
++files = []
++develop = false
+ 
+ [package.dependencies]
+ anyio = ">=3.6.2,<5"
+ typing-extensions = {version = ">=4.10.0", markers = "python_version < \"3.13\""}
+ 
+ [package.extras]
+-full = ["httpx (>=0.27.0,<0.29.0)", "httpx2 (>=2.0.0)", "itsdangerous", "jinja2", "python-multipart (>=0.0.18)", "pyyaml"]
++full = ["httpx (>=0.27.0,<0.29.0)", "httpx2 (>=2.0.0)", "itsdangerous", "jinja2", "opentelemetry-api", "python-multipart (>=0.0.18)", "pyyaml"]
++
++[package.source]
++type = "git"
++url = "https://github.com/libratechw/starlette.git"
++reference = "17e3955f997c2f271a08057fe649abadcc482f77"
++resolved_reference = "17e3955f997c2f271a08057fe649abadcc482f77"
+ 
+ [[package]]
+ name = "taskipy"
+@@ -4075,4 +4079,4 @@ websockets = ">=14.0"
+ [metadata]
+ lock-version = "2.0"
+ python-versions = ">=3.11,<3.12"
+-content-hash = "17ce50ac349a43e9bf0b3d66d1742bf593ffdac3d083959fc9b3cae043fe849b"
++content-hash = "fcdb003e70619e302ceb933e53186720d55903c3aa2ebefddcde19325b7bb4b9"
+diff --git a/server/pyproject.toml b/server/pyproject.toml
+index d34f78091ebfbd7fc263566cc54ba8b08803813d..92ac3ea58426df197fc2510895daee2fcfbea08b 100644
+--- a/server/pyproject.toml
++++ b/server/pyproject.toml
+@@ -42,6 +42,7 @@ requests = "^2.32.4"
+ rich = "^13.9.4"
+ "ruamel.yaml" = "==0.18.12"
+ sse-starlette = "^2.1.3"
++starlette = { git = "https://github.com/libratechw/starlette.git", rev = "17e3955f997c2f271a08057fe649abadcc482f77" }
+ taskipy = "^1.14.1"
+ tortoise-orm = ">=0.23.0,<1.0.0"
+ typer = ">=0.21.0,<1.0.0"

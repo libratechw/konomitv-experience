@@ -1,0 +1,292 @@
+diff --git a/packages/player/README.md b/packages/player/README.md
+index 446b6ae6b5bd7f8e08dea76fb2495d3b2a71c2c2..f70d91a60e0561a1f199dcfdca4c113973e62154 100644
+--- a/packages/player/README.md
++++ b/packages/player/README.md
+@@ -1,5 +1,8 @@
+ # @mpeg2toh264/player
+ 
++> [!WARNING]
++> このbranchは、iOSで録画の画質切替を繰り返した際に発生する`InvalidStateError`の診断専用です。MSE操作名、`sourceopen` / `sourceclose`の回数と直近イベントからの時間、失敗直前のvideoと`<source>`の接続状態をエラーへ追加しますが、不具合を修正するものではなく、branch全体の取り込みは想定していません。
++
+ MPEG-2 TSをWorker内でH.264へ変換し、`<video>`で再生するMSEプレイヤーです。取得、変換、バッファー管理、Rangeリクエストによるシークをまとめて扱います。
+ 
+ ```ts
+diff --git a/packages/player/src/mse.ts b/packages/player/src/mse.ts
+index a2d288581f2a7e8cf91172127e4285f63a13fc37..d96e385819d07b14f63729b10e4947e5abf434bd 100644
+--- a/packages/player/src/mse.ts
++++ b/packages/player/src/mse.ts
+@@ -260,6 +260,10 @@ export class MseSink implements FragmentSink {
+   #currentTime = 0;
+   #closed = false;
+   #ending = false;
++  #sourceOpenCount = 0;
++  #sourceCloseCount = 0;
++  #lastSourceOpenAt: number | null = null;
++  #lastSourceCloseAt: number | null = null;
+   readonly #room = new ReadyGate();
+   #drained: (() => void)[] = [];
+ 
+@@ -270,6 +274,8 @@ export class MseSink implements FragmentSink {
+     this.#class = source;
+     this.mediaSource = new source();
+     this.managed = source === managedMediaSource;
++    this.mediaSource.addEventListener("sourceopen", this.#onSourceOpen);
++    this.mediaSource.addEventListener("sourceclose", this.#onSourceClose);
+     if (this.managed) {
+       this.mediaSource.addEventListener(
+         "startstreaming",
+@@ -303,12 +309,16 @@ export class MseSink implements FragmentSink {
+     await this.#opened;
+     if (this.#closed) return;
+     if (!this.#sourceBuffer) {
+-      const sourceBuffer = this.mediaSource.addSourceBuffer(mimeCodec);
+-      sourceBuffer.mode = "segments";
+-      sourceBuffer.addEventListener("updateend", this.#onUpdateEnd);
+-      sourceBuffer.addEventListener("error", this.#onSourceBufferError);
+-      this.#sourceBuffer = sourceBuffer;
+-      this.#mimeCodec = mimeCodec;
++      try {
++        const sourceBuffer = this.mediaSource.addSourceBuffer(mimeCodec);
++        sourceBuffer.mode = "segments";
++        sourceBuffer.addEventListener("updateend", this.#onUpdateEnd);
++        sourceBuffer.addEventListener("error", this.#onSourceBufferError);
++        this.#sourceBuffer = sourceBuffer;
++        this.#mimeCodec = mimeCodec;
++      } catch (error) {
++        throw this.#error("add or configure SourceBuffer", error);
++      }
+     } else if (mimeCodec !== this.#mimeCodec) {
+       // Resuming elsewhere in the same file can turn up a different profile,
+       // and only changeType lets a SourceBuffer accept one. It cannot run
+@@ -377,12 +387,20 @@ export class MseSink implements FragmentSink {
+     // A seek during the drain releases this without the queue having emptied,
+     // and what follows is a stream that is not ending after all.
+     if (this.#closed || this.#epoch !== epoch) return;
+-    if (this.mediaSource.readyState === "open") this.mediaSource.endOfStream();
++    if (this.mediaSource.readyState === "open") {
++      try {
++        this.mediaSource.endOfStream();
++      } catch (error) {
++        throw this.#error("end MediaSource", error);
++      }
++    }
+   }
+ 
+   close(): void {
+     if (this.#closed) return;
+     this.#closed = true;
++    this.mediaSource.removeEventListener("sourceopen", this.#onSourceOpen);
++    this.mediaSource.removeEventListener("sourceclose", this.#onSourceClose);
+     if (this.managed) {
+       this.mediaSource.removeEventListener(
+         "startstreaming",
+@@ -436,7 +454,7 @@ export class MseSink implements FragmentSink {
+       } catch (error) {
+         this.#operation = null;
+         this.#clearing = false;
+-        this.#fail(error);
++        this.#fail("clear SourceBuffer", error);
+       }
+       return;
+     }
+@@ -453,7 +471,7 @@ export class MseSink implements FragmentSink {
+         sourceBuffer.changeType(mimeCodec);
+         this.#mimeCodec = mimeCodec;
+       } catch (error) {
+-        this.#fail(error);
++        this.#fail("change SourceBuffer type", error);
+         return;
+       }
+     }
+@@ -472,7 +490,7 @@ export class MseSink implements FragmentSink {
+         // Try at once rather than waiting for playback to raise an event: if
+         // the buffer ahead runs out first, nothing will raise one.
+         this.#evict();
+-      } else this.#fail(error);
++      } else this.#fail("append SourceBuffer", error);
+     }
+   }
+ 
+@@ -525,7 +543,20 @@ export class MseSink implements FragmentSink {
+   };
+ 
+   #onSourceBufferError = (): void => {
+-    this.#fail(new Error("the SourceBuffer rejected what was appended"));
++    this.#fail(
++      "complete SourceBuffer update",
++      new Error("the SourceBuffer rejected what was appended"),
++    );
++  };
++
++  #onSourceOpen = (): void => {
++    this.#sourceOpenCount++;
++    this.#lastSourceOpenAt = performance.now();
++  };
++
++  #onSourceClose = (): void => {
++    this.#sourceCloseCount++;
++    this.#lastSourceCloseAt = performance.now();
+   };
+ 
+   /**
+@@ -568,7 +599,7 @@ export class MseSink implements FragmentSink {
+     try {
+       this.mediaSource.duration = Math.max(duration, end);
+     } catch (error) {
+-      this.#fail(error);
++      this.#fail("set MediaSource duration", error);
+     }
+   }
+ 
+@@ -614,7 +645,12 @@ export class MseSink implements FragmentSink {
+       this.#randomAccessPoints.shift();
+     }
+     this.#operation = { type: "remove" };
+-    sourceBuffer.remove(0, removeEnd);
++    try {
++      sourceBuffer.remove(0, removeEnd);
++    } catch (error) {
++      this.#operation = null;
++      this.#fail("evict SourceBuffer range", error);
++    }
+   }
+ 
+   /** How far past the playhead the buffer reaches, in seconds. */
+@@ -655,9 +691,32 @@ export class MseSink implements FragmentSink {
+     for (const resolve of waiting) resolve();
+   }
+ 
+-  #fail(error: unknown): void {
+-    this.#options.onError?.(
+-      error instanceof Error ? error : new Error(String(error)),
++  #error(operation: string, error: unknown): Error {
++    const cause = error instanceof Error ? error : new Error(String(error));
++    const sourceBuffer = this.#sourceBuffer;
++    const at = performance.now();
++    const detail = [
++      `mediaSource=${this.mediaSource.readyState}`,
++      `closed=${this.#closed}`,
++      `sourceOpens=${this.#sourceOpenCount}`,
++      `sourceCloses=${this.#sourceCloseCount}`,
++      `sinceSourceOpenMs=${this.#lastSourceOpenAt === null ? "none" : Math.round(at - this.#lastSourceOpenAt)}`,
++      `sinceSourceCloseMs=${this.#lastSourceCloseAt === null ? "none" : Math.round(at - this.#lastSourceCloseAt)}`,
++      `sourceBuffer=${sourceBuffer ? "present" : "absent"}`,
++      `updating=${sourceBuffer?.updating ?? false}`,
++      `operation=${this.#operation?.type ?? "none"}`,
++      `queue=${this.#queue.length}`,
++      `epoch=${this.#epoch}`,
++    ].join(", ");
++    const contextual = new Error(
++      `MSE ${operation} failed (${detail}): ${cause.name}: ${cause.message}`,
+     );
++    contextual.name = cause.name;
++    contextual.stack += `\nCaused by: ${cause.stack ?? cause.message}`;
++    return contextual;
++  }
++
++  #fail(operation: string, error: unknown): void {
++    this.#options.onError?.(this.#error(operation, error));
+   }
+ }
+diff --git a/packages/player/src/player.ts b/packages/player/src/player.ts
+index 54e3b085c2fbd97d45d045fb86bee379cb9814df..ad3068a339e40e596e013fb266e9b9916cda8716 100644
+--- a/packages/player/src/player.ts
++++ b/packages/player/src/player.ts
+@@ -756,7 +756,8 @@ export class Mpeg2TsPlayer extends EventTarget {
+           .ready()
+           .then(() => this.#report(id, { type: "flow", id, ready: true })),
+       (error: unknown) => {
+-        if (id === this.#generation) this.#fail(toError(error));
++        if (id === this.#generation)
++          this.#fail(this.#withMseAttachmentContext(toError(error)));
+       },
+     );
+   }
+@@ -780,7 +781,8 @@ export class Mpeg2TsPlayer extends EventTarget {
+           this.#setState(blocked ? "buffer-full" : "converting");
+       },
+       onError: (error) => {
+-        if (id === this.#generation) this.#fail(error);
++        if (id === this.#generation)
++          this.#fail(this.#withMseAttachmentContext(error));
+       },
+     });
+     this.#sink = sink;
+@@ -995,6 +997,25 @@ export class Mpeg2TsPlayer extends EventTarget {
+     this.#emit("error", { error });
+   }
+ 
++  #withMseAttachmentContext(error: Error): Error {
++    const source = this.#source;
++    const objectUrl = this.#objectUrl;
++    const detail = [
++      `videoConnected=${this.video.isConnected}`,
++      `videoReadyState=${this.video.readyState}`,
++      `videoNetworkState=${this.video.networkState}`,
++      `videoPaused=${this.video.paused}`,
++      `sourceElement=${source ? "present" : "absent"}`,
++      `sourceConnected=${source?.isConnected ?? false}`,
++      `sourceMatchesObjectUrl=${source !== null && objectUrl !== null && source.src === objectUrl}`,
++      `currentSrcMatchesObjectUrl=${objectUrl !== null && this.video.currentSrc === objectUrl}`,
++    ].join(", ");
++    const contextual = new Error(`${error.message} (${detail})`);
++    contextual.name = error.name;
++    contextual.stack += `\nCaused by: ${error.stack ?? error.message}`;
++    return contextual;
++  }
++
+   #settle(error: Error | null): void {
+     const pending = this.#pending;
+     if (!pending) return;
+diff --git a/tools/test-mse-reset.mjs b/tools/test-mse-reset.mjs
+index b80b8cbeeb5e31cfcc36d5595b194416bac210f8..ec5f24a617c293c10505ede9c26a5c721027af1b 100644
+--- a/tools/test-mse-reset.mjs
++++ b/tools/test-mse-reset.mjs
+@@ -9,6 +9,7 @@ import { build } from "esbuild";
+ class FakeSourceBuffer extends EventTarget {
+   mode = "segments";
+   updating = false;
++  appendError = null;
+   appended = [];
+   removed = [];
+   buffered = {
+@@ -18,6 +19,7 @@ class FakeSourceBuffer extends EventTarget {
+   };
+ 
+   appendBuffer(data) {
++    if (this.appendError) throw this.appendError;
+     assert.equal(this.updating, false);
+     this.updating = true;
+     this.appended.push(data);
+@@ -95,6 +97,31 @@ try {
+   assert.equal(sourceBuffer.appended[1], newInit);
+   sourceBuffer.complete();
+   assert.equal(sourceBuffer.appended[2], newMedia);
++
++  const diagnosticErrors = [];
++  const diagnosticSink = new MseSink({
++    queueHighWaterMark: 1024 * 1024,
++    maxAheadSeconds: 8,
++    keepBehindSeconds: 10,
++    seek() {},
++    onError(error) {
++      diagnosticErrors.push(error);
++    },
++  });
++  const invalidState = new Error("The object is in an invalid state.");
++  invalidState.name = "InvalidStateError";
++  await diagnosticSink.open("video/mp4; codecs=avc1.640028", oldInit);
++  diagnosticSink.mediaSource.sourceBuffer.complete();
++  diagnosticSink.mediaSource.readyState = "closed";
++  diagnosticSink.mediaSource.dispatchEvent(new Event("sourceclose"));
++  diagnosticSink.mediaSource.sourceBuffer.appendError = invalidState;
++  diagnosticSink.push(oldMedia, 0, true);
++  assert.equal(diagnosticErrors.length, 1);
++  assert.equal(diagnosticErrors[0].name, "InvalidStateError");
++  assert.match(
++    diagnosticErrors[0].message,
++    /^MSE append SourceBuffer failed \(mediaSource=closed, closed=false, sourceOpens=1, sourceCloses=1, sinceSourceOpenMs=\d+, sinceSourceCloseMs=\d+, sourceBuffer=present, updating=false, operation=none, queue=1, epoch=0\): InvalidStateError: The object is in an invalid state\.$/,
++  );
+ } finally {
+   delete globalThis.MediaSource;
+   await unlink(output).catch(() => {});
