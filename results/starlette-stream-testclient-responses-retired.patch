@@ -1,0 +1,371 @@
+diff --git a/starlette/responses.py b/starlette/responses.py
+index 47b698e4c143700c356297afc4d04525465a030d..509e282ca9c1aea15feb8ba6751efb9a3069fe91 100644
+--- a/starlette/responses.py
++++ b/starlette/responses.py
+@@ -6,7 +6,7 @@ import json
+ import os
+ import stat
+ import sys
+-from collections.abc import AsyncIterable, Awaitable, Callable, Iterable, Mapping, Sequence
++from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Iterable, Mapping, Sequence
+ from datetime import datetime
+ from email.utils import format_datetime, formatdate
+ from functools import partial
+@@ -246,13 +246,19 @@ class StreamingResponse(Response):
+                 break
+ 
+     async def stream_response(self, send: Send) -> None:
+-        await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
+-        async for chunk in self.body_iterator:
+-            if not isinstance(chunk, bytes | memoryview):
+-                chunk = chunk.encode(self.charset)
+-            await send({"type": "http.response.body", "body": chunk, "more_body": True})
++        iterator = self.body_iterator.__aiter__()
++        try:
++            await send({"type": "http.response.start", "status": self.status_code, "headers": self.raw_headers})
++            async for chunk in iterator:
++                if not isinstance(chunk, bytes | memoryview):
++                    chunk = chunk.encode(self.charset)
++                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+ 
+-        await send({"type": "http.response.body", "body": b"", "more_body": False})
++            await send({"type": "http.response.body", "body": b"", "more_body": False})
++        finally:
++            if isinstance(iterator, AsyncGenerator):
++                with anyio.CancelScope(shield=True):
++                    await iterator.aclose()
+ 
+     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+         if scope["type"] == "websocket":
+diff --git a/starlette/testclient.py b/starlette/testclient.py
+index 449fc5fcbe004d935b8bbb75635459665587930c..d2ac0c55dd47be5b58d2fd4c15786266d5ecd555 100644
+--- a/starlette/testclient.py
++++ b/starlette/testclient.py
+@@ -2,7 +2,6 @@ from __future__ import annotations
+ 
+ import contextlib
+ import inspect
+-import io
+ import json
+ import math
+ import sys
+@@ -17,6 +16,7 @@ from urllib.parse import unquote, urljoin
+ import anyio
+ import anyio.abc
+ import anyio.from_thread
++from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+ from anyio.streams.stapled import StapledObjectStream
+ 
+ from starlette._utils import is_async_callable
+@@ -204,6 +204,49 @@ class WebSocketTestSession:
+         return json.loads(text)
+ 
+ 
++class _TestClientResponseStream(httpx.SyncByteStream):
++    def __init__(
++        self,
++        body_rx: MemoryObjectReceiveStream[bytes],
++        portal: anyio.abc.BlockingPortal,
++        app_task: Future[None],
++        cancel_scope: anyio.CancelScope,
++        exit_stack: contextlib.ExitStack,
++        raise_server_exceptions: bool,
++        include_body: bool,
++    ) -> None:
++        self._body_rx = body_rx
++        self._portal = portal
++        self._app_task = app_task
++        self._cancel_scope = cancel_scope
++        self._exit_stack = exit_stack
++        self._raise_server_exceptions = raise_server_exceptions
++        self._include_body = include_body
++
++    def __iter__(self) -> Generator[bytes, None, None]:
++        while True:
++            try:
++                body = self._portal.call(self._body_rx.receive)
++            except anyio.EndOfStream:
++                self._wait_for_app()
++                return
++            if self._include_body and body:
++                yield body
++
++    def close(self) -> None:
++        if not self._app_task.done():
++            self._portal.call(self._cancel_scope.cancel)
++        try:
++            self._wait_for_app()
++        finally:
++            self._exit_stack.close()
++
++    def _wait_for_app(self) -> None:
++        exception = self._app_task.exception()
++        if exception is not None and self._raise_server_exceptions:
++            raise exception
++
++
+ class _TestClientTransport(httpx.BaseTransport):
+     def __init__(
+         self,
+@@ -287,7 +330,7 @@ class _TestClientTransport(httpx.BaseTransport):
+         request_complete = False
+         response_started = False
+         response_complete: anyio.Event
+-        raw_kwargs: dict[str, Any] = {"stream": io.BytesIO()}
++        raw_kwargs: dict[str, Any] = {}
+         debug_info: dict[str, Any] | None = None
+ 
+         async def receive() -> Message:
+@@ -326,37 +369,59 @@ class _TestClientTransport(httpx.BaseTransport):
+                 raw_kwargs["status_code"] = message["status"]
+                 raw_kwargs["headers"] = [(key.decode(), value.decode()) for key, value in message.get("headers", [])]
+                 response_started = True
++                response_available.set()
+             elif message["type"] == "http.response.body":
+                 assert response_started, 'Received "http.response.body" without "http.response.start".'
+                 assert not response_complete.is_set(), 'Received "http.response.body" after response completed.'
+                 body = message.get("body", b"")
+                 more_body = message.get("more_body", False)
+-                if request.method != "HEAD":
+-                    raw_kwargs["stream"].write(body)
++                await body_tx.send(body)
+                 if not more_body:
+-                    raw_kwargs["stream"].seek(0)
+                     response_complete.set()
+             elif message["type"] == "http.response.debug":
+                 debug_info = message["info"]
+ 
+-        try:
+-            with self.portal_factory() as portal:
+-                response_complete = portal.call(anyio.Event)
+-                portal.call(self.app, scope, receive, send)
+-        except BaseException as exc:
++        async def run_app(*, task_status: anyio.abc.TaskStatus[anyio.CancelScope]) -> None:
++            with anyio.CancelScope() as cancel_scope:
++                task_status.started(cancel_scope)
++                async with body_tx:
++                    await self.app(scope, receive, send)
++
++        exit_stack = contextlib.ExitStack()
++        portal = exit_stack.enter_context(self.portal_factory())
++        response_available = portal.call(anyio.Event)
++        response_complete = portal.call(anyio.Event)
++        body_tx, body_rx = cast(
++            "tuple[MemoryObjectSendStream[bytes], MemoryObjectReceiveStream[bytes]]",
++            portal.call(anyio.create_memory_object_stream, 0),
++        )
++        exit_stack.callback(body_rx.close)
++        app_task, cancel_scope = cast("tuple[Future[None], anyio.CancelScope]", portal.start_task(run_app))
++        app_task.add_done_callback(lambda _: response_available.set())
++        portal.call(response_available.wait)
++
++        if not response_started:
++            exception = app_task.exception()
++            exit_stack.close()
+             if self.raise_server_exceptions:
+-                raise exc
+-
+-        if self.raise_server_exceptions:
+-            assert response_started, "TestClient did not receive any response."
+-        elif not response_started:
++                if exception is not None:
++                    raise exception
++                raise AssertionError("TestClient did not receive any response.")
+             raw_kwargs = {
+                 "status_code": 500,
+                 "headers": [],
+-                "stream": io.BytesIO(),
++                "stream": httpx.ByteStream(b""),
+             }
+-
+-        raw_kwargs["stream"] = httpx.ByteStream(raw_kwargs["stream"].read())
++        else:
++            raw_kwargs["stream"] = _TestClientResponseStream(
++                body_rx=body_rx,
++                portal=portal,
++                app_task=app_task,
++                cancel_scope=cancel_scope,
++                exit_stack=exit_stack,
++                raise_server_exceptions=self.raise_server_exceptions,
++                include_body=request.method != "HEAD",
++            )
+ 
+         response = httpx.Response(**raw_kwargs, request=request)
+         if debug_info is not None:
+diff --git a/tests/test_testclient.py b/tests/test_testclient.py
+index ff67b56ebbb81d60f0d55720c6d8c85f27a750c3..dfaa74a771918c5e109dd754b123989d22dc7bfd 100644
+--- a/tests/test_testclient.py
++++ b/tests/test_testclient.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import itertools
+ import sys
++import threading
+ from asyncio import Task, current_task as asyncio_current_task
+ from collections.abc import AsyncGenerator
+ from contextlib import asynccontextmanager
+@@ -17,8 +18,8 @@ from starlette.applications import Starlette
+ from starlette.exceptions import StarletteDeprecationWarning
+ from starlette.middleware import Middleware
+ from starlette.requests import Request
+-from starlette.responses import JSONResponse, RedirectResponse, Response
+-from starlette.routing import Route
++from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
++from starlette.routing import Mount, Route
+ from starlette.testclient import ASGIInstance, TestClient
+ from starlette.types import ASGIApp, Receive, Scope, Send
+ from starlette.websockets import WebSocket, WebSocketDisconnect
+@@ -230,6 +231,153 @@ def test_testclient_asgi3(test_client_factory: TestClientFactory) -> None:
+     assert response.text == "Hello, world!"
+ 
+ 
++def test_testclient_requires_response(test_client_factory: TestClientFactory) -> None:
++    async def app(scope: Scope, receive: Receive, send: Send) -> None:
++        pass
++
++    client = test_client_factory(app)
++    with pytest.raises(AssertionError, match="TestClient did not receive any response"):
++        client.get("/")
++
++
++def test_streaming_response_is_available_before_first_chunk(test_client_factory: TestClientFactory) -> None:
++    release_response = threading.Event()
++
++    async def stream() -> AsyncGenerator[bytes, None]:
++        await anyio.to_thread.run_sync(release_response.wait)
++        yield b"hello"
++
++    async def homepage(request: Request) -> StreamingResponse:
++        return StreamingResponse(stream())
++
++    client = test_client_factory(Starlette(routes=[Route("/", homepage)]))
++    with client.stream("GET", "/") as response:
++        release_response.set()
++        assert response.read() == b"hello"
++
++
++def test_streaming_response_applies_backpressure(test_client_factory: TestClientFactory) -> None:
++    second_chunk_started = threading.Event()
++
++    async def stream() -> AsyncGenerator[bytes, None]:
++        yield b"one"
++        second_chunk_started.set()
++        yield b"two"
++
++    async def homepage(request: Request) -> StreamingResponse:
++        return StreamingResponse(stream())
++
++    client = test_client_factory(Starlette(routes=[Route("/", homepage)]))
++    with client.stream("GET", "/") as response:
++        chunks = response.iter_raw()
++        assert not second_chunk_started.is_set()
++        assert next(chunks) == b"one"
++        assert second_chunk_started.wait(timeout=1)
++        assert list(chunks) == [b"two"]
++
++
++@pytest.mark.parametrize(("method", "body"), [("GET", b""), ("HEAD", b"chunk")])
++def test_streaming_response_applies_backpressure_to_ignored_body(
++    test_client_factory: TestClientFactory,
++    method: str,
++    body: bytes,
++) -> None:
++    response_opened = threading.Event()
++    stop_streaming = threading.Event()
++
++    async def http_app(scope: Scope, receive: Receive, send: Send) -> None:
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        while not stop_streaming.is_set():
++            await send({"type": "http.response.body", "body": body, "more_body": True})
++        await send({"type": "http.response.body", "body": b""})
++
++    client = test_client_factory(Starlette(routes=[Mount("/", app=http_app)]))
++    response_body: list[bytes] = []
++
++    def open_response() -> None:
++        with client.stream(method, "/") as response:
++            response_opened.set()
++            response_body.append(response.read())
++
++    thread = threading.Thread(target=open_response)
++    thread.start()
++    try:
++        assert response_opened.wait(timeout=1)
++    finally:
++        stop_streaming.set()
++        thread.join(timeout=1)
++    assert not thread.is_alive()
++    assert response_body == [b""]
++
++
++def test_closing_streaming_response_stops_application(test_client_factory: TestClientFactory) -> None:
++    app_finished = threading.Event()
++
++    async def http_app(scope: Scope, receive: Receive, send: Send) -> None:
++        try:
++            await send({"type": "http.response.start", "status": 200, "headers": []})
++            while True:
++                await send({"type": "http.response.body", "body": b"chunk", "more_body": True})
++        finally:
++            app_finished.set()
++
++    client = test_client_factory(Starlette(routes=[Mount("/", app=http_app)]))
++    with client:
++        with client.stream("GET", "/") as response:
++            assert next(response.iter_raw()) == b"chunk"
++        assert app_finished.is_set()
++
++
++def test_closing_streaming_response_closes_body_iterator(test_client_factory: TestClientFactory) -> None:
++    body_iterator_closed = threading.Event()
++
++    async def stream() -> AsyncGenerator[bytes, None]:
++        try:
++            while True:
++                yield b"chunk"
++        finally:
++            await anyio.sleep(0)
++            body_iterator_closed.set()
++
++    async def homepage(request: Request) -> StreamingResponse:
++        return StreamingResponse(stream())
++
++    client = test_client_factory(Starlette(routes=[Route("/", homepage)]))
++    with client:
++        with client.stream("GET", "/") as response:
++            assert next(response.iter_raw()) == b"chunk"
++        assert body_iterator_closed.is_set()
++
++
++def test_streaming_response_raises_late_server_exception(test_client_factory: TestClientFactory) -> None:
++    async def http_app(scope: Scope, receive: Receive, send: Send) -> None:
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        await send({"type": "http.response.body", "body": b"body"})
++        await anyio.sleep(0)
++        raise RuntimeError("late failure")
++
++    client = test_client_factory(Starlette(routes=[Mount("/", app=http_app)]))
++    with client, pytest.raises(RuntimeError, match="late failure"):
++        with client.stream("GET", "/") as response:
++            response.read()
++
++
++def test_streaming_response_ignores_late_server_exception(test_client_factory: TestClientFactory) -> None:
++    async def http_app(scope: Scope, receive: Receive, send: Send) -> None:
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        await send({"type": "http.response.body", "body": b"body"})
++        await anyio.sleep(0)
++        raise RuntimeError("late failure")
++
++    client = test_client_factory(
++        Starlette(routes=[Mount("/", app=http_app)]),
++        raise_server_exceptions=False,
++    )
++    with client:
++        with client.stream("GET", "/") as response:
++            assert response.read() == b"body"
++
++
+ def test_debug_info_in_response_extensions(test_client_factory: TestClientFactory) -> None:
+     async def app(scope: Scope, receive: Receive, send: Send) -> None:
+         await send(

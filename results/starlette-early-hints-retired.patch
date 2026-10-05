@@ -1,0 +1,362 @@
+diff --git a/docs/early-hints.md b/docs/early-hints.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f3ce5a503aee6a59a617d4fa0d1762eaa2c00eb
+--- /dev/null
++++ b/docs/early-hints.md
+@@ -0,0 +1,38 @@
++Starlette supports [HTTP 103 Early Hints](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/103)
++through the ASGI [`http.response.early_hint`](https://asgi.readthedocs.io/en/latest/extensions.html#early-hints)
++extension. Early Hints let a client start loading resources while the endpoint prepares the final response.
++
++### `Request.send_early_hints`
++
++Used to send one or more `Link` header values before the final response. If the ASGI server does not support
++Early Hints, this method does nothing.
++
++Signature: `send_early_hints(link, *additional_links)`
++
++* `link` - An [RFC 8288](https://www.rfc-editor.org/rfc/rfc8288.html) `Link` header value.
++* `additional_links` - Additional `Link` header values.
++
++```python
++from starlette.applications import Starlette
++from starlette.requests import Request
++from starlette.responses import HTMLResponse
++from starlette.routing import Route
++
++
++async def homepage(request: Request) -> HTMLResponse:
++    await request.send_early_hints(
++        "</static/style.css>; rel=preload; as=style",
++        "</static/app.js>; rel=modulepreload",
++    )
++
++    # The client can load the hinted resources while this work runs.
++    content = await render_homepage()
++    return HTMLResponse(content)
++
++
++app = Starlette(routes=[Route("/", endpoint=homepage)])
++```
++
++The ASGI server is responsible for sending Early Hints to the client. For example, Hypercorn supports the
++extension over HTTP/2 and HTTP/3. Browsers may ignore Early Hints, so the resources must still be referenced by
++the final response.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index cbe56940befb17c52383441508ee9fce7676bfe4..3982b2a5a23e95f6f2453ac48233da147b6e5955 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -48,6 +48,7 @@ nav:
+       - Lifespan: "lifespan.md"
+       - Background Tasks: "background.md"
+       - Server Push: "server-push.md"
++      - Early Hints: "early-hints.md"
+       - Exceptions: "exceptions.md"
+       - Configuration: "config.md"
+       - Thread Pool: "threadpool.md"
+diff --git a/starlette/endpoints.py b/starlette/endpoints.py
+index bdd51dce9583a64b5d3d0d26fd0e3191078d17ef..27bbb638ef12624c2c0ec100b0303f833f7b4639 100644
+--- a/starlette/endpoints.py
++++ b/starlette/endpoints.py
+@@ -30,7 +30,7 @@ class HTTPEndpoint:
+         return self.dispatch().__await__()
+ 
+     async def dispatch(self) -> None:
+-        request = Request(self.scope, receive=self.receive)
++        request = Request(self.scope, receive=self.receive, send=self.send)
+         handler_name = "get" if request.method == "HEAD" and not hasattr(self, "head") else request.method.lower()
+ 
+         handler: Callable[[Request], Any]
+diff --git a/starlette/middleware/base.py b/starlette/middleware/base.py
+index 2579c031b2b8c12f1e3e18b8398320257fc36c64..b78b30295124dd0faf1df326252fbe77889b975b 100644
+--- a/starlette/middleware/base.py
++++ b/starlette/middleware/base.py
+@@ -25,8 +25,8 @@ class _CachedRequest(Request):
+     empty body so that downstream things don't hang forever.
+     """
+ 
+-    def __init__(self, scope: Scope, receive: Receive):
+-        super().__init__(scope, receive)
++    def __init__(self, scope: Scope, receive: Receive, send: Send):
++        super().__init__(scope, receive, send)
+         self._wrapped_rcv_disconnected = False
+         self._wrapped_rcv_consumed = False
+         self._wrapped_rc_stream = self.stream()
+@@ -103,7 +103,7 @@ class BaseHTTPMiddleware:
+             await self.app(scope, receive, send)
+             return
+ 
+-        request = _CachedRequest(scope, receive)
++        request = _CachedRequest(scope, receive, send)
+         wrapped_receive = request.wrapped_receive
+         response_sent = anyio.Event()
+         app_exc: Exception | None = None
+@@ -148,10 +148,16 @@ class BaseHTTPMiddleware:
+             task_group.start_soon(coro)
+ 
+             try:
+-                message = await recv_stream.receive()
+-                info = message.get("info", None)
+-                if message["type"] == "http.response.debug" and info is not None:
++                info = None
++                while True:
+                     message = await recv_stream.receive()
++                    if message["type"] == "http.response.debug":
++                        info = message["info"]
++                        continue
++                    elif message["type"] == "http.response.early_hint":
++                        await send(message)
++                        continue
++                    break
+             except anyio.EndOfStream:
+                 if app_exc is not None:
+                     nonlocal exception_already_raised
+diff --git a/starlette/middleware/gzip.py b/starlette/middleware/gzip.py
+index 4473f5ae710b649ee6f734dbf7697832c12d537b..fddb2d55c67a7ac67f399f94a17783f0a236b0c5 100644
+--- a/starlette/middleware/gzip.py
++++ b/starlette/middleware/gzip.py
+@@ -162,9 +162,10 @@ class IdentityResponder:
+ 
+             message["body"] = await self.apply_compression(body, more_body=more_body)
+ 
++            await self.send(message)
++        elif message_type == "http.response.early_hint":
+             await self.send(message)
+         elif message_type == "http.response.pathsend":  # pragma: no branch
+-            # Don't apply GZip to pathsend responses
+             await self.send(self.initial_message)
+             await self.send(message)
+ 
+diff --git a/starlette/requests.py b/starlette/requests.py
+index d4f3f4be6d2159b0c2a5838f13ea2ce7e683398e..86833e06e64239e41471240509f27bc0b0d252ca 100644
+--- a/starlette/requests.py
++++ b/starlette/requests.py
+@@ -346,3 +346,8 @@ class Request(HTTPConnection[StateT]):
+                 for value in self.headers.getlist(name):
+                     raw_headers.append((name.encode("latin-1"), value.encode("latin-1")))
+             await self._send({"type": "http.response.push", "path": path, "headers": raw_headers})
++
++    async def send_early_hints(self, link: str, /, *additional_links: str) -> None:
++        if "http.response.early_hint" in self.scope.get("extensions", {}):
++            raw_links = [value.encode("latin-1") for value in (link, *additional_links)]
++            await self._send({"type": "http.response.early_hint", "links": raw_links})
+diff --git a/tests/middleware/test_base.py b/tests/middleware/test_base.py
+index 44b685fa8614b4829ca898dc1a348fcad3ea123b..e32146363995cb330873340778e34d3ea132a58d 100644
+--- a/tests/middleware/test_base.py
++++ b/tests/middleware/test_base.py
+@@ -1215,6 +1215,55 @@ async def test_poll_for_disconnect_repeated(send_body: bool) -> None:
+     ]
+ 
+ 
++@pytest.mark.anyio
++async def test_early_hints_events() -> None:
++    events: list[Message] = []
++
++    async def endpoint(request: Request) -> PlainTextResponse:
++        await request.send_early_hints("</endpoint.css>; rel=preload; as=style")
++        return PlainTextResponse("hello")
++
++    async def send_early_hints(request: Request, call_next: RequestResponseEndpoint) -> Response:
++        await request.send_early_hints("</middleware.css>; rel=preload; as=style")
++        return await call_next(request)
++
++    app = Starlette(
++        middleware=[Middleware(BaseHTTPMiddleware, dispatch=send_early_hints)],
++        routes=[Route("/", endpoint)],
++    )
++    scope: Scope = {
++        "type": "http",
++        "method": "GET",
++        "path": "/",
++        "headers": [],
++        "extensions": {"http.response.early_hint": {}},
++    }
++
++    async def receive() -> Message:
++        raise NotImplementedError("Should not be called")  # pragma: no cover
++
++    async def send(message: Message) -> None:
++        events.append(message)
++
++    await app(scope, receive, send)
++
++    assert events[:2] == [
++        {
++            "type": "http.response.early_hint",
++            "links": [b"</middleware.css>; rel=preload; as=style"],
++        },
++        {
++            "type": "http.response.early_hint",
++            "links": [b"</endpoint.css>; rel=preload; as=style"],
++        },
++    ]
++    assert [event["type"] for event in events[2:]] == [
++        "http.response.start",
++        "http.response.body",
++        "http.response.body",
++    ]
++
++
+ @pytest.mark.anyio
+ async def test_asgi_pathsend_events(tmpdir: Path) -> None:
+     path = tmpdir / "example.txt"
+diff --git a/tests/middleware/test_gzip.py b/tests/middleware/test_gzip.py
+index 65742594a0926db34d2df4fda77be61bb0537fb1..8912158483ac11eddb760550a76fd95624339817 100644
+--- a/tests/middleware/test_gzip.py
++++ b/tests/middleware/test_gzip.py
+@@ -216,6 +216,41 @@ def test_gzip_ignored_on_server_sent_events(test_client_factory: TestClientFacto
+     assert "Content-Length" not in response.headers
+ 
+ 
++@pytest.mark.anyio
++async def test_gzip_passes_through_early_hints() -> None:
++    early_hint: Message = {
++        "type": "http.response.early_hint",
++        "links": [b"</style.css>; rel=preload; as=style"],
++    }
++
++    async def app(scope: Scope, receive: Receive, send: Send) -> None:
++        await send(early_hint)
++        await send({"type": "http.response.start", "status": 200, "headers": []})
++        await send({"type": "http.response.body", "body": b"content"})
++
++    events: list[Message] = []
++
++    async def send(message: Message) -> None:
++        events.append(message)
++
++    async def receive() -> Message:
++        raise NotImplementedError  # pragma: no cover
++
++    scope: Scope = {
++        "type": "http",
++        "headers": [(b"accept-encoding", b"gzip")],
++        "extensions": {"http.response.early_hint": {}},
++    }
++    await GZipMiddleware(app)(scope, receive, send)
++
++    assert events[0] == early_hint
++    assert [event["type"] for event in events] == [
++        "http.response.early_hint",
++        "http.response.start",
++        "http.response.body",
++    ]
++
++
+ @pytest.mark.anyio
+ async def test_gzip_ignored_for_pathsend_responses(tmpdir: Path) -> None:
+     path = tmpdir / "example.txt"
+diff --git a/tests/test_endpoints.py b/tests/test_endpoints.py
+index dfc2019698dbdfa8962318558dc088ea000ddbf4..fe921596ce2c885b45a58bbc0c95becee47ca967 100644
+--- a/tests/test_endpoints.py
++++ b/tests/test_endpoints.py
+@@ -7,6 +7,7 @@ from starlette.requests import Request
+ from starlette.responses import PlainTextResponse
+ from starlette.routing import Route, Router
+ from starlette.testclient import TestClient
++from starlette.types import Message, Scope
+ from starlette.websockets import WebSocket
+ from tests.types import TestClientFactory
+ 
+@@ -47,6 +48,36 @@ def test_http_endpoint_route_method(client: TestClient) -> None:
+     assert response.headers["allow"] == "GET"
+ 
+ 
++@pytest.mark.anyio
++async def test_http_endpoint_supports_early_hints() -> None:
++    class Endpoint(HTTPEndpoint):
++        async def get(self, request: Request) -> PlainTextResponse:
++            await request.send_early_hints("</style.css>; rel=preload; as=style")
++            return PlainTextResponse("Hello, world!")
++
++    scope: Scope = {
++        "type": "http",
++        "method": "GET",
++        "extensions": {"http.response.early_hint": {}},
++    }
++    messages: list[Message] = []
++
++    async def receive() -> Message:
++        raise NotImplementedError  # pragma: no cover
++
++    async def send(message: Message) -> None:
++        messages.append(message)
++
++    await Endpoint(scope, receive, send)
++
++    assert messages[0] == {
++        "type": "http.response.early_hint",
++        "links": [b"</style.css>; rel=preload; as=style"],
++    }
++    assert messages[1]["type"] == "http.response.start"
++    assert messages[2]["type"] == "http.response.body"
++
++
+ def test_http_endpoint_does_not_dispatch_non_verb_method(test_client_factory: TestClientFactory) -> None:
+     class Endpoint(HTTPEndpoint):
+         async def get(self, request: Request) -> PlainTextResponse:
+diff --git a/tests/test_requests.py b/tests/test_requests.py
+index eb02a0ffd7ce4cb98751037784207a8c3f464507..5b09390be0f3b26d2ab60e7c467fb175dcd7b44f 100644
+--- a/tests/test_requests.py
++++ b/tests/test_requests.py
+@@ -564,6 +564,60 @@ def test_request_send_push_promise_without_setting_send(
+     assert response.json() == {"json": "Send channel not available"}
+ 
+ 
++@pytest.mark.anyio
++async def test_request_send_early_hints() -> None:
++    messages: list[Message] = []
++
++    async def send(message: Message) -> None:
++        messages.append(message)
++
++    scope: Scope = {"type": "http", "extensions": {"http.response.early_hint": {}}}
++    request = Request(scope, send=send)
++    await request.send_early_hints(
++        "</style.css>; rel=preload; as=style",
++        "</app.js>; rel=modulepreload",
++    )
++
++    assert messages == [
++        {
++            "type": "http.response.early_hint",
++            "links": [
++                b"</style.css>; rel=preload; as=style",
++                b"</app.js>; rel=modulepreload",
++            ],
++        }
++    ]
++
++
++@pytest.mark.anyio
++async def test_request_send_early_hints_requires_positional_link() -> None:
++    request = Request({"type": "http"})
++
++    with pytest.raises(TypeError, match="positional-only"):
++        await request.send_early_hints(link="</style.css>; rel=preload; as=style")  # type: ignore[call-arg]
++
++
++@pytest.mark.anyio
++async def test_request_send_early_hints_without_extension() -> None:
++    messages: list[Message] = []
++
++    async def send(message: Message) -> None:  # pragma: no cover
++        messages.append(message)
++
++    request = Request({"type": "http", "extensions": {}}, send=send)
++    await request.send_early_hints("</style.css>; rel=preload; as=style")
++
++    assert messages == []
++
++
++@pytest.mark.anyio
++async def test_request_send_early_hints_without_send_channel() -> None:
++    request = Request({"type": "http", "extensions": {"http.response.early_hint": {}}})
++
++    with pytest.raises(RuntimeError, match="Send channel has not been made available"):
++        await request.send_early_hints("</style.css>; rel=preload; as=style")
++
++
+ @pytest.mark.parametrize(
+     "messages",
+     [

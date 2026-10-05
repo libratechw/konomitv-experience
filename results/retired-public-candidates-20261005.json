@@ -2,7 +2,7 @@
   "schema_version": 1,
   "date": "2026-10-05",
   "purpose": "Historical candidate, experiment and diagnostic source preservation; not an adoption recommendation or a claim that all changes were merged.",
-  "source_license": "MIT; original repositories' licenses and attribution remain applicable to the archived source patches.",
+  "source_license": "Original repository licenses remain applicable (MIT or BSD-3-Clause); attribution is preserved. Starlette entries link to the included BSD license notice.",
   "patch_format": "git diff --binary --full-index",
   "excluded_paths": [
     "dist/**",
@@ -161,6 +161,65 @@
       "current_reference_url": "https://github.com/tsukumijima/mpeg2toh264/commit/23d270cd29beb8cd6ce8f00947fe84934219b8c9",
       "historical_group": "ios-lifecycle-diagnostics",
       "historical_note": "An old diagnostic MPEG-2 player with MSE operation/attachment and iOS lifecycle error tracing. The complete source delta is preserved as part of the historical diagnostic group, not as an adoption recommendation or a current playback implementation."
+    },
+    {
+      "repository": "https://github.com/libratechw/aribb24.js",
+      "retired_branch": "backport/v1",
+      "base_commit": "2715b3f394a249ecdab862a2ac6359d765150fcf",
+      "base_url": "https://github.com/libratechw/aribb24.js/commit/2715b3f394a249ecdab862a2ac6359d765150fcf",
+      "recorded_tip": "66007217fe96ea0c90b5014c2db4b62e4d5fe2c8",
+      "tip_url": "https://github.com/libratechw/aribb24.js/commit/66007217fe96ea0c90b5014c2db4b62e4d5fe2c8",
+      "source_patch": "aribb24-v1-backport-retired.patch",
+      "source_patch_sha256": "38a4bce2a6e8b607955f0397549890971e9f893b701bbac3c8f3d4f46455628d",
+      "source_license": "MIT",
+      "source_license_url": "https://github.com/monyone/aribb24.js/blob/66007217fe96ea0c90b5014c2db4b62e4d5fe2c8/LICENSE",
+      "current_reference_url": "https://github.com/monyone/aribb24.js/commit/66007217fe96ea0c90b5014c2db4b62e4d5fe2c8",
+      "historical_note": "A v1 backport mirror with the same tip as monyone/aribb24.js backport/v1 at cleanup. It has no independent fork changes; the source delta is preserved for restoration. The upstream backport branch is not removed."
+    },
+    {
+      "repository": "https://github.com/libratechw/starlette",
+      "retired_branch": "add-early-hints",
+      "base_commit": "4f250d6b814587e20c5365f0a5f0c4d42bcb929f",
+      "base_url": "https://github.com/libratechw/starlette/commit/4f250d6b814587e20c5365f0a5f0c4d42bcb929f",
+      "recorded_tip": "9e0b0bd02af5ca09b5c37505541678a79aafbfa3",
+      "tip_url": "https://github.com/libratechw/starlette/commit/9e0b0bd02af5ca09b5c37505541678a79aafbfa3",
+      "source_patch": "starlette-early-hints-retired.patch",
+      "source_patch_sha256": "df9b9dda3a36f31cea3d9b3c3705303de983ce64625fa8c6e6ae93eeb0a5b418",
+      "source_license": "BSD-3-Clause",
+      "source_license_url": "https://github.com/libratechw/starlette/blob/9e0b0bd02af5ca09b5c37505541678a79aafbfa3/LICENSE.md",
+      "source_license_file": "starlette-retired-source-LICENSE.md",
+      "current_reference_url": "https://github.com/libratechw/starlette/commit/39fd0ffac25593fce39466320c9a666957ce8b8c",
+      "historical_note": "An old Early Hints proposal with its source, tests and documentation. The full source delta is preserved, not claimed to be merged, validated for adoption or used by the current playback deployment."
+    },
+    {
+      "repository": "https://github.com/libratechw/starlette",
+      "retired_branch": "codex/add-opentelemetry-header-capture",
+      "base_commit": "e4bd5981540ee0003deaae69d7f4881f11714b96",
+      "base_url": "https://github.com/libratechw/starlette/commit/e4bd5981540ee0003deaae69d7f4881f11714b96",
+      "recorded_tip": "a47fdaa565b6da4246647198e0b56abbc16d26ae",
+      "tip_url": "https://github.com/libratechw/starlette/commit/a47fdaa565b6da4246647198e0b56abbc16d26ae",
+      "source_patch": "starlette-opentelemetry-header-capture-retired.patch",
+      "source_patch_sha256": "311d16ee70fc2350754461490bfa535c5eb7c0a753d8f906244b4a3c47447792",
+      "source_license": "BSD-3-Clause",
+      "source_license_url": "https://github.com/libratechw/starlette/blob/a47fdaa565b6da4246647198e0b56abbc16d26ae/LICENSE.md",
+      "source_license_file": "starlette-retired-source-LICENSE.md",
+      "current_reference_url": "https://github.com/libratechw/starlette/commit/39fd0ffac25593fce39466320c9a666957ce8b8c",
+      "historical_note": "An old OpenTelemetry header-capture proposal with its source, tests and documentation. The full source delta is preserved, not claimed to be merged, validated for adoption or used by the current playback deployment."
+    },
+    {
+      "repository": "https://github.com/libratechw/starlette",
+      "retired_branch": "codex/stream-testclient-responses",
+      "base_commit": "e4bd5981540ee0003deaae69d7f4881f11714b96",
+      "base_url": "https://github.com/libratechw/starlette/commit/e4bd5981540ee0003deaae69d7f4881f11714b96",
+      "recorded_tip": "a728ef11f10653cc59ede2890091424bc4808786",
+      "tip_url": "https://github.com/libratechw/starlette/commit/a728ef11f10653cc59ede2890091424bc4808786",
+      "source_patch": "starlette-stream-testclient-responses-retired.patch",
+      "source_patch_sha256": "036d5b8e7eeb066deb8d68bd53c0fac6d28fea5839c108da0b13ff7873fac8ca",
+      "source_license": "BSD-3-Clause",
+      "source_license_url": "https://github.com/libratechw/starlette/blob/a728ef11f10653cc59ede2890091424bc4808786/LICENSE.md",
+      "source_license_file": "starlette-retired-source-LICENSE.md",
+      "current_reference_url": "https://github.com/libratechw/starlette/commit/39fd0ffac25593fce39466320c9a666957ce8b8c",
+      "historical_note": "An old streaming TestClient proposal with its source and tests. The full source delta is preserved, not claimed to be merged, validated for adoption or used by the current playback deployment."
     }
   ]
 }
