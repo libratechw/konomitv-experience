@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "date": "2026-10-05",
-  "purpose": "Historical candidate and experiment source preservation; not an adoption recommendation or a claim that all changes were merged.",
+  "purpose": "Historical candidate, experiment and diagnostic source preservation; not an adoption recommendation or a claim that all changes were merged.",
   "source_license": "MIT; original repositories' licenses and attribution remain applicable to the archived source patches.",
   "patch_format": "git diff --binary --full-index",
   "excluded_paths": [
@@ -90,6 +90,77 @@
       "source_patch_sha256": "8ef70e8ce1b618f8ab976750f4076b426a7ab4fdf3a808e7d5220dd284ea75a9",
       "current_reference_url": "https://github.com/tsukumijima/mpeg2toh264/commit/23d270cd29beb8cd6ce8f00947fe84934219b8c9",
       "historical_note": "An old dogfood integration of product candidates and hot-path experiments. The complete source delta is preserved, including changes absent from the current reference; retirement does not imply that every change was merged or validated for adoption."
+    },
+    {
+      "repository": "https://github.com/libratechw/KonomiTV",
+      "retired_branch": "provisional/livepsi-worker-single-expose",
+      "base_commit": "cc9f340cde56f9e1343dc212600a78b607a47bd8",
+      "base_url": "https://github.com/libratechw/KonomiTV/commit/cc9f340cde56f9e1343dc212600a78b607a47bd8",
+      "recorded_tip": "cc3c0e91462376a966f94c94073c79b706450d59",
+      "tip_url": "https://github.com/libratechw/KonomiTV/commit/cc3c0e91462376a966f94c94073c79b706450d59",
+      "source_patch": "konomitv-livepsi-single-expose-retired.patch",
+      "source_patch_sha256": "b4e75a3c02922880f34737ae402e9051497c5cd64b4547bf93d408ec1c8fa983",
+      "current_reference_url": "https://github.com/tsukumijima/KonomiTV/commit/423665b1f9b4bb24c1ce3486c34a4e9112c96874",
+      "historical_note": "An old provisional LivePSI Worker connection option. The current official KonomiTV reference uses the same native Worker and Comlink.wrap connection, with different comments and expression layout. The exact former implementation is preserved rather than claimed to have been merged commit-for-commit."
+    },
+    {
+      "repository": "https://github.com/libratechw/KonomiTV",
+      "retired_branch": "codex/dogfood-provenance-ui",
+      "base_commit": "ea1962f84c22265c1d31081dfe41cc3b53e9a555",
+      "base_url": "https://github.com/libratechw/KonomiTV/commit/ea1962f84c22265c1d31081dfe41cc3b53e9a555",
+      "recorded_tip": "ef1cac6d52e22bb18b39fbcc644aa77245b48fef",
+      "tip_url": "https://github.com/libratechw/KonomiTV/commit/ef1cac6d52e22bb18b39fbcc644aa77245b48fef",
+      "source_patch": "konomitv-ios-provenance-ui-retired.patch",
+      "source_patch_sha256": "8eab55676ded06cf07093cf5cf478d25150373f994a06c102dc5e7d3b6ae2dee",
+      "current_reference_url": "https://github.com/tsukumijima/KonomiTV/commit/423665b1f9b4bb24c1ce3486c34a4e9112c96874",
+      "historical_group": "ios-lifecycle-diagnostics",
+      "historical_dependencies": [
+        {
+          "repository": "https://github.com/libratechw/DPlayer",
+          "commit": "f9ac9d9f07ea6dbfd678992953ca7ee35b9c2f68",
+          "archive_manifest": "retired-public-candidates-20261005.json",
+          "archive_entry": "diagnostic/ios-lifecycle-trace"
+        },
+        {
+          "repository": "https://github.com/libratechw/mpeg2toh264",
+          "commit": "68c1c21734d193b646070d9ff003786757550080",
+          "archive_manifest": "retired-public-candidates-20261005.json",
+          "archive_entry": "diagnostic/ios-lifecycle-trace"
+        },
+        {
+          "repository": "https://github.com/libratechw/starlette",
+          "commit": "17e3955f997c2f271a08057fe649abadcc482f77",
+          "archive_manifest": "retired-public-branches-20261005.json",
+          "archive_entry": "codex/fix-file-response-disconnect"
+        }
+      ],
+      "historical_note": "An old diagnostic application with persistent playback error/provenance UI. Its complete source delta and the pinned DPlayer, mpeg2toh264 and Starlette diagnostic dependencies are preserved as a historical group, not as a current dogfood or adoption recommendation."
+    },
+    {
+      "repository": "https://github.com/libratechw/DPlayer",
+      "retired_branch": "diagnostic/ios-lifecycle-trace",
+      "base_commit": "a5f847877eada1390456aea4ed7da8e31b4c166e",
+      "base_url": "https://github.com/libratechw/DPlayer/commit/a5f847877eada1390456aea4ed7da8e31b4c166e",
+      "recorded_tip": "f9ac9d9f07ea6dbfd678992953ca7ee35b9c2f68",
+      "tip_url": "https://github.com/libratechw/DPlayer/commit/f9ac9d9f07ea6dbfd678992953ca7ee35b9c2f68",
+      "source_patch": "dplayer-ios-lifecycle-trace-retired.patch",
+      "source_patch_sha256": "e576114326fa78ba96dc9f6a260415c7872b3dcde5d78f65bce5d5472113b91b",
+      "current_reference_url": "https://github.com/tsukumijima/DPlayer/commit/e1132aa9bef23013dfd49ea228622daa6aebc0b0",
+      "historical_group": "ios-lifecycle-diagnostics",
+      "historical_note": "An old diagnostic DPlayer build for video lifecycle/quality-switch tracing. The full source delta includes its older stale-video-event fixes; their standalone candidate remains separate. This archive preserves the diagnostic group without claiming all changes were adopted."
+    },
+    {
+      "repository": "https://github.com/libratechw/mpeg2toh264",
+      "retired_branch": "diagnostic/ios-lifecycle-trace",
+      "base_commit": "faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "base_url": "https://github.com/libratechw/mpeg2toh264/commit/faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "recorded_tip": "68c1c21734d193b646070d9ff003786757550080",
+      "tip_url": "https://github.com/libratechw/mpeg2toh264/commit/68c1c21734d193b646070d9ff003786757550080",
+      "source_patch": "mpeg2toh264-ios-lifecycle-trace-retired.patch",
+      "source_patch_sha256": "8c4c1ea05675d79060d8f7ce7834ca501fde80369dbac0ccaef28b5f6ea5e20f",
+      "current_reference_url": "https://github.com/tsukumijima/mpeg2toh264/commit/23d270cd29beb8cd6ce8f00947fe84934219b8c9",
+      "historical_group": "ios-lifecycle-diagnostics",
+      "historical_note": "An old diagnostic MPEG-2 player with MSE operation/attachment and iOS lifecycle error tracing. The complete source delta is preserved as part of the historical diagnostic group, not as an adoption recommendation or a current playback implementation."
     }
   ]
 }

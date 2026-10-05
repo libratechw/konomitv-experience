@@ -1,0 +1,635 @@
+diff --git a/Readme.md b/Readme.md
+index cd45037b4f3db36a41e872722adf057efcd35535..5789d4c8fccba3e713031c23d067d55477c53e2c 100644
+--- a/Readme.md
++++ b/Readme.md
+@@ -3,6 +3,9 @@
+ </p>
+ <h1 align="center">DPlayer</h1>
+ 
++> [!WARNING]
++> この branch は iOS Original 再生の診断統合専用です。画質切替と media backend の世代・破棄・作成を mpeg2toh264 の lifecycle trace へ記録します。画質切替の成功、video error、別videoへの置換、backendの明示破棄、DPlayer破棄では、終了理由を記録してから、そのswitch generationに結び付いたopaque tokenだけを解決済みにします。履歴は通常のリング容量内に残り、errorより前にmpeg2toh264がsnapshotを凍結済みならtokenの解決は凍結済みsnapshotを変更しません。通常の復旧動作を変更せず、branch 全体を公開 API の提案として取り込むことは想定していません。
++
+ > 🍭 Wow, such a lovely HTML5 danmaku video player
+ 
+ この Fork は、
+diff --git a/package.json b/package.json
+index ed76033a13f538541e22879c538962422381376f..f48a36b8112d7c8b7603d55d0fa35df556a1969f 100644
+--- a/package.json
++++ b/package.json
+@@ -32,6 +32,8 @@
+         "build": "cross-env NODE_ENV=production webpack build --config webpack/prod.config.js --progress",
+         "dev": "cross-env NODE_ENV=development webpack serve --config webpack/dev.config.js",
+         "test": "eslint src",
++        "test:diagnostic-lifecycle": "node tools/test-diagnostic-lifecycle.mjs",
++        "test:dist-provenance": "node tools/test-dist-provenance.mjs",
+         "type-check": "tsc --noEmit",
+         "format": "eslint \"**/*.ts\" --fix",
+         "format:check": "eslint \"**/*.ts\"",
+diff --git a/src/ts/player.ts b/src/ts/player.ts
+index 06e33005ff68837fc359d1a4d8a736bd4d7c5454..4319cd9854b59ac77e06f2129acbf9c98813f615 100644
+--- a/src/ts/player.ts
++++ b/src/ts/player.ts
+@@ -27,6 +27,37 @@ import type { PlayerState, PrivateStream, Progress, Stats } from 'mpeg2toh264/pl
+ let index = 0;
+ const instances: DPlayer[] = [];
+ 
++type DiagnosticLifecycleValue = string | number | boolean | null;
++type DiagnosticLifecycleToken = Readonly<object>;
++type DiagnosticMpeg2TsPlayer = {
++    recordDiagnosticLifecycle?: (
++        event: string,
++        detail?: Readonly<Record<string, DiagnosticLifecycleValue>>,
++        options?: { readonly at?: number; readonly critical?: boolean },
++    ) => DiagnosticLifecycleToken | null;
++    resolveDiagnosticLifecycle?: (token: DiagnosticLifecycleToken) => void;
++};
++
++interface DiagnosticLifecycleRecord {
++    readonly recorded: boolean;
++    readonly criticalToken: DiagnosticLifecycleToken | null;
++    readonly owner: DPlayerType.Plugins['mpeg2toh264'];
++}
++
++interface DiagnosticQualitySwitch {
++    readonly generation: number;
++    readonly fromQualityIndex: number | null;
++    readonly toQualityIndex: number;
++    readonly startedAt: number;
++    recordedOnMpeg: boolean;
++    criticalToken: DiagnosticLifecycleToken | null;
++    criticalOwner: DPlayerType.Plugins['mpeg2toh264'];
++}
++
++function diagnosticNow(): number {
++    return performance.timeOrigin + performance.now();
++}
++
+ declare let window: DPlayerType.WindowExtend;
+ 
+ class DPlayer {
+@@ -58,6 +89,12 @@ class DPlayer {
+     plugins: DPlayerType.Plugins;
+     prevVideoCurrentTime = 0;
+     prevVideo: HTMLVideoElement | null = null;
++    private videoEventsInitialized = false;
++    private qualityCanplayHandler: (() => void) | null = null;
++    private readonly diagnosticInstance = index;
++    private videoGeneration = 0;
++    private qualitySwitchGeneration = 0;
++    private activeQualitySwitch: DiagnosticQualitySwitch | null = null;
+     quality: DPlayerType.VideoQualityInternal | null = null;
+     qualityIndex: number | null = null;
+     switchingQuality = false;
+@@ -248,11 +285,15 @@ class DPlayer {
+         }
+ 
+         if (!fromNative) {
+-            const playFunc = (this.type === 'mpegts' && this.plugins.mpegts && this.plugins.mpegts.play.bind(this.plugins.mpegts)) || this.video.play.bind(this.video);
++            const targetVideo = this.video;
++            const playFunc = (this.type === 'mpegts' && this.plugins.mpegts && this.plugins.mpegts.play.bind(this.plugins.mpegts)) || targetVideo.play.bind(targetVideo);
+             const playedPromise = Promise.resolve(playFunc());
+             playedPromise
+                 .catch(() => {
+-                    this.pause();
++                    // Ignore a rejection from the video replaced by a quality switch.
++                    if (this.video === targetVideo) {
++                        this.pause();
++                    }
+                 })
+                 .then(() => {
+                     // pass
+@@ -395,6 +436,7 @@ class DPlayer {
+         remember = false,
+         apiBackend: DPlayerType.APIBackend = defaultApiBackend,
+     ): void {
++        this.cancelDiagnosticQualitySwitch('switch-video');
+         this.pause();
+         const seek = this.video.currentTime;
+         const speed = this.video.playbackRate;
+@@ -479,9 +521,93 @@ class DPlayer {
+         this.comment = new Comment(this);
+     }
+ 
++    private recordMpeg2ToH264Lifecycle(
++        player: DPlayerType.Plugins['mpeg2toh264'],
++        event: string,
++        detail: Readonly<Record<string, DiagnosticLifecycleValue>>,
++        options: { readonly at?: number; readonly critical?: boolean } = {},
++    ): DiagnosticLifecycleRecord {
++        try {
++            const record = (player as (DiagnosticMpeg2TsPlayer & EventTarget) | undefined)?.recordDiagnosticLifecycle;
++            if (record === undefined) {
++                return { recorded: false, criticalToken: null, owner: player };
++            }
++            const result = record.call(
++                player,
++                event,
++                { dplayerInstance: this.diagnosticInstance, ...detail },
++                options,
++            );
++            const criticalToken = typeof result === 'object' && result !== null ? result : null;
++            return { recorded: true, criticalToken, owner: player };
++        } catch {
++            // Optional diagnostics must never change quality-switch behaviour.
++            return { recorded: false, criticalToken: null, owner: player };
++        }
++    }
++
++    private resolveMpeg2ToH264Lifecycle(
++        owner: DPlayerType.Plugins['mpeg2toh264'],
++        token: DiagnosticLifecycleToken | null,
++    ): void {
++        try {
++            if (token === null) {
++                return;
++            }
++            const resolve = (owner as (DiagnosticMpeg2TsPlayer & EventTarget) | undefined)?.resolveDiagnosticLifecycle;
++            resolve?.call(owner, token);
++        } catch {
++            // Optional diagnostics must never change quality-switch behaviour.
++        }
++    }
++
++    private finishDiagnosticQualitySwitch(
++        qualitySwitch: DiagnosticQualitySwitch | null,
++        event: 'dplayer-quality-switch-end' | 'dplayer-quality-switch-error' | 'dplayer-quality-switch-cancel',
++        detail: Readonly<Record<string, DiagnosticLifecycleValue>> = {},
++    ): DPlayerType.Plugins['mpeg2toh264'] {
++        const owner = this.plugins.mpeg2toh264 ?? qualitySwitch?.criticalOwner;
++        if (qualitySwitch === null) {
++            return owner;
++        }
++        this.recordMpeg2ToH264Lifecycle(
++            owner,
++            event,
++            {
++                ...detail,
++                dplayerVideoGeneration: this.videoGeneration,
++                qualitySwitchGeneration: qualitySwitch.generation,
++                currentVideo: true,
++            },
++        );
++        // The mpeg owner only releases this exact entry. A journal already
++        // frozen by a synchronous fatal error treats this as a harmless no-op.
++        this.resolveMpeg2ToH264Lifecycle(
++            qualitySwitch.criticalOwner,
++            qualitySwitch.criticalToken,
++        );
++        if (this.activeQualitySwitch === qualitySwitch) {
++            this.activeQualitySwitch = null;
++        }
++        return owner;
++    }
++
++    private cancelDiagnosticQualitySwitch(reason: string): void {
++        this.finishDiagnosticQualitySwitch(
++            this.activeQualitySwitch,
++            'dplayer-quality-switch-cancel',
++            { reason },
++        );
++    }
++
+     initMSE(video: HTMLVideoElement, type: DPlayerType.VideoType | string): void {
++        const isActiveQualityReplacement =
++            this.switchingQuality && this.activeQualitySwitch !== null && this.video === video;
++        if (!isActiveQualityReplacement) {
++            this.cancelDiagnosticQualitySwitch('media-backend-replacement');
++        }
+         // A video element has exactly one media backend, so switching formats releases the previous owner first
+-        this.destroyMediaBackend();
++        this.releaseMediaBackend();
+         this.type = type;
+ 
+         if (this.options.video.customType && this.options.video.customType[type]) {
+@@ -744,9 +870,33 @@ class DPlayer {
+                             },
+                         );
+                         this.plugins.mpeg2toh264 = mpeg2toh264Player;
++                        const backendVideoGeneration = this.videoGeneration;
++                        const qualitySwitch = this.activeQualitySwitch;
++                        const backendRecord = this.recordMpeg2ToH264Lifecycle(
++                            mpeg2toh264Player,
++                            'dplayer-backend-created',
++                            {
++                                dplayerVideoGeneration: backendVideoGeneration,
++                                qualitySwitchGeneration: qualitySwitch?.generation ?? 0,
++                                fromQualityIndex: qualitySwitch?.fromQualityIndex ?? null,
++                                toQualityIndex: qualitySwitch?.toQualityIndex ?? this.qualityIndex,
++                                currentVideo: this.video === video,
++                            },
++                            { critical: qualitySwitch !== null && !qualitySwitch.recordedOnMpeg },
++                        );
++                        if (qualitySwitch !== null && backendRecord.recorded) {
++                            qualitySwitch.recordedOnMpeg = true;
++                            if (backendRecord.criticalToken !== null) {
++                                qualitySwitch.criticalToken = backendRecord.criticalToken;
++                                qualitySwitch.criticalOwner = backendRecord.owner;
++                            }
++                        }
+ 
+                         // Conversion failures use DPlayer's existing notice surface while callers can observe the plugin directly
+                         mpeg2toh264Player.addEventListener('error', (event) => {
++                            if (this.video !== video || this.plugins.mpeg2toh264 !== mpeg2toh264Player) {
++                                return;
++                            }
+                             this.notice(`Error: ${event.detail.error.message}`, undefined, undefined, '#FF6F6A');
+                         });
+ 
+@@ -825,6 +975,15 @@ class DPlayer {
+ 
+                         // Keep Worker, MSE, and subtitle resources under the same backend lifetime
+                         this.mediaBackendDestroy = () => {
++                            this.recordMpeg2ToH264Lifecycle(
++                                mpeg2toh264Player,
++                                'dplayer-backend-destroy',
++                                {
++                                    dplayerVideoGeneration: backendVideoGeneration,
++                                    qualitySwitchGeneration: this.activeQualitySwitch?.generation ?? 0,
++                                    currentVideo: this.video === video,
++                                },
++                            );
+                             mpeg2toh264Player.removeEventListener('stats', updateStats);
+                             mpeg2toh264Player.removeEventListener('statechange', updateState);
+                             mpeg2toh264Player.removeEventListener('progress', updateProgress);
+@@ -943,24 +1102,22 @@ class DPlayer {
+         }
+     }
+ 
+-    initVideo(video: HTMLVideoElement, type: DPlayerType.VideoType | string): void {
+-        this.initMSE(video, type);
+-
++    private initVideoEvents(): void {
+         /**
+          * video events
+          */
+         // show video time: the metadata has loaded or changed
+         this.on('durationchange', () => {
+             // compatibility: Android browsers will output 1 or Infinity at first
+-            if (video.duration !== 1 && video.duration !== Infinity) {
+-                this.template.dtime.textContent = utils.secondToTime(video.duration);
++            if (this.video.duration !== 1 && this.video.duration !== Infinity) {
++                this.template.dtime.textContent = utils.secondToTime(this.video.duration);
+             }
+         });
+ 
+         // show video loaded bar: to inform interested parties of progress downloading the media
+         this.on('progress', () => {
+             const duration = utils.getVideoDuration(this.video, this.template);
+-            const percentage = video.buffered.length ? video.buffered.end(video.buffered.length - 1) / duration : 0;
++            const percentage = this.video.buffered.length ? this.video.buffered.end(this.video.buffered.length - 1) / duration : 0;
+             this.bar.set('loaded', percentage, 'width');
+         });
+ 
+@@ -972,7 +1129,24 @@ class DPlayer {
+             }
+             // quality switching failed
+             if (this.switchingQuality) {
++                const failedSwitch = this.activeQualitySwitch;
++                const failureLifecycleOwner = this.finishDiagnosticQualitySwitch(
++                    failedSwitch,
++                    'dplayer-quality-switch-error',
++                    {
++                        mediaErrorCode: this.video.error?.code ?? null,
++                    },
++                );
+                 if (this.prevVideo !== null) {
++                    this.recordMpeg2ToH264Lifecycle(
++                        failureLifecycleOwner,
++                        'dplayer-previous-video-remove',
++                        {
++                            dplayerVideoGeneration: this.videoGeneration,
++                            qualitySwitchGeneration: failedSwitch?.generation ?? 0,
++                            reason: 'quality-switch-error',
++                        },
++                    );
+                     this.template.videoWrapAspect.removeChild(this.prevVideo);
+                 }
+                 this.video.classList.add('dplayer-video-current');
+@@ -1020,9 +1194,23 @@ class DPlayer {
+                 this.template.ptime.textContent = currentTime;
+             }
+         });
++    }
++
++    initVideo(video: HTMLVideoElement, type: DPlayerType.VideoType | string): void {
++        this.videoGeneration++;
++        this.initMSE(video, type);
++        if (!this.videoEventsInitialized) {
++            this.initVideoEvents();
++            this.videoEventsInitialized = true;
++        }
+ 
+         for (let i = 0; i < this.events.videoEvents.length; i++) {
+             video.addEventListener(this.events.videoEvents[i], (event) => {
++                // A quality switch keeps the previous video until the replacement can play.
++                // Do not forward late events from that video to handlers for the replacement.
++                if (this.video !== video) {
++                    return;
++                }
+                 this.events.trigger(this.events.videoEvents[i], event);
+             });
+         }
+@@ -1102,9 +1290,33 @@ class DPlayer {
+         index = typeof index === 'string' ? parseInt(index) : index;
+         if (this.options.video.quality === undefined || this.qualityIndex === index || this.switchingQuality) {
+             return;
+-        } else {
+-            this.qualityIndex = index;
+         }
++        const qualitySwitch: DiagnosticQualitySwitch = {
++            generation: ++this.qualitySwitchGeneration,
++            fromQualityIndex: this.qualityIndex,
++            toQualityIndex: index,
++            startedAt: diagnosticNow(),
++            recordedOnMpeg: false,
++            criticalToken: null,
++            criticalOwner: undefined,
++        };
++        this.activeQualitySwitch = qualitySwitch;
++        const switchStartRecord = this.recordMpeg2ToH264Lifecycle(
++            this.plugins.mpeg2toh264,
++            'dplayer-quality-switch-start',
++            {
++                dplayerVideoGeneration: this.videoGeneration,
++                qualitySwitchGeneration: qualitySwitch.generation,
++                fromQualityIndex: qualitySwitch.fromQualityIndex,
++                toQualityIndex: qualitySwitch.toQualityIndex,
++                currentVideo: true,
++            },
++            { at: qualitySwitch.startedAt, critical: true },
++        );
++        qualitySwitch.recordedOnMpeg = switchStartRecord.recorded;
++        qualitySwitch.criticalToken = switchStartRecord.criticalToken;
++        qualitySwitch.criticalOwner = switchStartRecord.owner;
++        this.qualityIndex = index;
+         this.switchingQuality = true;
+         this.quality = this.options.video.quality[index];
+ 
+@@ -1126,7 +1338,12 @@ class DPlayer {
+         this.video = videoEle;
+         // Preserve the selected channel until the replacement backend publishes enough audio metadata
+         this.pendingAudio = this.setting.currentAudio;
+-        this.initVideo(this.video, this.quality.type || this.options.video.type);
++        try {
++            this.initVideo(this.video, this.quality.type || this.options.video.type);
++        } catch (error) {
++            this.cancelDiagnosticQualitySwitch('quality-switch-init-error');
++            throw error;
++        }
+         if (!this.options.live) {
+             this.seek(this.prevVideoCurrentTime);
+         }
+@@ -1150,12 +1367,24 @@ class DPlayer {
+             }
+         });
+ 
+-        this.on('canplay', () => {
++        if (this.qualityCanplayHandler !== null) {
++            this.off('canplay', this.qualityCanplayHandler);
++        }
++        this.qualityCanplayHandler = () => {
+             if (this.prevVideo !== null) {
+                 if (!this.options.live && this.video.currentTime !== this.prevVideoCurrentTime) {
+                     this.seek(this.prevVideoCurrentTime);
+                     return;
+                 }
++                this.recordMpeg2ToH264Lifecycle(
++                    this.plugins.mpeg2toh264,
++                    'dplayer-previous-video-remove',
++                    {
++                        dplayerVideoGeneration: this.videoGeneration,
++                        qualitySwitchGeneration: this.activeQualitySwitch?.generation ?? 0,
++                        reason: 'quality-switch-complete',
++                    },
++                );
+                 this.template.videoWrapAspect.removeChild(this.prevVideo);
+                 this.video.classList.add('dplayer-video-current');
+                 if (!paused) {
+@@ -1179,9 +1408,15 @@ class DPlayer {
+                 }
+ 
+                 this.container.classList.remove('dplayer-loading');
++                const completedSwitch = this.activeQualitySwitch;
++                this.finishDiagnosticQualitySwitch(
++                    completedSwitch,
++                    'dplayer-quality-switch-end',
++                );
+                 this.events.trigger('quality_end');
+             }
+-        });
++        };
++        this.on('canplay', this.qualityCanplayHandler);
+     }
+ 
+     /**
+@@ -1262,6 +1497,11 @@ class DPlayer {
+      * Release the media backend currently attached to the video element
+      */
+     destroyMediaBackend(): void {
++        this.cancelDiagnosticQualitySwitch('media-backend-abandon');
++        this.releaseMediaBackend();
++    }
++
++    private releaseMediaBackend(): void {
+         // Clear the callback before running plugin code so reentrant teardown remains idempotent
+         const mediaBackendDestroy = this.mediaBackendDestroy;
+         this.mediaBackendDestroy = null;
+@@ -1273,6 +1513,7 @@ class DPlayer {
+      * @param keepContainerInnerHTML If true, do not clean the innerHTML of the container
+      */
+     destroy(keepContainerInnerHTML = false): void {
++        this.cancelDiagnosticQualitySwitch('player-destroy');
+         instances.splice(instances.indexOf(this), 1);
+         this.pause();
+         document.removeEventListener('click', this.docClickFun, true);
+diff --git a/tools/test-diagnostic-lifecycle.mjs b/tools/test-diagnostic-lifecycle.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..394f567a8497983c0dd50600a7e480b2f4edf695
+--- /dev/null
++++ b/tools/test-diagnostic-lifecycle.mjs
+@@ -0,0 +1,160 @@
++import assert from 'node:assert/strict';
++import { readFile } from 'node:fs/promises';
++
++const source = await readFile('src/ts/player.ts', 'utf8');
++
++assert.match(
++    source,
++    /function diagnosticNow\(\): number \{\s*return performance\.timeOrigin \+ performance\.now\(\);\s*\}/,
++);
++
++const recordMethod = source.slice(
++    source.indexOf('    private recordMpeg2ToH264Lifecycle('),
++    source.indexOf('    initMSE(', source.indexOf('    private recordMpeg2ToH264Lifecycle(')),
++);
++assert.ok(recordMethod.indexOf('try {') < recordMethod.indexOf('record.call('));
++assert.ok(recordMethod.indexOf('record.call(') < recordMethod.indexOf('} catch {'));
++assert.match(recordMethod, /criticalToken[\s\S]+owner/);
++
++const finishMethod = source.slice(
++    source.indexOf('    private finishDiagnosticQualitySwitch('),
++    source.indexOf('    private cancelDiagnosticQualitySwitch('),
++);
++const finishRecord = finishMethod.indexOf('this.recordMpeg2ToH264Lifecycle(');
++const finishResolve = finishMethod.indexOf('this.resolveMpeg2ToH264Lifecycle(');
++const finishClear = finishMethod.indexOf('this.activeQualitySwitch = null');
++assert.match(
++    finishMethod,
++    /const owner = this\.plugins\.mpeg2toh264 \?\? qualitySwitch\?\.criticalOwner;/,
++);
++assert.match(finishMethod, /qualitySwitchGeneration: qualitySwitch\.generation/);
++assert.equal(finishMethod.includes('{ critical: true }'), false);
++assert.ok(finishRecord >= 0);
++assert.ok(finishRecord < finishResolve);
++assert.ok(finishResolve < finishClear);
++assert.match(
++    finishMethod,
++    /this\.resolveMpeg2ToH264Lifecycle\(\s*qualitySwitch\.criticalOwner,\s*qualitySwitch\.criticalToken,\s*\)/,
++);
++assert.match(
++    finishMethod,
++    /if \(this\.activeQualitySwitch === qualitySwitch\) \{\s*this\.activeQualitySwitch = null;/,
++);
++
++const initVideo = source.slice(
++    source.indexOf('    initVideo('),
++    source.indexOf('    initVideoEvents(', source.indexOf('    initVideo(')),
++);
++assert.ok(initVideo.indexOf('this.videoGeneration++') < initVideo.indexOf('this.initMSE('));
++
++const videoEvents = source.slice(
++    source.indexOf('    private initVideoEvents('),
++    source.indexOf('    initVideo(', source.indexOf('    private initVideoEvents(')),
++);
++const switchFailure = videoEvents.slice(
++    videoEvents.indexOf('            // quality switching failed'),
++    videoEvents.indexOf('            if (this.tran && this.notice'),
++);
++const failureRecord = switchFailure.indexOf("'dplayer-quality-switch-error'");
++assert.match(
++    switchFailure,
++    /const failedSwitch = this\.activeQualitySwitch;\s*const failureLifecycleOwner = this\.finishDiagnosticQualitySwitch\(\s*failedSwitch,\s*'dplayer-quality-switch-error'/,
++);
++assert.match(switchFailure, /qualitySwitchGeneration: failedSwitch\?\.generation \?\? 0/);
++assert.equal(switchFailure.includes('{ critical: true }'), false);
++assert.ok(failureRecord >= 0);
++assert.match(
++    switchFailure,
++    /this\.recordMpeg2ToH264Lifecycle\(\s*failureLifecycleOwner,\s*'dplayer-previous-video-remove'/,
++);
++assert.ok(
++    failureRecord < switchFailure.indexOf("this.events.trigger('quality_end')"),
++);
++assert.equal(switchFailure.includes('this.activeQualitySwitch = null'), false);
++
++const switchQuality = source.slice(
++    source.indexOf('    switchQuality('),
++    source.indexOf('    notice(', source.indexOf('    switchQuality(')),
++);
++const switchStart = switchQuality.indexOf("'dplayer-quality-switch-start'");
++assert.ok(switchStart >= 0);
++assert.ok(switchStart < switchQuality.indexOf('this.qualityIndex = index'));
++assert.ok(switchStart < switchQuality.indexOf('this.prevVideo = this.video'));
++assert.match(
++    switchQuality,
++    /qualitySwitch\.criticalToken = switchStartRecord\.criticalToken;\s*qualitySwitch\.criticalOwner = switchStartRecord\.owner;/,
++);
++assert.ok(
++    switchQuality.indexOf("'dplayer-previous-video-remove'") <
++        switchQuality.indexOf('removeChild(this.prevVideo)'),
++);
++assert.ok(switchQuality.indexOf("'dplayer-quality-switch-end'") >= 0);
++assert.match(
++    switchQuality,
++    /const completedSwitch = this\.activeQualitySwitch;\s*this\.finishDiagnosticQualitySwitch\(\s*completedSwitch,\s*'dplayer-quality-switch-end'/,
++);
++assert.ok(
++    switchQuality.indexOf("'dplayer-quality-switch-end'") <
++        switchQuality.indexOf("this.events.trigger('quality_end')"),
++);
++assert.equal(
++    switchQuality
++        .slice(switchQuality.indexOf("this.events.trigger('quality_end')"))
++        .includes('this.activeQualitySwitch = null'),
++    false,
++);
++assert.match(switchQuality, /this\.cancelDiagnosticQualitySwitch\('quality-switch-init-error'\)/);
++
++const switchVideo = source.slice(
++    source.indexOf('    switchVideo('),
++    source.indexOf('    initDanmaku(', source.indexOf('    switchVideo(')),
++);
++assert.ok(
++    switchVideo.indexOf("this.cancelDiagnosticQualitySwitch('switch-video')") <
++        switchVideo.indexOf('this.initMSE('),
++);
++
++const initMse = source.slice(
++    source.indexOf('    initMSE('),
++    source.indexOf('    private initVideoEvents(', source.indexOf('    initMSE(')),
++);
++assert.match(
++    initMse,
++    /if \(!isActiveQualityReplacement\) \{\s*this\.cancelDiagnosticQualitySwitch\('media-backend-replacement'\);/,
++);
++assert.match(initMse, /this\.releaseMediaBackend\(\)/);
++
++const backendRelease = source.slice(
++    source.indexOf('    destroyMediaBackend('),
++    source.indexOf('    static get version', source.indexOf('    destroyMediaBackend(')),
++);
++assert.match(
++    backendRelease,
++    /destroyMediaBackend\(\): void \{\s*this\.cancelDiagnosticQualitySwitch\('media-backend-abandon'\);\s*this\.releaseMediaBackend\(\);/,
++);
++assert.ok(
++    backendRelease.indexOf("this.cancelDiagnosticQualitySwitch('player-destroy')") <
++        backendRelease.indexOf('this.destroyMediaBackend()'),
++);
++
++const mpegBackend = source.slice(
++    source.indexOf("                case 'mpeg2toh264':"),
++    source.indexOf("                case 'flv':"),
++);
++assert.ok(
++    mpegBackend.indexOf("'dplayer-backend-created'") <
++        mpegBackend.indexOf('mpeg2toh264Player.load('),
++);
++assert.ok(
++    mpegBackend.indexOf("'dplayer-backend-destroy'") <
++        mpegBackend.indexOf('mpeg2toh264Player.destroy()'),
++);
++assert.match(
++    mpegBackend,
++    /qualitySwitch\.criticalToken = backendRecord\.criticalToken;\s*qualitySwitch\.criticalOwner = backendRecord\.owner;/,
++);
++assert.match(
++    mpegBackend,
++    /this\.notice\(`Error: \$\{event\.detail\.error\.message\}`,[^;]+;/,
++);
++assert.equal(source.includes('mpeg2toh264_error'), false);
+diff --git a/tools/test-dist-provenance.mjs b/tools/test-dist-provenance.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf2c8c0bd47fc74910430659f3f46ba2172e7ed6
+--- /dev/null
++++ b/tools/test-dist-provenance.mjs
+@@ -0,0 +1,19 @@
++import assert from 'node:assert/strict';
++import { execFileSync } from 'node:child_process';
++import { readFile } from 'node:fs/promises';
++
++// Distribution commits follow their source commit; pass HEAD while validating
++// a freshly built but not-yet-committed distribution.
++const sourceRef = process.argv[2] ?? 'HEAD^';
++const sourceCommit = execFileSync('git', ['rev-parse', '--short=7', sourceRef], {
++    encoding: 'utf8',
++}).trim();
++const { version } = JSON.parse(await readFile('package.json', 'utf8'));
++const distribution = await readFile('dist/DPlayer.min.js', 'utf8');
++const expectedBanner = `DPlayer v${version} ${sourceCommit}`;
++
++assert.equal(
++    distribution.includes(expectedBanner),
++    true,
++    `distribution banner does not contain ${expectedBanner}`,
++);

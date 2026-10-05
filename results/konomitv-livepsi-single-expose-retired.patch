@@ -1,0 +1,34 @@
+diff --git a/Readme.md b/Readme.md
+index ea092f794991cd745651e8820dca757f38c997dd..9d873d934707413a0f46223b1a31f5764fd6de98 100644
+--- a/Readme.md
++++ b/Readme.md
+@@ -1,4 +1,9 @@
+ 
++> [!WARNING]
++> **このbranch (`provisional/livepsi-worker-single-expose`) は、LivePSI worker Comlink単一公開の暫定の取込み候補です。検証が残っています。**
++>
++> code baseは `cc9f340cde56f9e1343dc212600a78b607a47bd8`、実装は `49f391b4b34a684d5538e032969a9478b0133b84`、このcommitは文書追加のみです。型/lint/buildとconstructor probeは実装時点の過去確認であり、今回は再実行していません。live視聴・PSI/SI・データ放送・画質切替・長時間worker lifecycleは未検証です。
++
+ # <img width="350" src="https://user-images.githubusercontent.com/39271166/134050201-8110f076-a939-4b62-8c86-7beaa3d4728c.png" alt="KonomiTV Logo">　<!-- omit in toc -->
+ 
+ <img width="100%" src="https://github.com/user-attachments/assets/6971f354-0418-4305-bf6d-b061142ffec6">
+diff --git a/client/src/workers/LivePSIArchivedDataDecoderProxy.ts b/client/src/workers/LivePSIArchivedDataDecoderProxy.ts
+index d556f9cbf5f128360e839a9a970e192bde529613..31b6fb0b7b1023d42ac6c7df12f420ac070c8841 100644
+--- a/client/src/workers/LivePSIArchivedDataDecoderProxy.ts
++++ b/client/src/workers/LivePSIArchivedDataDecoderProxy.ts
+@@ -1,10 +1,12 @@
+ 
+-import { ILivePSIArchivedDataDecoderConstructor } from '@/workers/LivePSIArchivedDataDecoder';
++import * as Comlink from 'comlink';
++
++import type { ILivePSIArchivedDataDecoderConstructor } from '@/workers/LivePSIArchivedDataDecoder';
+ 
+ 
+ // LivePSIArchivedDataDecoder を Web Worker 上で動作させるためのラッパー
+ // Comlink を経由し、Web Worker とメインスレッド間でオブジェクトをやり取りする
+ // ラップ元と同じファイルに定義すると Webpack から Circler Dependency として警告されブラウザの挙動が不安定になるため、別ファイルに定義している
+-const LivePSIArchivedDataDecoderProxy =
+-    new ComlinkWorker<ILivePSIArchivedDataDecoderConstructor>(new URL('./LivePSIArchivedDataDecoder', import.meta.url));
++const worker = new Worker(new URL('./LivePSIArchivedDataDecoder.ts', import.meta.url), {type: 'module'});
++const LivePSIArchivedDataDecoderProxy = Comlink.wrap<ILivePSIArchivedDataDecoderConstructor>(worker);
+ export default LivePSIArchivedDataDecoderProxy;

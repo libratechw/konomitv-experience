@@ -1,0 +1,1894 @@
+diff --git a/Readme.md b/Readme.md
+index ea092f794991cd745651e8820dca757f38c997dd..830bf9e3dd69e753c20cda5cf79ce96b8affb323 100644
+--- a/Readme.md
++++ b/Readme.md
+@@ -1,4 +1,36 @@
+ 
++> [!WARNING]
++> **このbranchは、診断版・dogfood版を日常利用中の画面から識別するための統合実装です。branch全体をupstreamへ取り込むことは想定していません。**
++>
++> **配備状態：診断用の隔離port 7018へ配備済み。** 配備buildのsource commitは`034fc69`です。port 7000のproductionと、port 7016 / 7017の既存dogfood・診断環境は変更していません。配信assetとローカルdistの一致、認証済み実画面のbuild・画質表示、実lifecycle errorのdispatch IDと画面footer IDの一致を確認しました。
++
++## 診断buildの公開provenance <!-- omit in toc -->
++
++`KONOMITV_PUBLIC_BUILD_MODE=DOGFOOD`または`DIAG`を指定してclientをbuildすると、視聴画面の時刻横に`DOGFOOD <buildId> · <現在画質>`または`DIAG <buildId> · <現在画質>`を常時表示します。mpeg2toh264エラーが発生した場合は、同じ再生セッションのエラーを受信順に残す診断パネルも表示します。指定しない通常buildでは、この表示、診断パネル、診断session state、公開manifestのいずれも生成しません。
++
++provenanceの正本は、build時のKonomiTV Git HEADと依存定義です。Viteは同じobjectをclientへ埋め込み、`client/dist/build-provenance.json`へ出力します。値をREADMEや別のsourceへ転記しません。
++
++| 公開値 | build時の取得元 |
++| --- | --- |
++| `buildId`, `components.konomiTV` | cleanなKonomiTV worktreeのGit HEAD |
++| `components.dplayer`, `components.mpeg2toh264` | `client/package.json`の40桁commit pin |
++| `components.starlette` | `server/pyproject.toml`の40桁`rev` |
++
++Git worktreeに未commitの変更がある場合や、依存が40桁commitへ固定されていない場合、provenance付きbuildは失敗します。配備manifestは`build-provenance.json`のSHA-256、配信した主要assetのSHA-256、隔離serverから取得したassetのSHA-256を記録し、この公開manifestへ対応付けます。
++
++`client/scripts/validate-public-build.mjs`は、生成manifest、cleanなKonomiTV source commit、package / lockfileのpin、componentのsource / dist commit、実際にinstallされたruntime、`index.html`から参照されたentryとPlayerController、PlayerControllerから参照されたmpeg2toh264 Workerを照合します。隔離serverの応答byteも同じlocal assetと一致した場合だけ、配備用build manifestを新規作成します。Worker名はglobで推測しません。
++
++```bash
++cd client
++KONOMITV_PUBLIC_BUILD_MODE=DIAG corepack yarn build
++```
++
++診断パネルの共通headerは、再生開始時点のbuild ID、KonomiTV / mpeg2toh264短縮commit、端末family、OS version、browser、CSS viewport size、devicePixelRatio、再生種別、初期画質、再生対象を1回だけ表示します。録画は番組名と録画ID、ライブはチャンネル名と表示チャンネルIDで識別します。Apple端末の正確なmodelは推定せず、raw User-Agent、IP address、file path、tokenは含めません。
++
++各エラーは発生順の連番、lifecycle snapshotの凍結時刻（traceがない場合は受信時刻）、受信時の再生位置、現在画質、エラー内容、event IDを不変snapshotとして追加し、時刻はJSTで表示します。lifecycle traceがある場合は、最初のcritical eventと直近のMediaSource `sourceclose`について、失敗時と同じplayer・generation・videoか、MediaSourceのowner / class、失敗までの時間、画質切替の世代・切替元・切替先も表示します。内部のplayer・generation・videoの数値ID自体は表示しません。パネルは映像の半分未満を上限にスクロールでき、DPlayerのnoticeが消えた後も同じ再生セッション中は残ります。PlayerControllerだけを再起動した場合は履歴を維持します。録画の自然終了時、別の番組・チャンネルへの切り替え時、視聴画面から離れた時に履歴を破棄し、同じ録画を再生し直す場合も新しい空のsessionを作ります。
++
++統合診断版ではlifecycle対応mpeg2toh264をpinし、同packageがexportする`isLifecycleError()`を通過したErrorだけから、`lifecycleEventId`、`frozenAt`、同じruntime-frozen trace objectを採用します。guardを通過しないErrorでは相関不能を`event unavailable`と明示し、別のevent IDは作りません。公開可能なclient contextは`recordDiagnosticLifecycle()`経由で同じring bufferへ渡します。配備検証はguard、clock、recorder、event ID上限、trace容量をexportするlifecycle対応pinを必須とします。
++
+ # <img width="350" src="https://user-images.githubusercontent.com/39271166/134050201-8110f076-a939-4b62-8c86-7beaa3d4728c.png" alt="KonomiTV Logo">　<!-- omit in toc -->
+ 
+ <img width="100%" src="https://github.com/user-attachments/assets/6971f354-0418-4305-bf6d-b061142ffec6">
+diff --git a/client/package.json b/client/package.json
+index 9b12dd7419c07c73dde45e3715037bfa9277d6ea..9edb8d4e4abcd3bbe943b4641860f5010c2a7493 100644
+--- a/client/package.json
++++ b/client/package.json
+@@ -10,7 +10,9 @@
+         "build": "vue-tsc --noEmit && vite build",
+         "preview": "concurrently --raw \"npm:akebi\" \"vite preview\"",
+         "lint": "eslint . --fix --ignore-path .gitignore",
+-        "typecheck": "vue-tsc --noEmit"
++        "test:diagnostic-session": "node --test scripts/test-diagnostic-session.mjs",
++        "typecheck": "vue-tsc --noEmit",
++        "validate:public-build": "node scripts/validate-public-build.mjs"
+     },
+     "engines": {
+         "node": "^20.16.0"
+@@ -25,12 +27,12 @@
+         "comlink": "^4.4.1",
+         "copy-image-clipboard": "^2.1.2",
+         "dayjs": "^1.11.13",
+-        "dplayer": "github:tsukumijima/DPlayer#v1.33.1",
++        "dplayer": "github:libratechw/DPlayer#f9ac9d9f07ea6dbfd678992953ca7ee35b9c2f68",
+         "floating-vue": "^5.2.2",
+         "hls.js": "^1.6.9",
+         "idb": "^8.0.3",
+         "mitt": "^3.0.1",
+-        "mpeg2toh264": "github:tsukumijima/mpeg2toh264#52a3db5e8fb9833e6cade2167097849c668bdb1f",
++        "mpeg2toh264": "github:libratechw/mpeg2toh264#68c1c21734d193b646070d9ff003786757550080",
+         "mpegts.js": "github:tsukumijima/mpegts.js#c69a71c809b6e0a53f7101455333f8b3d98460d0",
+         "nanoid": "^5.1.16",
+         "ohash": "^1.1.3",
+diff --git a/client/scripts/test-diagnostic-session.mjs b/client/scripts/test-diagnostic-session.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..75c61715f5b1c94e25040481f06e627dae3fc9b5
+--- /dev/null
++++ b/client/scripts/test-diagnostic-session.mjs
+@@ -0,0 +1,232 @@
++#!/usr/bin/env node
++
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import { dirname, resolve } from 'node:path';
++import test from 'node:test';
++import { fileURLToPath } from 'node:url';
++
++import ts from 'typescript';
++
++
++const script_directory = dirname(fileURLToPath(import.meta.url));
++const source_path = resolve(script_directory, '../src/utils/DiagnosticSession.ts');
++const source = readFileSync(source_path, 'utf8');
++const player_controller_source = readFileSync(resolve(script_directory, '../src/services/player/PlayerController.ts'), 'utf8');
++const watch_component_source = readFileSync(resolve(script_directory, '../src/components/Watch/Watch.vue'), 'utf8');
++const compiled = ts.transpileModule(source, {
++    compilerOptions: {
++        module: ts.ModuleKind.ESNext,
++        target: ts.ScriptTarget.ES2022,
++    },
++    fileName: source_path,
++    reportDiagnostics: true,
++});
++if ((compiled.diagnostics ?? []).length > 0) {
++    throw new Error(ts.formatDiagnostics(compiled.diagnostics, {
++        getCanonicalFileName: (path) => path,
++        getCurrentDirectory: () => script_directory,
++        getNewLine: () => '\n',
++    }));
++}
++const diagnostic_session = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`);
++
++
++const header = (overrides = {}) => ({
++    mode: 'DIAG',
++    buildId: '123abcd',
++    buildRevision: '123abcdef0123456789012345678901234567890',
++    mpeg2toh264Revision: '456abcdef0123456789012345678901234567890',
++    playbackMode: 'Video',
++    mediaTitle: 'Recorded programme',
++    mediaIdentifier: 'recorded:42',
++    startedAt: 1_788_624_000_000,
++    initialQuality: 'Original (MPEG-2)',
++    deviceFamily: 'iPad',
++    os: 'iPadOS 18.6',
++    browser: 'Safari 18.6',
++    viewportWidth: 1180,
++    viewportHeight: 820,
++    devicePixelRatio: 2,
++    ...overrides,
++});
++
++
++const lifecycle_trace = Object.freeze({
++    eventId: 'm2h-a-b-c-d',
++    frozenAt: 1_788_624_001_000,
++    firstCritical: null,
++    entries: Object.freeze([]),
++});
++
++
++test('normal build does not create diagnostic session state', () => {
++    assert.equal(diagnostic_session.createPublicPlaybackDiagnosticSessionState(false, header()), null);
++});
++
++
++test('session snapshots its header and begins with no errors', () => {
++    const input_header = header();
++    const session = diagnostic_session.createPublicPlaybackDiagnosticSessionState(true, input_header);
++    input_header.mediaTitle = 'Changed after creation';
++
++    assert.equal(session.header.mediaTitle, 'Recorded programme');
++    assert.equal(session.errorCount, 0);
++    assert.deepEqual(session.errors, []);
++    assert.equal(Object.isFrozen(session), true);
++    assert.equal(Object.isFrozen(session.header), true);
++    assert.equal(Object.isFrozen(session.errors), true);
++});
++
++
++test('error append snapshots time, position, content, quality, ID, and frozen trace reference', () => {
++    const session = diagnostic_session.createPublicPlaybackDiagnosticSessionState(true, header());
++    const trace_summary = ['first quality-switch-start', 'close mediasource-sourceclose'];
++    const next = diagnostic_session.appendPublicPlaybackDiagnosticError(session, {
++        occurredAt: 1_788_624_001_000,
++        playbackPosition: 83.125,
++        quality: 'Original (MPEG-2)',
++        message: 'conversion failed',
++        eventId: lifecycle_trace.eventId,
++        lifecycleTrace: lifecycle_trace,
++        traceSummary: trace_summary,
++    });
++    trace_summary[0] = 'changed after append';
++
++    assert.equal(next.errorCount, 1);
++    assert.deepEqual(next.errors[0], {
++        sequence: 1,
++        occurredAt: 1_788_624_001_000,
++        playbackPosition: 83.125,
++        quality: 'Original (MPEG-2)',
++        message: 'conversion failed',
++        eventId: 'm2h-a-b-c-d',
++        lifecycleTrace: lifecycle_trace,
++        traceSummary: ['first quality-switch-start', 'close mediasource-sourceclose'],
++    });
++    assert.equal(next.errors[0].lifecycleTrace, lifecycle_trace);
++    assert.equal(Object.isFrozen(next.errors[0]), true);
++    assert.equal(Object.isFrozen(next.errors[0].traceSummary), true);
++});
++
++
++test('multiple errors remain in receipt order without mutating the previous snapshot', () => {
++    const empty = diagnostic_session.createPublicPlaybackDiagnosticSessionState(true, header());
++    const first = diagnostic_session.appendPublicPlaybackDiagnosticError(empty, {
++        occurredAt: 200,
++        playbackPosition: 10,
++        quality: 'Original (MPEG-2)',
++        message: 'first',
++        eventId: 'm2h-1-1-1-1',
++        lifecycleTrace: lifecycle_trace,
++        traceSummary: [],
++    });
++    const second = diagnostic_session.appendPublicPlaybackDiagnosticError(first, {
++        occurredAt: 300,
++        playbackPosition: 11,
++        quality: 'Original (MPEG-2)',
++        message: 'second',
++        eventId: 'm2h-2-2-2-2',
++        lifecycleTrace: lifecycle_trace,
++        traceSummary: [],
++    });
++
++    assert.deepEqual(first.errors.map((error) => error.message), ['first']);
++    assert.deepEqual(second.errors.map((error) => error.message), ['first', 'second']);
++    assert.deepEqual(second.errors.map((error) => error.sequence), [1, 2]);
++    assert.equal(second.errorCount, 2);
++    assert.equal(second.header, empty.header);
++});
++
++
++test('unavailable playback position and lifecycle remain explicit', () => {
++    const session = diagnostic_session.createPublicPlaybackDiagnosticSessionState(true, header());
++    const next = diagnostic_session.appendPublicPlaybackDiagnosticError(session, {
++        occurredAt: 400,
++        playbackPosition: Number.NaN,
++        quality: '720p',
++        message: 'plain error',
++        eventId: null,
++        lifecycleTrace: null,
++        traceSummary: [],
++    });
++
++    assert.equal(next.errors[0].playbackPosition, null);
++    assert.equal(next.errors[0].eventId, null);
++    assert.equal(next.errors[0].lifecycleTrace, null);
++});
++
++
++test('same-target check preserves only an exact playback mode and media identity match', () => {
++    const session = diagnostic_session.createPublicPlaybackDiagnosticSessionState(true, header());
++
++    assert.equal(diagnostic_session.isSamePublicPlaybackDiagnosticTarget(session, 'Video', 'recorded:42'), true);
++    assert.equal(diagnostic_session.isSamePublicPlaybackDiagnosticTarget(session, 'Video', 'recorded:43'), false);
++    assert.equal(diagnostic_session.isSamePublicPlaybackDiagnosticTarget(session, 'Live', 'recorded:42'), false);
++});
++
++
++test('a new playback session starts empty after the previous target accumulated errors', () => {
++    const old_session = diagnostic_session.createPublicPlaybackDiagnosticSessionState(true, header());
++    const old_with_error = diagnostic_session.appendPublicPlaybackDiagnosticError(old_session, {
++        occurredAt: 500,
++        playbackPosition: 20,
++        quality: 'Original (MPEG-2)',
++        message: 'old target error',
++        eventId: null,
++        lifecycleTrace: null,
++        traceSummary: [],
++    });
++    const new_session = diagnostic_session.createPublicPlaybackDiagnosticSessionState(true, header({
++        playbackMode: 'Live',
++        mediaTitle: 'Live channel',
++        mediaIdentifier: 'channel:gr011',
++    }));
++
++    assert.equal(old_with_error.errorCount, 1);
++    assert.equal(new_session.header.mediaTitle, 'Live channel');
++    assert.equal(new_session.header.mediaIdentifier, 'channel:gr011');
++    assert.equal(new_session.errorCount, 0);
++    assert.deepEqual(new_session.errors, []);
++});
++
++
++test('natural recorded playback end clears before replay creates a same-target session', () => {
++    const playback_handler_start = player_controller_source.indexOf('private setupVideoPlaybackHandler(): void');
++    const playback_handler_end = player_controller_source.indexOf('\n    /**', playback_handler_start + 1);
++    const playback_handler = player_controller_source.slice(playback_handler_start, playback_handler_end);
++
++    assert.notEqual(playback_handler_start, -1);
++    assert.notEqual(playback_handler_end, -1);
++    assert.match(playback_handler, /this\.player\.on\('play', \(\) => \{[\s\S]*?this\.ensurePublicPlaybackDiagnosticSession\(\);[\s\S]*?on_play_or_pause\(\);[\s\S]*?\}\);/);
++    assert.match(playback_handler, /if \(this\.playback_mode === 'Video'\) \{[\s\S]*?this\.player\.on\('ended', \(\) => \{[\s\S]*?clearPublicPlaybackDiagnosticSession\(\);[\s\S]*?\}\);[\s\S]*?\}/);
++
++    const previous = diagnostic_session.createPublicPlaybackDiagnosticSessionState(true, header());
++    const with_error = diagnostic_session.appendPublicPlaybackDiagnosticError(previous, {
++        occurredAt: 600,
++        playbackPosition: 120,
++        quality: 'Original (MPEG-2)',
++        message: 'previous playback error',
++        eventId: null,
++        lifecycleTrace: null,
++        traceSummary: [],
++    });
++    const after_ended = null;
++    const replay = after_ended ?? diagnostic_session.createPublicPlaybackDiagnosticSessionState(true, header());
++
++    assert.equal(with_error.errorCount, 1);
++    assert.equal(replay.header.mediaIdentifier, with_error.header.mediaIdentifier);
++    assert.equal(replay.errorCount, 0);
++    assert.deepEqual(replay.errors, []);
++});
++
++
++test('leaving the watch screen clears diagnostics before resetting shared player state', () => {
++    const before_unmount_start = watch_component_source.indexOf('beforeUnmount() {');
++    const before_unmount_end = watch_component_source.indexOf('\n    }', before_unmount_start);
++    const before_unmount = watch_component_source.slice(before_unmount_start, before_unmount_end);
++
++    assert.notEqual(before_unmount_start, -1);
++    assert.notEqual(before_unmount_end, -1);
++    assert.ok(before_unmount.indexOf('clearPublicPlaybackDiagnosticSession();') < before_unmount.indexOf('this.playerStore.stopWatching();'));
++});
+diff --git a/client/scripts/validate-public-build.mjs b/client/scripts/validate-public-build.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fc01b821dbba2c9d4f959ca73919d33449447a3
+--- /dev/null
++++ b/client/scripts/validate-public-build.mjs
+@@ -0,0 +1,334 @@
++#!/usr/bin/env node
++
++import { execFileSync } from 'node:child_process';
++import { createHash } from 'node:crypto';
++import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
++import { dirname, relative, resolve, sep } from 'node:path';
++import { fileURLToPath, pathToFileURL } from 'node:url';
++
++
++const COMMIT_PATTERN = /^[0-9a-f]{40}$/;
++const MAX_GIT_BLOB_BYTES = 16 * 1024 * 1024;
++const SAFE_DIST_PATH_PATTERN = /^(?:assets\/[A-Za-z0-9._-]+|build-provenance\.json|index\.html)$/;
++
++
++const fail = (message) => {
++    throw new Error(message);
++};
++
++
++const parseArguments = () => {
++    const values = {};
++    for (let index = 2; index < process.argv.length; index += 2) {
++        const key = process.argv[index];
++        const value = process.argv[index + 1];
++        if (key?.startsWith('--') !== true || value === undefined) {
++            fail('Arguments must be --name value pairs.');
++        }
++        if (values[key] !== undefined) fail(`Duplicate argument: ${key}`);
++        values[key] = value;
++    }
++    for (const required of ['--dplayer-repo', '--mpeg2toh264-repo', '--served-base-url', '--output']) {
++        if (values[required] === undefined) fail(`Missing required argument: ${required}`);
++    }
++    return values;
++};
++
++
++const sha256 = (content) => createHash('sha256').update(content).digest('hex');
++
++
++const readJson = (path) => JSON.parse(readFileSync(path, 'utf8'));
++
++
++const gitOutput = (repo, ...arguments_) => execFileSync('git', ['-C', repo, ...arguments_], {
++    encoding: 'utf8',
++}).trim();
++
++
++const requireCleanCommit = (repo, commit, name) => {
++    if (COMMIT_PATTERN.test(commit) === false) fail(`${name} has an invalid commit.`);
++    if (gitOutput(repo, 'rev-parse', '--verify', 'HEAD^{commit}') !== commit) {
++        fail(`${name} checkout does not match its declared dist commit.`);
++    }
++    if (gitOutput(repo, 'status', '--porcelain=v1', '--untracked-files=normal') !== '') {
++        fail(`${name} checkout is not clean.`);
++    }
++    const parents = gitOutput(repo, 'show', '-s', '--format=%P', commit).split(/\s+/);
++    if (parents.length !== 1 || COMMIT_PATTERN.test(parents[0]) === false) {
++        fail(`${name} dist commit must have exactly one source parent.`);
++    }
++    return parents[0];
++};
++
++
++const requireExactKeys = (value, keys, name) => {
++    if (typeof value !== 'object' || value === null || Array.isArray(value)) fail(`${name} must be an object.`);
++    const actual = Object.keys(value).sort();
++    const expected = [...keys].sort();
++    if (JSON.stringify(actual) !== JSON.stringify(expected)) fail(`${name} has unexpected fields.`);
++};
++
++
++const requireSafeDistPath = (path) => {
++    if (SAFE_DIST_PATH_PATTERN.test(path) === false) fail(`Unsafe dist path: ${path}`);
++    return path;
++};
++
++
++const fileRecord = (root, path) => {
++    requireSafeDistPath(path);
++    const absolute_path = resolve(root, path);
++    const root_prefix = `${resolve(root)}${sep}`;
++    if (absolute_path.startsWith(root_prefix) === false || statSync(absolute_path).isFile() === false) {
++        fail(`Missing dist file: ${path}`);
++    }
++    const content = readFileSync(absolute_path);
++    return Object.freeze({path, bytes: content.length, sha256: sha256(content), content});
++};
++
++
++const publicFileRecord = (record) => Object.freeze({
++    path: record.path,
++    bytes: record.bytes,
++    sha256: record.sha256,
++});
++
++
++const findUnique = (content, pattern, name) => {
++    const matches = [...new Set([...content.matchAll(pattern)].map((match) => match[1]))];
++    if (matches.length !== 1) fail(`Expected exactly one ${name}; found ${matches.length}.`);
++    return matches[0];
++};
++
++
++const extractPinnedCommit = (dependency, name) => {
++    if (typeof dependency !== 'string') fail(`${name} dependency is unavailable.`);
++    const match = dependency.match(/#([0-9a-f]{40})$/);
++    if (match === null) fail(`${name} dependency is not pinned to a full commit.`);
++    return match[1];
++};
++
++
++const requireInstalledGitBlob = (repo, commit, git_path, installed_path, name) => {
++    const expected = execFileSync('git', ['-C', repo, 'show', `${commit}:${git_path}`], {
++        maxBuffer: MAX_GIT_BLOB_BYTES,
++    });
++    const installed = readFileSync(installed_path);
++    if (installed.equals(expected) === false) fail(`${name} does not match its declared Git blob.`);
++    return Object.freeze({path: git_path, bytes: installed.length, sha256: sha256(installed)});
++};
++
++
++const distTreeRecord = (root) => {
++    const entries = [];
++    const visit = (directory) => {
++        for (const entry of readdirSync(directory, {withFileTypes: true}).sort((left, right) => {
++            if (left.name < right.name) return -1;
++            if (left.name > right.name) return 1;
++            return 0;
++        })) {
++            const absolute_path = resolve(directory, entry.name);
++            if (entry.isDirectory()) {
++                visit(absolute_path);
++            } else if (entry.isFile()) {
++                const path = relative(root, absolute_path).split(sep).join('/');
++                const content = readFileSync(absolute_path);
++                entries.push({path, bytes: content.length, sha256: sha256(content)});
++            } else {
++                fail(`Dist contains a non-file entry: ${entry.name}`);
++            }
++        }
++    };
++    visit(root);
++    const digest_input = entries.map((entry) => `${entry.sha256}  ${entry.path}\n`).join('');
++    return Object.freeze({fileCount: entries.length, bytes: entries.reduce((sum, entry) => sum + entry.bytes, 0), sha256: sha256(digest_input)});
++};
++
++
++const fetchServedRecord = async (base_url, local_record, build_id) => {
++    const url = new URL(`/${local_record.path}`, base_url);
++    url.searchParams.set('provenance-check', build_id);
++    const expected_origin = new URL(base_url).origin;
++    const response = await fetch(url, {cache: 'no-store', redirect: 'follow'});
++    if (response.ok === false) fail(`Served ${local_record.path} returned HTTP ${response.status}.`);
++    if (new URL(response.url).origin !== expected_origin) fail(`Served ${local_record.path} redirected to another origin.`);
++    const content = Buffer.from(await response.arrayBuffer());
++    const served_hash = sha256(content);
++    if (content.length !== local_record.bytes || served_hash !== local_record.sha256) {
++        fail(`Served ${local_record.path} does not match the local dist file.`);
++    }
++    return Object.freeze({path: local_record.path, bytes: content.length, sha256: served_hash});
++};
++
++
++const arguments_ = parseArguments();
++const script_path = fileURLToPath(import.meta.url);
++const client_root = resolve(dirname(script_path), '..');
++const repository_root = resolve(client_root, '..');
++const dist_root = resolve(arguments_['--dist'] ?? resolve(client_root, 'dist'));
++const dplayer_repo = resolve(arguments_['--dplayer-repo']);
++const mpeg2toh264_repo = resolve(arguments_['--mpeg2toh264-repo']);
++
++const provenance_record = fileRecord(dist_root, 'build-provenance.json');
++const provenance = JSON.parse(provenance_record.content.toString('utf8'));
++requireExactKeys(provenance, ['schemaVersion', 'mode', 'buildId', 'components'], 'build provenance');
++requireExactKeys(provenance.components, ['konomiTV', 'dplayer', 'mpeg2toh264', 'starlette'], 'build provenance components');
++if (provenance.schemaVersion !== 1 || !['DOGFOOD', 'DIAG'].includes(provenance.mode)) fail('Unsupported build provenance.');
++for (const [name, commit] of Object.entries(provenance.components)) {
++    if (COMMIT_PATTERN.test(commit) === false) fail(`Invalid ${name} provenance commit.`);
++}
++if (provenance.buildId !== provenance.components.konomiTV.slice(0, 7)) fail('buildId does not match the KonomiTV commit.');
++
++if (gitOutput(repository_root, 'rev-parse', '--verify', 'HEAD^{commit}') !== provenance.components.konomiTV) {
++    fail('KonomiTV checkout does not match build provenance.');
++}
++if (gitOutput(repository_root, 'status', '--porcelain=v1', '--untracked-files=normal') !== '') fail('KonomiTV checkout is not clean.');
++
++const package_json_path = resolve(client_root, 'package.json');
++const yarn_lock_path = resolve(client_root, 'yarn.lock');
++const pyproject_path = resolve(repository_root, 'server/pyproject.toml');
++const package_json = readJson(package_json_path);
++if (extractPinnedCommit(package_json.dependencies?.dplayer, 'dplayer') !== provenance.components.dplayer) fail('DPlayer package pin mismatch.');
++if (extractPinnedCommit(package_json.dependencies?.mpeg2toh264, 'mpeg2toh264') !== provenance.components.mpeg2toh264) fail('mpeg2toh264 package pin mismatch.');
++const yarn_lock = readFileSync(yarn_lock_path, 'utf8');
++for (const commit of [provenance.components.dplayer, provenance.components.mpeg2toh264]) {
++    if (yarn_lock.includes(`#${commit}`) === false || yarn_lock.includes(`/tar.gz/${commit}`) === false) fail(`yarn.lock is missing ${commit}.`);
++}
++const pyproject = readFileSync(pyproject_path, 'utf8');
++const starlette_match = pyproject.match(/^starlette\s*=\s*\{[^\r\n]*\brev\s*=\s*"([0-9a-f]{40})"/im);
++if (starlette_match?.[1] !== provenance.components.starlette) fail('Starlette pin mismatch.');
++
++const dplayer_source_commit = requireCleanCommit(dplayer_repo, provenance.components.dplayer, 'DPlayer');
++const mpeg2toh264_source_commit = requireCleanCommit(mpeg2toh264_repo, provenance.components.mpeg2toh264, 'mpeg2toh264');
++const installed_dplayer = requireInstalledGitBlob(
++    dplayer_repo,
++    provenance.components.dplayer,
++    'dist/DPlayer.min.js',
++    resolve(client_root, 'node_modules/dplayer/dist/DPlayer.min.js'),
++    'Installed DPlayer',
++);
++const installed_mpeg_player = requireInstalledGitBlob(
++    mpeg2toh264_repo,
++    provenance.components.mpeg2toh264,
++    'packages/player/dist/index.js',
++    resolve(client_root, 'node_modules/mpeg2toh264/packages/player/dist/index.js'),
++    'Installed mpeg2toh264 player',
++);
++const installed_mpeg_yadif = requireInstalledGitBlob(
++    mpeg2toh264_repo,
++    provenance.components.mpeg2toh264,
++    'packages/yadif/dist/index.js',
++    resolve(client_root, 'node_modules/mpeg2toh264/packages/yadif/dist/index.js'),
++    'Installed mpeg2toh264 YADIF',
++);
++
++const installed_dplayer_text = readFileSync(resolve(client_root, 'node_modules/dplayer/dist/DPlayer.min.js'), 'utf8');
++const installed_dplayer_version = readJson(resolve(client_root, 'node_modules/dplayer/package.json')).version;
++if (typeof installed_dplayer_version !== 'string') fail('Installed DPlayer package version is unavailable.');
++const expected_dplayer_banner = `DPlayer v${installed_dplayer_version} ${dplayer_source_commit.slice(0, 7)}`;
++if (installed_dplayer_text.includes(expected_dplayer_banner) === false) fail('Installed DPlayer build banner does not identify its source commit.');
++
++const installed_mpeg_module_path = resolve(client_root, 'node_modules/mpeg2toh264/packages/player/dist/index.js');
++const installed_mpeg_module = await import(pathToFileURL(installed_mpeg_module_path).href);
++if (typeof installed_mpeg_module.isLifecycleError !== 'function' ||
++    typeof installed_mpeg_module.lifecycleNow !== 'function' ||
++    typeof installed_mpeg_module.Mpeg2TsPlayer?.prototype.recordDiagnosticLifecycle !== 'function' ||
++    Number.isSafeInteger(installed_mpeg_module.LIFECYCLE_EVENT_ID_MAX_LENGTH) === false ||
++    installed_mpeg_module.LIFECYCLE_EVENT_ID_MAX_LENGTH <= 0 ||
++    Number.isSafeInteger(installed_mpeg_module.LIFECYCLE_TRACE_CAPACITY) === false ||
++    installed_mpeg_module.LIFECYCLE_TRACE_CAPACITY <= 0) {
++    fail('Installed mpeg2toh264 does not expose the required lifecycle diagnostic API.');
++}
++const lifecycle_contract = Object.freeze({
++    errorGuard: 'isLifecycleError',
++    clock: 'lifecycleNow',
++    recorder: 'Mpeg2TsPlayer.recordDiagnosticLifecycle',
++    eventIdMaxLength: installed_mpeg_module.LIFECYCLE_EVENT_ID_MAX_LENGTH,
++    traceCapacity: installed_mpeg_module.LIFECYCLE_TRACE_CAPACITY,
++});
++
++const index_record = fileRecord(dist_root, 'index.html');
++const index_html = index_record.content.toString('utf8');
++const entry_path = requireSafeDistPath(findUnique(index_html, /<script\b[^>]*\bsrc="\/?(assets\/index-[A-Za-z0-9_-]+\.js)"[^>]*><\/script>/g, 'entry asset'));
++const entry_record = fileRecord(dist_root, entry_path);
++const player_controller_path = requireSafeDistPath(findUnique(
++    entry_record.content.toString('utf8'),
++    /["'`]\/?(assets\/PlayerController-[A-Za-z0-9_-]+\.js)["'`]/g,
++    'PlayerController asset reference',
++));
++const player_controller_record = fileRecord(dist_root, player_controller_path);
++const mpeg_worker_name = findUnique(
++    player_controller_record.content.toString('utf8'),
++    /["'`](?:\/?assets\/)?(worker-[A-Za-z0-9._-]+\.js)["'`]/g,
++    'mpeg2toh264 Worker asset reference',
++);
++const mpeg_worker_record = fileRecord(dist_root, `assets/${mpeg_worker_name}`);
++
++const installed_mpeg_text = readFileSync(installed_mpeg_module_path, 'utf8');
++const dependency_worker_path = findUnique(installed_mpeg_text, /["'`](assets\/worker-[A-Za-z0-9._-]+\.js)["'`]/g, 'installed mpeg2toh264 Worker reference');
++const dependency_worker = requireInstalledGitBlob(
++    mpeg2toh264_repo,
++    provenance.components.mpeg2toh264,
++    `packages/player/dist/${dependency_worker_path}`,
++    resolve(client_root, `node_modules/mpeg2toh264/packages/player/dist/${dependency_worker_path}`),
++    'Installed mpeg2toh264 Worker',
++);
++if (dependency_worker.sha256 !== mpeg_worker_record.sha256 || dependency_worker.bytes !== mpeg_worker_record.bytes) {
++    fail('Generated mpeg2toh264 Worker does not match the pinned dependency Worker.');
++}
++
++const local_records = [provenance_record, index_record, entry_record, player_controller_record, mpeg_worker_record];
++const served_records = [];
++for (const record of local_records) {
++    served_records.push(await fetchServedRecord(arguments_['--served-base-url'], record, provenance.buildId));
++}
++
++const tool_version = (path) => readJson(resolve(client_root, path)).version;
++const manifest = Object.freeze({
++    schemaVersion: 1,
++    status: 'verified',
++    provenance,
++    sourceBinding: Object.freeze({
++        konomiTV: Object.freeze({sourceCommit: provenance.components.konomiTV}),
++        dplayer: Object.freeze({
++            sourceCommit: dplayer_source_commit,
++            distCommit: provenance.components.dplayer,
++            bundleBanner: expected_dplayer_banner,
++            runtime: installed_dplayer,
++        }),
++        mpeg2toh264: Object.freeze({
++            sourceCommit: mpeg2toh264_source_commit,
++            distCommit: provenance.components.mpeg2toh264,
++            lifecycleContract: lifecycle_contract,
++            playerRuntime: installed_mpeg_player,
++            yadifRuntime: installed_mpeg_yadif,
++            workerRuntime: dependency_worker,
++        }),
++        starlette: Object.freeze({sourceCommit: provenance.components.starlette}),
++    }),
++    buildEnvironment: Object.freeze({
++        node: process.version,
++        platform: process.platform,
++        architecture: process.arch,
++        yarn: execFileSync('corepack', ['yarn', '--version'], {encoding: 'utf8'}).trim(),
++        vite: tool_version('node_modules/vite/package.json'),
++        typescript: tool_version('node_modules/typescript/package.json'),
++        vueTsc: tool_version('node_modules/vue-tsc/package.json'),
++        inputs: Object.freeze({
++            packageJsonSha256: sha256(readFileSync(package_json_path)),
++            yarnLockSha256: sha256(readFileSync(yarn_lock_path)),
++            pyprojectTomlSha256: sha256(readFileSync(pyproject_path)),
++        }),
++    }),
++    dist: Object.freeze({
++        treeHashFormat: 'sha256sum-lines-v1',
++        tree: distTreeRecord(dist_root),
++        localAssets: Object.freeze(local_records.map(publicFileRecord)),
++        servedAssets: Object.freeze(served_records),
++    }),
++});
++
++const output_path = resolve(arguments_['--output']);
++writeFileSync(output_path, `${JSON.stringify(manifest, null, 2)}\n`, {flag: 'wx'});
++console.log(JSON.stringify({status: manifest.status, buildId: provenance.buildId, distTreeSha256: manifest.dist.tree.sha256}));
+diff --git a/client/src/components/Watch/Header.vue b/client/src/components/Watch/Header.vue
+index 19380cebe4369aec4bc31bf473dff7038e7357ff..ebe89ce444db0906fd9f3dc98d675342cede66e7 100644
+--- a/client/src/components/Watch/Header.vue
++++ b/client/src/components/Watch/Header.vue
+@@ -1,18 +1,23 @@
+ <template>
+-    <header class="watch-header" :class="{'watch-header--video': playback_mode === 'Video'}">
+-        <router-link class="watch-header__back-icon" v-ripple :to="playback_mode === 'Live' ? '/tv/' : '/videos/'">
++    <header class="watch-header" :class="{
++            'watch-header--video': playback_mode === 'Video',
++            'watch-header--public-provenance': public_build_label !== null,
++            'watch-header--controls-hidden': public_build_label !== null && playerStore.is_control_display === false,
++        }">
++        <router-link class="watch-header__back-icon watch-header__ordinary" v-ripple :to="playback_mode === 'Live' ? '/tv/' : '/videos/'">
+             <Icon icon="fluent:chevron-left-12-filled" width="21px" />
+         </router-link>
+-        <img class="watch-header__broadcaster" v-if="playback_mode === 'Live'"
++        <img class="watch-header__broadcaster watch-header__ordinary" v-if="playback_mode === 'Live'"
+             :src="`${Utils.api_base_url}/channels/${channelsStore.channel.current.id}/logo`">
+-        <span class="watch-header__program-title" v-html="ProgramUtils.decorateProgramInfo(
++        <span class="watch-header__program-title watch-header__ordinary" v-html="ProgramUtils.decorateProgramInfo(
+             playback_mode === 'Live' ? channelsStore.channel.current.program_present : playerStore.recorded_program, 'title'
+         )"></span>
+-        <span class="watch-header__program-time">
++        <span class="watch-header__program-time watch-header__ordinary">
+             {{ProgramUtils.getProgramTime(playback_mode === 'Live' ? channelsStore.channel.current.program_present : playerStore.recorded_program, true)}}
+         </span>
+-        <v-spacer></v-spacer>
+-        <span class="watch-header__now">
++        <v-spacer class="watch-header__ordinary"></v-spacer>
++        <span v-if="public_build_label !== null" class="watch-header__public-provenance">{{public_build_label}}</span>
++        <span class="watch-header__now watch-header__ordinary">
+             <Icon v-if="is_showing_original_broadcast_time" class="watch-header__timeshift-icon" icon="fluent:history-16-regular" width="16px" />
+             {{time}}
+         </span>
+@@ -29,6 +34,7 @@ import useChannelsStore from '@/stores/ChannelsStore';
+ import usePlayerStore from '@/stores/PlayerStore';
+ import useSettingsStore from '@/stores/SettingsStore';
+ import Utils, { dayjs, ProgramUtils } from '@/utils';
++import { formatPublicBuildLabel } from '@/utils/DiagnosticProvenance';
+ 
+ export default defineComponent({
+     name: 'Watch-Header',
+@@ -58,6 +64,11 @@ export default defineComponent({
+     computed: {
+         ...mapStores(useChannelsStore, usePlayerStore, useSettingsStore),
+ 
++        // 診断・dogfood buildだけに表示する、現在画質を含む短い公開provenance
++        public_build_label(): string | null {
++            return formatPublicBuildLabel(this.playerStore.current_quality);
++        },
++
+         // 元の放送時刻を表示すべきかどうか
+         // 録画再生時かつ設定がオンの場合に true
+         is_showing_original_broadcast_time(): boolean {
+@@ -144,6 +155,21 @@ export default defineComponent({
+     visibility: hidden;
+     z-index: 5;
+ 
++    // provenanceが埋め込まれたbuildでは、操作UIを隠している間も短い識別表示だけを残す
++    &.watch-header--public-provenance {
++        opacity: 1 !important;
++        visibility: visible !important;
++    }
++    &.watch-header--controls-hidden {
++        pointer-events: none;
++        background: none;
++
++        .watch-header__ordinary {
++            opacity: 0;
++            visibility: hidden;
++        }
++    }
++
+     @include tablet-vertical {
+         height: 66px;
+         padding-left: 16px;
+@@ -304,6 +330,20 @@ export default defineComponent({
+             opacity: 0.8;
+         }
+     }
++
++    .watch-header__public-provenance {
++        flex-shrink: 0;
++        padding: 3px 6px;
++        border: 1px solid #ffffff52;
++        border-radius: 4px;
++        background: #000000a8;
++        color: #fff;
++        font-size: 11px;
++        font-weight: 600;
++        line-height: 1.2;
++        letter-spacing: 0.03em;
++        white-space: nowrap;
++    }
+ }
+ 
+-</style>
+\ No newline at end of file
++</style>
+diff --git a/client/src/components/Watch/PlaybackDiagnosticErrors.vue b/client/src/components/Watch/PlaybackDiagnosticErrors.vue
+new file mode 100644
+index 0000000000000000000000000000000000000000..94e33dbceaefa47297702cd32c5e62c278da69dd
+--- /dev/null
++++ b/client/src/components/Watch/PlaybackDiagnosticErrors.vue
+@@ -0,0 +1,154 @@
++<template>
++    <section v-if="session !== null && session.errorCount > 0" ref="panel"
++        class="playback-diagnostic-errors" aria-live="polite" aria-label="Playback diagnostic errors">
++        <header class="playback-diagnostic-errors__header">
++            <strong>{{ session.header.mode }} {{ session.header.buildId }} · Errors {{ session.errorCount }}</strong>
++            <span>{{ session.header.mediaTitle }} · {{ session.header.mediaIdentifier }}</span>
++            <span>
++                build {{ shortRevision(session.header.buildRevision) }} ·
++                m2h {{ shortRevision(session.header.mpeg2toh264Revision) }} ·
++                {{ session.header.playbackMode }} · {{ session.header.initialQuality }}
++            </span>
++            <span>
++                {{ session.header.deviceFamily }} · {{ session.header.os }} · {{ session.header.browser }} ·
++                {{ session.header.viewportWidth }}x{{ session.header.viewportHeight }} CSS ·
++                DPR {{ session.header.devicePixelRatio }}
++            </span>
++            <span>session {{ formatTime(session.header.startedAt) }}</span>
++        </header>
++        <ol class="playback-diagnostic-errors__list">
++            <li v-for="error in session.errors" :key="error.sequence" class="playback-diagnostic-errors__item">
++                <strong>#{{ error.sequence }} · {{ formatTime(error.occurredAt) }} · {{ formatPosition(error.playbackPosition) }}</strong>
++                <span>{{ error.quality }} · event {{ error.eventId ?? 'unavailable' }}</span>
++                <span class="playback-diagnostic-errors__message">Error: {{ error.message }}</span>
++                <span v-for="(summary, summary_index) in error.traceSummary" :key="`${error.sequence}-${summary_index}`"
++                    class="playback-diagnostic-errors__trace">
++                    {{ summary }}
++                </span>
++            </li>
++        </ol>
++    </section>
++</template>
++<script setup lang="ts">
++
++import { nextTick, ref, watch } from 'vue';
++
++import { dayjs } from '@/utils';
++import { public_playback_diagnostic_session as session } from '@/utils/PlaybackDiagnostics';
++
++
++const panel = ref<HTMLElement | null>(null);
++
++
++// 新しいerrorを受信したら共通headerを残したまま最新項目まで移動し、異常を見落とさないようにする。
++watch(() => session.value?.errorCount ?? 0, async (error_count) => {
++    if (error_count === 0) return;
++    await nextTick();
++    panel.value?.scrollTo({top: panel.value.scrollHeight});
++});
++
++
++const shortRevision = (revision: string): string => revision.slice(0, 7);
++
++
++const formatTime = (timestamp: number): string => dayjs(timestamp).tz('Asia/Tokyo').format('YYYY-MM-DD HH:mm:ss.SSS [JST]');
++
++
++const formatPosition = (position: number | null): string => {
++    if (position === null) return 'position unavailable';
++
++    const milliseconds = Math.max(0, Math.round(position * 1000));
++    const hours = Math.floor(milliseconds / 3_600_000);
++    const minutes = Math.floor(milliseconds % 3_600_000 / 60_000);
++    const seconds = Math.floor(milliseconds % 60_000 / 1000);
++    const fraction = milliseconds % 1000;
++    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:` +
++        `${seconds.toString().padStart(2, '0')}.${fraction.toString().padStart(3, '0')}`;
++};
++
++</script>
++<style lang="scss" scoped>
++
++.playback-diagnostic-errors {
++    position: absolute;
++    top: 74px;
++    left: 18px;
++    width: min(720px, calc(100% - 104px));
++    max-height: min(42%, 320px);
++    overflow: auto;
++    color: #FFFFFF;
++    background: rgba(18, 13, 14, 0.9);
++    border: 1px solid rgba(255, 111, 106, 0.85);
++    border-radius: 6px;
++    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.45);
++    font-size: 11px;
++    line-height: 1.45;
++    overscroll-behavior: contain;
++    z-index: 9;
++
++    @include tablet-vertical {
++        top: 68px;
++        left: 12px;
++        width: calc(100% - 24px);
++        max-height: 44%;
++    }
++    @include smartphone-horizontal {
++        top: 68px;
++        left: 10px;
++        width: calc(100% - 20px);
++        max-height: 46%;
++        font-size: 10px;
++    }
++    @include smartphone-vertical {
++        top: 54px;
++        left: 8px;
++        width: calc(100% - 16px);
++        max-height: 44%;
++        font-size: 10px;
++    }
++
++    &__header {
++        display: flex;
++        position: sticky;
++        top: 0;
++        flex-direction: column;
++        gap: 1px;
++        padding: 7px 9px;
++        background: rgba(37, 25, 27, 0.98);
++        border-bottom: 1px solid rgba(255, 255, 255, 0.25);
++        overflow-wrap: anywhere;
++        z-index: 1;
++    }
++
++    &__list {
++        display: flex;
++        flex-direction: column;
++        padding: 0;
++        margin: 0;
++        list-style: none;
++    }
++
++    &__item {
++        display: flex;
++        flex-direction: column;
++        gap: 2px;
++        padding: 7px 9px;
++        border-bottom: 1px solid rgba(255, 255, 255, 0.18);
++        overflow-wrap: anywhere;
++
++        &:last-child {
++            border-bottom: 0;
++        }
++    }
++
++    &__message {
++        color: #FFB5B2;
++        white-space: pre-wrap;
++    }
++
++    &__trace {
++        color: #D9D9D9;
++    }
++}
++
++</style>
+diff --git a/client/src/components/Watch/Player.vue b/client/src/components/Watch/Player.vue
+index 4430b241157bdee99fee6a3d29646a6aefd3b650..157e5803bbeb894fffa0fb365edfe43e1445c2b7 100644
+--- a/client/src/components/Watch/Player.vue
++++ b/client/src/components/Watch/Player.vue
+@@ -18,6 +18,7 @@
+             :class="{'watch-player__buffering--display': playerStore.is_video_buffering}">
+         </v-progress-circular>
+         <div class="watch-player__dplayer"></div>
++        <component :is="PlaybackDiagnosticErrors" v-if="PlaybackDiagnosticErrors !== null" />
+         <div class="watch-player__dplayer-setting-cover"
+             :class="{'watch-player__dplayer-setting-cover--display': playerStore.is_player_setting_panel_open}"
+             @click="handleSettingCoverClick"></div>
+@@ -45,13 +46,17 @@
+ </template>
+ <script setup lang="ts">
+ 
+-import { PropType } from 'vue';
++import { defineAsyncComponent, PropType } from 'vue';
+ 
+ import useChannelsStore from '@/stores/ChannelsStore';
+ import usePlayerStore from '@/stores/PlayerStore';
+ import useSettingsStore from '@/stores/SettingsStore';
+ import Utils from '@/utils';
+ 
++// 通常buildではimport()自体を定数畳み込みで除去し、診断UIを生成bundleへ含めない。
++const PlaybackDiagnosticErrors = import.meta.env.KONOMITV_PUBLIC_BUILD_PROVENANCE === null ? null :
++    defineAsyncComponent(() => import('@/components/Watch/PlaybackDiagnosticErrors.vue'));
++
+ // Props の定義
+ defineProps({
+     playback_mode: {
+@@ -719,4 +724,4 @@ _::-webkit-full-page-media, _:future, :root .dplayer-subtitle-icon[aria-label='
+     }
+ }
+ 
+-</style>
+\ No newline at end of file
++</style>
+diff --git a/client/src/components/Watch/Watch.vue b/client/src/components/Watch/Watch.vue
+index e87d93c36fa1855bd7a74de751783f0fc9af014e..de6e068bffc13c2bf48d8af0a4829b801f5d9ea7 100644
+--- a/client/src/components/Watch/Watch.vue
++++ b/client/src/components/Watch/Watch.vue
+@@ -35,6 +35,7 @@ import WatchPlayer from '@/components/Watch/Player.vue';
+ import usePlayerStore from '@/stores/PlayerStore';
+ import useSettingsStore from '@/stores/SettingsStore';
+ import Utils from '@/utils';
++import { clearPublicPlaybackDiagnosticSession } from '@/utils/PlaybackDiagnostics';
+ 
+ // ライブ視聴・ビデオ視聴共通の視聴画面
+ export default defineComponent({
+@@ -94,6 +95,9 @@ export default defineComponent({
+     // 終了前に実行
+     beforeUnmount() {
+ 
++        // 公開診断sessionを視聴画面の外へ持ち越さない。
++        clearPublicPlaybackDiagnosticSession();
++
+         // PlayerStore に視聴画面を閉じたことを伝える
+         this.playerStore.stopWatching();
+ 
+@@ -466,4 +470,4 @@ export default defineComponent({
+     }
+ }
+ 
+-</style>
+\ No newline at end of file
++</style>
+diff --git a/client/src/services/player/PlayerController.ts b/client/src/services/player/PlayerController.ts
+index 68f54ef9e78050639b4d7e2e8e17c739942fbe46..bf0c355dc63a1a688cd75ca583e2df2517532850 100644
+--- a/client/src/services/player/PlayerController.ts
++++ b/client/src/services/player/PlayerController.ts
+@@ -3,7 +3,7 @@ import assert from 'assert';
+ 
+ import DPlayer, { DPlayerType } from 'dplayer';
+ import Hls from 'hls.js';
+-import { Mpeg2TsPlayer } from 'mpeg2toh264/player';
++import { Mpeg2TsPlayer, type Mpeg2TsPlayerEventMap } from 'mpeg2toh264/player';
+ import { Deinterlacer, probeDecoder, supportsDeinterlace, type DecoderProbe } from 'mpeg2toh264/yadif';
+ import mpegts from 'mpegts.js';
+ import { watch } from 'vue';
+@@ -24,6 +24,13 @@ import useChannelsStore from '@/stores/ChannelsStore';
+ import usePlayerStore from '@/stores/PlayerStore';
+ import useSettingsStore, { LiveStreamingQuality, LIVE_STREAMING_QUALITIES, VideoStreamingQuality, VIDEO_STREAMING_QUALITIES } from '@/stores/SettingsStore';
+ import Utils, { dayjs, PlayerUtils } from '@/utils';
++import { public_build_provenance } from '@/utils/DiagnosticProvenance';
++import {
++    appendMpeg2ToH264DiagnosticError,
++    clearPublicPlaybackDiagnosticSession,
++    ensurePublicPlaybackDiagnosticSession,
++    recordPublicPlaybackDiagnosticContext,
++} from '@/utils/PlaybackDiagnostics';
+ 
+ 
+ // デバイスのデコーダーが自動でのデインタレースに対応しているかを取得
+@@ -1284,6 +1291,59 @@ class PlayerController {
+     }
+ 
+ 
++    /**
++     * 現在の再生対象について、公開診断buildのsession headerを1回だけ固定する。
++     * 同じ対象のPlayerController再起動では既存errorを維持し、番組・チャンネル切替では空のsessionへ置き換える。
++     */
++    private ensurePublicPlaybackDiagnosticSession(): void {
++        if (public_build_provenance === null) return;
++
++        const channels_store = useChannelsStore();
++        const player_store = usePlayerStore();
++        const target = this.playback_mode === 'Live' ? {
++            playbackMode: this.playback_mode,
++            mediaTitle: channels_store.channel.current.name,
++            mediaIdentifier: `channel:${channels_store.channel.current.display_channel_id}`,
++        } as const : {
++            playbackMode: this.playback_mode,
++            mediaTitle: player_store.recorded_program.title,
++            mediaIdentifier: `recorded:${player_store.recorded_program.id}`,
++        } as const;
++
++        ensurePublicPlaybackDiagnosticSession(target, player_store.current_quality);
++    }
++
++
++    /**
++     * mpeg2toh264のエラーを公開診断sessionへ追加して停止する。
++     * 画質切り替えで破棄済みのpluginから遅れて届いたeventは無視する。
++     */
++    private handleMpeg2ToH264Error(
++        mpeg2toh264_player: Mpeg2TsPlayer,
++        event: Mpeg2TsPlayerEventMap['error'],
++    ): void {
++        if (this.destroyed === true || this.player?.plugins.mpeg2toh264 !== mpeg2toh264_player) return;
++
++        const player_store = usePlayerStore();
++        const quality_snapshot = this.player.quality?.name ?? player_store.current_quality;
++        player_store.current_quality = quality_snapshot;
++        if (public_build_provenance !== null) {
++            let playback_position = Number.NaN;
++            try {
++                playback_position = this.player.video.currentTime;
++            } catch {
++                // currentTimeを取得できなくても、診断表示が再生停止処理を妨げないようにする。
++            }
++            appendMpeg2ToH264DiagnosticError(
++                event.detail.error,
++                quality_snapshot,
++                playback_position,
++            );
++        }
++        this.player.pause();
++    }
++
++
+     /**
+      * DPlayer に動画再生系のイベントハンドラーを登録する
+      * 特にライブ視聴ではここで適切に再生状態の管理 (再生可能かどうか、エラーが発生していないかなど) を行う必要がある
+@@ -1339,9 +1399,22 @@ class PlayerController {
+             // プレイヤーのコントロール UI を表示する
+             this.setControlDisplayTimer();
+         };
+-        this.player.on('play', on_play_or_pause);
++        this.player.on('play', () => {
++            // 録画の自然終了後に同じ番組を再生し直す場合も、前回のerrorを引き継がず新しいsessionを作る。
++            this.ensurePublicPlaybackDiagnosticSession();
++            on_play_or_pause();
++        });
+         this.player.on('pause', on_play_or_pause);
+ 
++        // 録画の自然終了は公開診断上の再生session境界として扱う。
++        // 同じDPlayerで再生し直した場合は上記play handlerが空のsessionを作り直す。
++        if (this.playback_mode === 'Video') {
++            this.player.on('ended', () => {
++                if (public_build_provenance === null) return;
++                clearPublicPlaybackDiagnosticSession();
++            });
++        }
++
+         // 再生が一時的に止まってバッファリングしているとき/再び再生されはじめたときのイベント
+         // バッファリングの Progress Circular の表示を制御する
+         this.player.on('waiting', () => {
+@@ -1364,6 +1437,13 @@ class PlayerController {
+         const on_init_or_quality_change = async () => {
+             assert(this.player !== null);
+ 
++            // DPlayerはquality_start前に選択中画質を更新済みなので、この時点の値を画面と診断snapshotへ共有する
++            player_store.current_quality = this.player.quality?.name ?? null;
++            this.ensurePublicPlaybackDiagnosticSession();
++            if (this.player.plugins.mpeg2toh264) {
++                recordPublicPlaybackDiagnosticContext(this.player.plugins.mpeg2toh264, player_store.current_quality);
++            }
++
+             // ローディング中の背景写真をランダムに変更
+             player_store.background_url = PlayerUtils.generatePlayerBackgroundURL();
+ 
+@@ -1407,9 +1487,10 @@ class PlayerController {
+                     this.player.video.oncanplaythrough = on_canplay;
+ 
+                     // 変換処理が失敗した場合は DPlayer のエラー表示を残し、プレイヤーを停止状態にする
+-                    mpeg2toh264_player.addEventListener('error', () => {
++                    mpeg2toh264_player.addEventListener('error', (event) => {
++                        if (this.destroyed === true || this.player?.plugins.mpeg2toh264 !== mpeg2toh264_player) return;
+                         window.clearTimeout(startup_timeout_id);
+-                        this.player?.pause();
++                        this.handleMpeg2ToH264Error(mpeg2toh264_player, event);
+                     }, {once: true});
+                     this.player.play();
+ 
+@@ -1742,8 +1823,9 @@ class PlayerController {
+ 
+                 // mpeg2toh264 の再生中になんらかの再生エラーが発生した場合は、エラー状態を明示するために自動で HLS 画質へ切り替わらないようにする
+                 if (this.player.type === 'mpeg2toh264' && this.player.plugins.mpeg2toh264) {
+-                    this.player.plugins.mpeg2toh264.addEventListener('error', () => {
+-                        this.player?.pause();
++                    const mpeg2toh264_player = this.player.plugins.mpeg2toh264;
++                    mpeg2toh264_player.addEventListener('error', (event) => {
++                        this.handleMpeg2ToH264Error(mpeg2toh264_player, event);
+                     }, {once: true});
+                 }
+             }
+diff --git a/client/src/stores/PlayerStore.ts b/client/src/stores/PlayerStore.ts
+index a9031489f1e1ff9f8492de94e66ccd3eb2ef94d8..e34e81c566b2bf2a657868434e853155693f09d8 100644
+--- a/client/src/stores/PlayerStore.ts
++++ b/client/src/stores/PlayerStore.ts
+@@ -132,6 +132,10 @@ const usePlayerStore = defineStore('player', {
+         // null の間は回線種別から選び、チャンネル切り替えなどでプレイヤーを作り直すときは手動選択を引き継ぐ
+         selected_quality_profile_type: null as 'Wi-Fi' | 'Cellular' | null,
+ 
++        // 現在DPlayerが選択している画質名
++        // 診断・dogfood buildの画面表示とエラー受信時のsnapshotに使う
++        current_quality: null as string | null,
++
+         // ビデオ視聴: CacheStorage に保存した単一画質を再生しているか
+         is_offline_playback: false,
+ 
+@@ -242,6 +246,7 @@ const usePlayerStore = defineStore('player', {
+             this.is_zapping = false;
+             this.is_player_setting_panel_open = false;
+             this.selected_quality_profile_type = null;
++            this.current_quality = null;
+             this.is_offline_playback = false;
+             this.offline_video = null;
+             this.is_loading = true;
+diff --git a/client/src/utils/DiagnosticProvenance.ts b/client/src/utils/DiagnosticProvenance.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..569340075ae34afe0328a228e06c9297009b4921
+--- /dev/null
++++ b/client/src/utils/DiagnosticProvenance.ts
+@@ -0,0 +1,22 @@
++
++type PublicBuildProvenance = NonNullable<ImportMetaEnv['KONOMITV_PUBLIC_BUILD_PROVENANCE']>;
++
++
++const embedded_public_build_provenance = import.meta.env.KONOMITV_PUBLIC_BUILD_PROVENANCE;
++export const public_build_provenance: PublicBuildProvenance | null = embedded_public_build_provenance === null ? null : Object.freeze({
++    ...embedded_public_build_provenance,
++    components: Object.freeze({...embedded_public_build_provenance.components}),
++});
++
++
++export const normalizePublicPlaybackQuality = (quality: string | null): string => {
++    if (quality === null) return 'Quality unavailable';
++    const normalized = quality.replace(/\s+/g, ' ').trim().slice(0, 80);
++    return normalized === '' ? 'Quality unavailable' : normalized;
++};
++
++
++export const formatPublicBuildLabel = (quality: string | null): string | null => {
++    if (public_build_provenance === null) return null;
++    return `${public_build_provenance.mode} ${public_build_provenance.buildId} · ${normalizePublicPlaybackQuality(quality)}`;
++};
+diff --git a/client/src/utils/DiagnosticSession.ts b/client/src/utils/DiagnosticSession.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4fc0e32fdf0aaa1b8dd2d69b0527e3e53288f12f
+--- /dev/null
++++ b/client/src/utils/DiagnosticSession.ts
+@@ -0,0 +1,98 @@
++
++import type { LifecycleTraceSnapshot } from 'mpeg2toh264/player';
++
++
++export type PublicPlaybackDiagnosticHeader = Readonly<{
++    mode: 'DOGFOOD' | 'DIAG';
++    buildId: string;
++    buildRevision: string;
++    mpeg2toh264Revision: string;
++    playbackMode: 'Live' | 'Video';
++    mediaTitle: string;
++    mediaIdentifier: string;
++    startedAt: number;
++    initialQuality: string;
++    deviceFamily: string;
++    os: string;
++    browser: string;
++    viewportWidth: number;
++    viewportHeight: number;
++    devicePixelRatio: number;
++}>;
++
++export type PublicPlaybackDiagnosticError = Readonly<{
++    sequence: number;
++    occurredAt: number;
++    playbackPosition: number | null;
++    quality: string;
++    message: string;
++    eventId: string | null;
++    lifecycleTrace: LifecycleTraceSnapshot | null;
++    traceSummary: readonly string[];
++}>;
++
++export type PublicPlaybackDiagnosticSession = Readonly<{
++    header: PublicPlaybackDiagnosticHeader;
++    errorCount: number;
++    errors: readonly PublicPlaybackDiagnosticError[];
++}>;
++
++export type PublicPlaybackDiagnosticErrorInput = Omit<PublicPlaybackDiagnosticError, 'sequence' | 'playbackPosition' | 'traceSummary'> & Readonly<{
++    playbackPosition: number;
++    traceSummary: readonly string[];
++}>;
++
++
++/**
++ * 診断build用の再生セッションを作る。通常buildではstate自体を作らない。
++ */
++export const createPublicPlaybackDiagnosticSessionState = (
++    is_enabled: boolean,
++    header: PublicPlaybackDiagnosticHeader,
++): PublicPlaybackDiagnosticSession | null => {
++    if (is_enabled === false) return null;
++
++    return Object.freeze({
++        header: Object.freeze({...header}),
++        errorCount: 0,
++        errors: Object.freeze([]),
++    });
++};
++
++
++/**
++ * 現在のsessionが同じ再生対象のものかを判定する。
++ * PlayerControllerだけの再起動では同じsessionを維持し、番組・チャンネル切替では作り直すために使う。
++ */
++export const isSamePublicPlaybackDiagnosticTarget = (
++    session: PublicPlaybackDiagnosticSession,
++    playback_mode: 'Live' | 'Video',
++    media_identifier: string,
++): boolean => session.header.playbackMode === playback_mode && session.header.mediaIdentifier === media_identifier;
++
++
++/**
++ * mpeg2toh264 errorを受信順に追加し、既存snapshotを変更せず新しいsnapshotを返す。
++ */
++export const appendPublicPlaybackDiagnosticError = (
++    session: PublicPlaybackDiagnosticSession,
++    input: PublicPlaybackDiagnosticErrorInput,
++): PublicPlaybackDiagnosticSession => {
++    const playback_position = Number.isFinite(input.playbackPosition) ? input.playbackPosition : null;
++    const error = Object.freeze({
++        sequence: session.errorCount + 1,
++        occurredAt: input.occurredAt,
++        playbackPosition: playback_position,
++        quality: input.quality,
++        message: input.message,
++        eventId: input.eventId,
++        lifecycleTrace: input.lifecycleTrace,
++        traceSummary: Object.freeze([...input.traceSummary]),
++    });
++    const errors = Object.freeze([...session.errors, error]);
++    return Object.freeze({
++        header: session.header,
++        errorCount: errors.length,
++        errors,
++    });
++};
+diff --git a/client/src/utils/PlaybackDiagnostics.disabled.ts b/client/src/utils/PlaybackDiagnostics.disabled.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..279cc7d54b63f4774d81118a2914cacf7c8c6ece
+--- /dev/null
++++ b/client/src/utils/PlaybackDiagnostics.disabled.ts
+@@ -0,0 +1,25 @@
++
++import type { Mpeg2TsPlayer } from 'mpeg2toh264/player';
++
++
++type PlaybackTarget = Readonly<{
++    playbackMode: 'Live' | 'Video';
++    mediaTitle: string;
++    mediaIdentifier: string;
++}>;
++
++
++export const ensurePublicPlaybackDiagnosticSession = (_target: PlaybackTarget, _initial_quality: string | null): void => {};
++
++
++export const clearPublicPlaybackDiagnosticSession = (): void => {};
++
++
++export const recordPublicPlaybackDiagnosticContext = (_player: Mpeg2TsPlayer, _quality: string | null): boolean => false;
++
++
++export const appendMpeg2ToH264DiagnosticError = (
++    _error: Error,
++    _quality: string | null,
++    _playback_position: number,
++): void => {};
+diff --git a/client/src/utils/PlaybackDiagnostics.ts b/client/src/utils/PlaybackDiagnostics.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f17d1d2968267222bb01a81f17dd0952b9ee5d48
+--- /dev/null
++++ b/client/src/utils/PlaybackDiagnostics.ts
+@@ -0,0 +1,308 @@
++
++import {
++    isLifecycleError,
++    lifecycleNow,
++    type LifecycleTraceDetail,
++    type LifecycleTraceEntry,
++    type LifecycleTraceSnapshot,
++    type Mpeg2TsPlayer,
++} from 'mpeg2toh264/player';
++import { shallowRef } from 'vue';
++
++import { normalizePublicPlaybackQuality, public_build_provenance } from '@/utils/DiagnosticProvenance';
++import {
++    appendPublicPlaybackDiagnosticError,
++    createPublicPlaybackDiagnosticSessionState,
++    isSamePublicPlaybackDiagnosticTarget,
++    type PublicPlaybackDiagnosticHeader,
++    type PublicPlaybackDiagnosticSession,
++} from '@/utils/DiagnosticSession';
++
++type LifecycleTraceReference = Readonly<{
++    eventId: string;
++    frozenAt: number;
++    trace: LifecycleTraceSnapshot;
++}>;
++type ClientFacts = Readonly<{
++    deviceFamily: string;
++    os: string;
++    browser: string;
++    viewportWidth: number;
++    viewportHeight: number;
++    devicePixelRatio: number;
++}>;
++
++export type PublicPlaybackDiagnosticTarget = Readonly<{
++    playbackMode: 'Live' | 'Video';
++    mediaTitle: string;
++    mediaIdentifier: string;
++}>;
++
++
++export const public_playback_diagnostic_session = shallowRef<PublicPlaybackDiagnosticSession | null>(null);
++
++
++const normalizeVersion = (version: string | undefined): string | null => {
++    if (version === undefined) return null;
++    return version.replaceAll('_', '.');
++};
++
++
++/**
++ * footerに表示してよい端末情報だけを抽出する。
++ * User-Agent文字列そのものやApple端末のモデルは、返り値にも保持しない。
++ */
++const captureClientFacts = (): ClientFacts => {
++    const user_agent = navigator.userAgent;
++    let device_family = 'Unknown device';
++    let os = 'OS version unavailable';
++
++    const ios_version = normalizeVersion(user_agent.match(/\bOS ([0-9_]+)/)?.[1]);
++    if (/\biPhone\b|\biPod\b/.test(user_agent)) {
++        device_family = 'iPhone / iPod touch';
++        os = ios_version === null ? 'iOS version unavailable' : `iOS ${ios_version}`;
++    } else if (/\biPad\b/.test(user_agent) || (/\bMacintosh\b/.test(user_agent) && navigator.maxTouchPoints > 1)) {
++        device_family = 'iPad';
++        // desktop-class UAではmacOSの偽装versionをiPadOSのversionとして扱わない。
++        os = ios_version === null ? 'iPadOS version unavailable' : `iPadOS ${ios_version}`;
++    } else {
++        const android_version = normalizeVersion(user_agent.match(/\bAndroid ([0-9._]+)/)?.[1]);
++        const chrome_os_version = normalizeVersion(user_agent.match(/\bCrOS [^ ]+ ([0-9.]+)/)?.[1]);
++        const windows_version = normalizeVersion(user_agent.match(/\bWindows NT ([0-9.]+)/)?.[1]);
++        const macos_version = normalizeVersion(user_agent.match(/\bMac OS X ([0-9_]+)/)?.[1]);
++        if (android_version !== null) {
++            device_family = /\bMobile\b/.test(user_agent) ? 'Android phone' : 'Android tablet';
++            os = `Android ${android_version}`;
++        } else if (chrome_os_version !== null) {
++            device_family = 'ChromeOS device';
++            os = `ChromeOS ${chrome_os_version}`;
++        } else if (windows_version !== null) {
++            device_family = 'Windows PC';
++            os = `Windows NT ${windows_version}`;
++        } else if (macos_version !== null) {
++            device_family = 'Mac';
++            os = `macOS ${macos_version}`;
++        } else if (/\bLinux\b/.test(user_agent)) {
++            device_family = 'Linux device';
++            os = 'Linux version unavailable';
++        }
++    }
++
++    const browser_candidates: ReadonlyArray<readonly [RegExp, string]> = [
++        [/\bEdgiOS\/([0-9.]+)/, 'Edge iOS'],
++        [/\bEdgA?\/([0-9.]+)/, 'Edge'],
++        [/\bCriOS\/([0-9.]+)/, 'Chrome iOS'],
++        [/\bFxiOS\/([0-9.]+)/, 'Firefox iOS'],
++        [/\bSamsungBrowser\/([0-9.]+)/, 'Samsung Internet'],
++        [/\bOPR\/([0-9.]+)/, 'Opera'],
++        [/\bChrome\/([0-9.]+)/, 'Chrome'],
++        [/\bFirefox\/([0-9.]+)/, 'Firefox'],
++        [/\bVersion\/([0-9.]+).*\bSafari\//, 'Safari'],
++    ];
++    let browser = 'Browser version unavailable';
++    for (const [pattern, name] of browser_candidates) {
++        const version = normalizeVersion(user_agent.match(pattern)?.[1]);
++        if (version !== null) {
++            browser = `${name} ${version}`;
++            break;
++        }
++    }
++
++    const viewport_width = Math.max(0, Math.round(window.innerWidth));
++    const viewport_height = Math.max(0, Math.round(window.innerHeight));
++    const device_pixel_ratio = Number.isFinite(window.devicePixelRatio) ?
++        Number(window.devicePixelRatio.toFixed(2)) : 0;
++    return Object.freeze({
++        deviceFamily: device_family,
++        os,
++        browser,
++        viewportWidth: viewport_width,
++        viewportHeight: viewport_height,
++        devicePixelRatio: device_pixel_ratio,
++    });
++};
++
++
++const normalizeDisplayText = (value: string, fallback: string): string => {
++    const normalized = value.trim();
++    return normalized === '' ? fallback : normalized;
++};
++
++
++const readErrorMessage = (error: Error): string => {
++    try {
++        return normalizeDisplayText(error.message, 'Error message unavailable');
++    } catch {
++        return 'Error message unavailable';
++    }
++};
++
++
++const TRACE_DETAIL_FIELDS = [
++    ['qualitySwitchGeneration', 'qs'],
++    ['fromQualityIndex', 'from'],
++    ['toQualityIndex', 'to'],
++    ['currentVideo', 'current'],
++    ['reason', 'reason'],
++    ['attachment', 'attachment'],
++    ['hadAttachment', 'attached'],
++    ['stoppedGeneration', 'stopped-generation'],
++] as const;
++
++
++const compactTraceValue = (value: string | number | boolean | null): string => {
++    if (value === null) return 'null';
++    return String(value).replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 40);
++};
++
++
++/**
++ * Screenshotだけでも、原因候補のeventとsourcecloseが失敗したplayer世代に
++ * 属するかを判定できる最小限のtrace identityを表示する。
++ */
++const formatTraceEntry = (
++    label: 'first' | 'close',
++    entry: LifecycleTraceEntry,
++    failure_entry: LifecycleTraceEntry,
++    frozen_at: number,
++): string => {
++    const relation = [
++        `p:${entry.playerInstance === failure_entry.playerInstance ? 'same' : 'other'}`,
++        `g:${entry.generation === failure_entry.generation ? 'same' : 'other'}`,
++        `v:${entry.videoId === failure_entry.videoId ? 'same' : 'other'}`,
++    ].join(' ');
++    const details = TRACE_DETAIL_FIELDS.flatMap(([field, alias]) => {
++        const value = entry.detail[field];
++        return value === undefined ? [] : [`${alias}=${compactTraceValue(value)}`];
++    });
++    const age = Math.max(0, Math.round(frozen_at - entry.at));
++    return [
++        `${label} ${entry.event}`,
++        `${entry.scope}/${entry.mediaSourceOwner}/${entry.mediaSourceClass ?? 'class-unavailable'}`,
++        relation,
++        `age=${age}ms`,
++        ...details,
++    ].join(' · ');
++};
++
++
++const summarizeLifecycleTrace = (trace: LifecycleTraceSnapshot): readonly string[] => {
++    const failure_entry = [...trace.entries].reverse().find((entry) => entry.event === 'player-fail') ?? trace.entries.at(-1);
++    if (failure_entry === undefined) return [];
++
++    const lines: string[] = [];
++    if (trace.firstCritical !== null) {
++        lines.push(formatTraceEntry('first', trace.firstCritical, failure_entry, trace.frozenAt));
++    }
++    const source_close = [...trace.entries].reverse().find((entry) => entry.event === 'mediasource-sourceclose');
++    if (source_close !== undefined && source_close.sequence !== trace.firstCritical?.sequence) {
++        lines.push(formatTraceEntry('close', source_close, failure_entry, trace.frozenAt));
++    }
++    return lines;
++};
++
++
++/**
++ * mpeg2toh264自身のguardが完全性を確認したsnapshotだけを採用する。
++ */
++const getLifecycleTraceReference = (error: Error): LifecycleTraceReference | null => {
++    if (isLifecycleError(error) === false) return null;
++    return Object.freeze({
++        eventId: error.lifecycleEventId,
++        frozenAt: error.lifecycleTrace.frozenAt,
++        trace: error.lifecycleTrace,
++    });
++};
++
++
++/**
++ * 公開診断buildの再生対象・build・client情報を1回だけ固定する。
++ * 同じ対象のPlayerController再起動では既存errorを維持する。
++ */
++export const ensurePublicPlaybackDiagnosticSession = (
++    target: PublicPlaybackDiagnosticTarget,
++    initial_quality: string | null,
++): void => {
++    if (public_build_provenance === null) return;
++    if (public_playback_diagnostic_session.value !== null && isSamePublicPlaybackDiagnosticTarget(
++        public_playback_diagnostic_session.value,
++        target.playbackMode,
++        target.mediaIdentifier,
++    )) return;
++
++    const facts = captureClientFacts();
++    const header: PublicPlaybackDiagnosticHeader = {
++        mode: public_build_provenance.mode,
++        buildId: public_build_provenance.buildId,
++        buildRevision: public_build_provenance.components.konomiTV,
++        mpeg2toh264Revision: public_build_provenance.components.mpeg2toh264,
++        playbackMode: target.playbackMode,
++        mediaTitle: normalizeDisplayText(target.mediaTitle, 'Title unavailable'),
++        mediaIdentifier: normalizeDisplayText(target.mediaIdentifier, 'Identifier unavailable'),
++        startedAt: lifecycleNow(),
++        initialQuality: normalizePublicPlaybackQuality(initial_quality),
++        deviceFamily: facts.deviceFamily,
++        os: facts.os,
++        browser: facts.browser,
++        viewportWidth: facts.viewportWidth,
++        viewportHeight: facts.viewportHeight,
++        devicePixelRatio: facts.devicePixelRatio,
++    };
++    public_playback_diagnostic_session.value = createPublicPlaybackDiagnosticSessionState(true, header);
++};
++
++
++/**
++ * 視聴離脱、録画の自然終了、新しい再生対象への移行時に前sessionを破棄する。
++ */
++export const clearPublicPlaybackDiagnosticSession = (): void => {
++    public_playback_diagnostic_session.value = null;
++};
++
++
++/**
++ * mpeg2toh264のlifecycle ring bufferへ、公開可能なclient contextを記録する。
++ */
++export const recordPublicPlaybackDiagnosticContext = (player: Mpeg2TsPlayer, quality: string | null): boolean => {
++    if (public_build_provenance === null) return false;
++
++    const facts = captureClientFacts();
++    const detail: LifecycleTraceDetail = Object.freeze({
++        buildId: public_build_provenance.buildId,
++        deviceFamily: facts.deviceFamily,
++        os: facts.os,
++        browser: facts.browser,
++        cssViewport: `${facts.viewportWidth}x${facts.viewportHeight}`,
++        devicePixelRatio: facts.devicePixelRatio,
++        quality: normalizePublicPlaybackQuality(quality),
++    });
++    player.recordDiagnosticLifecycle('konomitv-client-context', detail, Object.freeze({
++        at: lifecycleNow(),
++        critical: false,
++    }));
++    return true;
++};
++
++
++/**
++ * mpeg2toh264 errorの内容・時刻・再生位置・traceを受信時点で固定し、sessionへ追加する。
++ * lifecycle interfaceがある場合は、ring bufferと同じevent ID・frozen trace objectを保持する。
++ */
++export const appendMpeg2ToH264DiagnosticError = (
++    error: Error,
++    quality: string | null,
++    playback_position: number,
++): void => {
++    if (public_build_provenance === null || public_playback_diagnostic_session.value === null) return;
++
++    const lifecycle_reference = getLifecycleTraceReference(error);
++    public_playback_diagnostic_session.value = appendPublicPlaybackDiagnosticError(public_playback_diagnostic_session.value, {
++        occurredAt: lifecycle_reference?.frozenAt ?? lifecycleNow(),
++        playbackPosition: playback_position,
++        quality: normalizePublicPlaybackQuality(quality),
++        message: readErrorMessage(error),
++        eventId: lifecycle_reference?.eventId ?? null,
++        lifecycleTrace: lifecycle_reference?.trace ?? null,
++        traceSummary: lifecycle_reference === null ? [] : summarizeLifecycleTrace(lifecycle_reference.trace),
++    });
++};
+diff --git a/client/src/vite-env.d.ts b/client/src/vite-env.d.ts
+index 61889901f0a091c2983b98c18add30194b0b95f2..f6514991e8e6d489e0c6772039287ca0cd11f27e 100644
+--- a/client/src/vite-env.d.ts
++++ b/client/src/vite-env.d.ts
+@@ -121,6 +121,24 @@ declare module 'vue-virtual-scroller' {
+ 
+ declare global {
+ 
++    // 診断・dogfood buildにだけ埋め込まれる公開provenance
++    interface ImportMetaEnv {
++        readonly KONOMITV_PUBLIC_BUILD_PROVENANCE: Readonly<{
++            schemaVersion: 1;
++            mode: 'DOGFOOD' | 'DIAG';
++            buildId: string;
++            components: Readonly<{
++                konomiTV: string;
++                dplayer: string;
++                mpeg2toh264: string;
++                starlette: string;
++            }>;
++        }> | null;
++    }
++    interface ImportMeta {
++        readonly env: ImportMetaEnv;
++    }
++
+     // location.reload() の forceReload 引数
+     // ref: https://developer.mozilla.org/en-US/docs/Web/API/Location/reload
+     interface Location {
+diff --git a/client/vite.config.mts b/client/vite.config.mts
+index a733fab9bfc698d29df52b6e4cd205e381a3a464..8d082ad4b7026f53001a87e06059c19eee2c5719 100644
+--- a/client/vite.config.mts
++++ b/client/vite.config.mts
+@@ -1,13 +1,122 @@
+ 
++import { execFileSync } from 'node:child_process';
++import { readFileSync } from 'node:fs';
+ import { fileURLToPath, URL } from 'node:url';
+ 
+ import vue from '@vitejs/plugin-vue';
+-import { defineConfig } from 'vite';
++import { defineConfig, type Plugin } from 'vite';
+ import { comlink } from 'vite-plugin-comlink';
+ import { VitePWA } from 'vite-plugin-pwa';
+ import vuetify, { transformAssetUrls } from 'vite-plugin-vuetify';
+ 
+ 
++type PublicBuildMode = 'DOGFOOD' | 'DIAG';
++type PublicBuildProvenance = Readonly<{
++    schemaVersion: 1;
++    mode: PublicBuildMode;
++    buildId: string;
++    components: Readonly<{
++        konomiTV: string;
++        dplayer: string;
++        mpeg2toh264: string;
++        starlette: string;
++    }>;
++}>;
++
++
++/**
++ * Git URL dependencyから、固定された40桁のcommitを取り出す。
++ * 公開provenanceを有効にしたbuildでは、branchやtagのように内容が動く参照は受け付けない。
++ */
++const extractPinnedCommit = (dependency_name: string, dependency: unknown): string => {
++    if (typeof dependency !== 'string') {
++        throw new Error(`Public build provenance requires a Git commit pin for ${dependency_name}.`);
++    }
++    const match = dependency.match(/#([0-9a-f]{40})$/i);
++    if (match === null) {
++        throw new Error(`Public build provenance requires a 40-character Git commit pin for ${dependency_name}.`);
++    }
++    return match[1].toLowerCase();
++};
++
++
++/**
++ * 診断・dogfood buildで画面と配備manifestへ投影する公開provenanceを生成する。
++ * 値の正本はKonomiTVのGit HEADと各依存pinで、同じオブジェクトを画面と生成manifestの両方へ使う。
++ */
++const createPublicBuildProvenance = (): PublicBuildProvenance | null => {
++    const mode = process.env.KONOMITV_PUBLIC_BUILD_MODE;
++    if (mode === undefined || mode === '') return null;
++    if (mode !== 'DOGFOOD' && mode !== 'DIAG') {
++        throw new Error('KONOMITV_PUBLIC_BUILD_MODE must be DOGFOOD or DIAG.');
++    }
++
++    // commitされていないsourceから、別のcommitを名乗る診断bundleを作らない。
++    const repository_root = fileURLToPath(new URL('../', import.meta.url));
++    const worktree_changes = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=normal'], {
++        cwd: repository_root,
++        encoding: 'utf8',
++    }).trim();
++    if (worktree_changes !== '') {
++        throw new Error('Public build provenance requires a clean worktree.');
++    }
++
++    const konomi_tv_commit = execFileSync('git', ['rev-parse', '--verify', 'HEAD^{commit}'], {
++        cwd: repository_root,
++        encoding: 'utf8',
++    }).trim().toLowerCase();
++    if (/^[0-9a-f]{40}$/.test(konomi_tv_commit) === false) {
++        throw new Error('Failed to resolve the KonomiTV source commit for public build provenance.');
++    }
++
++    // Client dependencyのcommitはpackage.jsonのpinを正本とする。
++    const package_json = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
++        dependencies?: Record<string, unknown>;
++    };
++    const dplayer_commit = extractPinnedCommit('dplayer', package_json.dependencies?.dplayer);
++    const mpeg2toh264_commit = extractPinnedCommit('mpeg2toh264', package_json.dependencies?.mpeg2toh264);
++
++    // Server dependencyのcommitはpyproject.tomlのpinを正本とする。
++    const pyproject_toml = readFileSync(new URL('../server/pyproject.toml', import.meta.url), 'utf8');
++    const starlette_match = pyproject_toml.match(/^starlette\s*=\s*\{[^\r\n]*\brev\s*=\s*"([0-9a-f]{40})"/im);
++    if (starlette_match === null) {
++        throw new Error('Public build provenance requires a 40-character Git commit pin for starlette.');
++    }
++
++    return Object.freeze({
++        schemaVersion: 1,
++        mode,
++        buildId: konomi_tv_commit.slice(0, 7),
++        components: Object.freeze({
++            konomiTV: konomi_tv_commit,
++            dplayer: dplayer_commit,
++            mpeg2toh264: mpeg2toh264_commit,
++            starlette: starlette_match[1].toLowerCase(),
++        }),
++    });
++};
++
++
++const public_build_provenance = createPublicBuildProvenance();
++const playback_diagnostics_module_path = fileURLToPath(new URL(
++    public_build_provenance === null ?
++        './src/utils/PlaybackDiagnostics.disabled.ts' :
++        './src/utils/PlaybackDiagnostics.ts',
++    import.meta.url,
++));
++const publicBuildProvenancePlugin = (): Plugin => ({
++    name: 'konomitv-public-build-provenance',
++    generateBundle() {
++        if (public_build_provenance === null) return;
++        this.emitFile({
++            type: 'asset',
++            fileName: 'build-provenance.json',
++            source: `${JSON.stringify(public_build_provenance, null, 2)}\n`,
++        });
++    },
++});
++
++
+ // Vite の設定
+ // https://vitejs.dev/config/
+ export default defineConfig({
+@@ -16,6 +125,7 @@ export default defineConfig({
+     define: {
+         'process.env': {},  // これがないと assert がエラーになる
+         'import.meta.env.KONOMITV_VERSION': JSON.stringify(process.env.npm_package_version),
++        'import.meta.env.KONOMITV_PUBLIC_BUILD_PROVENANCE': JSON.stringify(public_build_provenance),
+     },
+     // ビルドの設定
+     build: {
+@@ -33,7 +143,16 @@ export default defineConfig({
+         },
+     },
+     resolve: {
+-        alias: {'@': fileURLToPath(new URL('./src', import.meta.url))},
++        alias: [
++            {
++                find: '@/utils/PlaybackDiagnostics',
++                replacement: playback_diagnostics_module_path,
++            },
++            {
++                find: '@',
++                replacement: fileURLToPath(new URL('./src', import.meta.url)),
++            },
++        ],
+         extensions: ['.js', '.json', '.jsx', '.mjs', '.ts', '.tsx', '.vue'],
+     },
+     // mpeg2toh264 は配布済みの Worker を import.meta.url から解決するため、依存関係の事前バンドルから除外する
+@@ -69,6 +188,7 @@ export default defineConfig({
+     },
+     // プラグインの設定
+     plugins: [
++        publicBuildProvenancePlugin(),
+         comlink(),
+         vue({
+             template: {
+diff --git a/client/yarn.lock b/client/yarn.lock
+index e9dd0941478fec7a8f0d4ec2c8a325914976205d..e8f308815189bd9c1b48b1fe93f3f06900c58ffb 100644
+--- a/client/yarn.lock
++++ b/client/yarn.lock
+@@ -2440,9 +2440,9 @@ dotenv@^16.3.1:
+   resolved "https://registry.yarnpkg.com/dotenv/-/dotenv-16.6.1.tgz#773f0e69527a8315c7285d5ee73c4459d20a8020"
+   integrity sha512-uBq4egWHTcTt33a72vpSG0z3HnPuIl6NqYcTrKEg2azoEyl2hpW0zqlxysq2pK9HlDIHyHyakeYaYnSAwd8bow==
+ 
+-"dplayer@github:tsukumijima/DPlayer#v1.33.1":
++"dplayer@github:libratechw/DPlayer#f9ac9d9f07ea6dbfd678992953ca7ee35b9c2f68":
+   version "1.33.1"
+-  resolved "https://codeload.github.com/tsukumijima/DPlayer/tar.gz/a5f847877eada1390456aea4ed7da8e31b4c166e"
++  resolved "https://codeload.github.com/libratechw/DPlayer/tar.gz/f9ac9d9f07ea6dbfd678992953ca7ee35b9c2f68"
+   dependencies:
+     aribb24.js "~1.11.5"
+     axios "^1.7.2"
+@@ -3970,9 +3970,9 @@ mitt@^3.0.1:
+   resolved "https://registry.yarnpkg.com/mitt/-/mitt-3.0.1.tgz#ea36cf0cc30403601ae074c8f77b7092cdab36d1"
+   integrity sha512-vKivATfr97l2/QBCYAkXYDbrIWPM2IIKEl7YPhjCvKlG3kE2gm+uBo6nEXK3M5/Ffh/FLpKExzOQ3JJoJGFKBw==
+ 
+-"mpeg2toh264@github:tsukumijima/mpeg2toh264#52a3db5e8fb9833e6cade2167097849c668bdb1f":
++"mpeg2toh264@github:libratechw/mpeg2toh264#68c1c21734d193b646070d9ff003786757550080":
+   version "0.0.1"
+-  resolved "https://codeload.github.com/tsukumijima/mpeg2toh264/tar.gz/52a3db5e8fb9833e6cade2167097849c668bdb1f"
++  resolved "https://codeload.github.com/libratechw/mpeg2toh264/tar.gz/68c1c21734d193b646070d9ff003786757550080"
+ 
+ mpegts.js@^1.7.3, "mpegts.js@github:tsukumijima/mpegts.js#c69a71c809b6e0a53f7101455333f8b3d98460d0":
+   version "1.8.0"
+diff --git a/server/poetry.lock b/server/poetry.lock
+index 324f3265f869f0a4e8921a28b1818c6dcb756848..9eefbeb33035cfe769dad3cbf89333372d0a4e6c 100644
+--- a/server/poetry.lock
++++ b/server/poetry.lock
+@@ -3312,17 +3312,21 @@ version = "1.6.0"
+ description = "The little ASGI library that shines."
+ optional = false
+ python-versions = ">=3.10"
+-files = [
+-    {file = "starlette-1.6.0-py3-none-any.whl", hash = "sha256:a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c"},
+-    {file = "starlette-1.6.0.tar.gz", hash = "sha256:d4e3ac5e546444960c710297a3c9fc3f7ebae1b7e963f3d36173b49da535be9b"},
+-]
++files = []
++develop = false
+ 
+ [package.dependencies]
+ anyio = ">=3.6.2,<5"
+ typing-extensions = {version = ">=4.10.0", markers = "python_version < \"3.13\""}
+ 
+ [package.extras]
+-full = ["httpx (>=0.27.0,<0.29.0)", "httpx2 (>=2.0.0)", "itsdangerous", "jinja2", "python-multipart (>=0.0.18)", "pyyaml"]
++full = ["httpx (>=0.27.0,<0.29.0)", "httpx2 (>=2.0.0)", "itsdangerous", "jinja2", "opentelemetry-api", "python-multipart (>=0.0.18)", "pyyaml"]
++
++[package.source]
++type = "git"
++url = "https://github.com/libratechw/starlette.git"
++reference = "17e3955f997c2f271a08057fe649abadcc482f77"
++resolved_reference = "17e3955f997c2f271a08057fe649abadcc482f77"
+ 
+ [[package]]
+ name = "taskipy"
+@@ -4075,4 +4079,4 @@ websockets = ">=14.0"
+ [metadata]
+ lock-version = "2.0"
+ python-versions = ">=3.11,<3.12"
+-content-hash = "17ce50ac349a43e9bf0b3d66d1742bf593ffdac3d083959fc9b3cae043fe849b"
++content-hash = "fcdb003e70619e302ceb933e53186720d55903c3aa2ebefddcde19325b7bb4b9"
+diff --git a/server/pyproject.toml b/server/pyproject.toml
+index d34f78091ebfbd7fc263566cc54ba8b08803813d..92ac3ea58426df197fc2510895daee2fcfbea08b 100644
+--- a/server/pyproject.toml
++++ b/server/pyproject.toml
+@@ -42,6 +42,7 @@ requests = "^2.32.4"
+ rich = "^13.9.4"
+ "ruamel.yaml" = "==0.18.12"
+ sse-starlette = "^2.1.3"
++starlette = { git = "https://github.com/libratechw/starlette.git", rev = "17e3955f997c2f271a08057fe649abadcc482f77" }
+ taskipy = "^1.14.1"
+ tortoise-orm = ">=0.23.0,<1.0.0"
+ typer = ">=0.21.0,<1.0.0"

@@ -1,0 +1,2332 @@
+diff --git a/package.json b/package.json
+index 80082e9f20ad702333094e421281a6ed1f8bad90..4e664de7670dde3abe6f41278f342df86bd31602 100644
+--- a/package.json
++++ b/package.json
+@@ -24,6 +24,7 @@
+   "scripts": {
+     "packages:build": "npm run build --workspace @mpeg2toh264/player && npm run build --workspace @mpeg2toh264/yadif",
+     "test:ivtc": "node tools/test-ivtc.cjs",
++    "test:lifecycle": "node tools/test-lifecycle-trace.mjs",
+     "test:mse": "node tools/test-mse-reset.mjs",
+     "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",
+     "web:build": "npm run packages:build && npm run build --workspace @mpeg2toh264/demo",
+diff --git a/packages/player/README.md b/packages/player/README.md
+index 446b6ae6b5bd7f8e08dea76fb2495d3b2a71c2c2..244afed3439b370b9810646616b11870faa8ac13 100644
+--- a/packages/player/README.md
++++ b/packages/player/README.md
+@@ -1,5 +1,8 @@
+ # @mpeg2toh264/player
+ 
++> [!WARNING]
++> このbranchは、iOSで録画の画質切替を繰り返した際に発生する`InvalidStateError`の診断専用です。MSE、SourceBuffer、video要素、接続と破棄の直近48イベントをエラーへ追加しますが、不具合を修正するものではなく、branch全体の取り込みは想定していません。
++
+ MPEG-2 TSをWorker内でH.264へ変換し、`<video>`で再生するMSEプレイヤーです。取得、変換、バッファー管理、Rangeリクエストによるシークをまとめて扱います。
+ 
+ ```ts
+@@ -38,4 +41,16 @@ await player.load('https://example.com/video.ts');
+ - `seekable`: Rangeシーク可能な入力の再生時間
+ - `private_stream_1` / `private_stream_2`: 選択サービスのprivate PES
+ - `timing`: 読み込み開始から各段階までの所要時間
+-- `error`: 読み込み中を含むすべてのエラー
++- `error`: 読み込み中を含むすべてのエラー。再生失敗時の`event.detail.error`は診断用の`lifecycleEventId`と`lifecycleTrace`を持つ。元の`Error`へ安全にpropertyを追加できる場合は同じオブジェクトを使い、readonlyまたは拡張不能な場合は元の`Error`を`cause`に保持する診断付き`Error`を渡す。再生を継続するdeinterlacer初期化エラーは従来どおり通常の`Error`
++
++## iOS lifecycle診断契約
++
++`lifecycleTrace`は、同じページで画質切替により交代するmpeg2toh264インスタンスをまたぐリングバッファーの凍結snapshotです。各entryの`at`とsnapshotの`frozenAt`は、WindowとWorkerのどちらでも`performance.timeOrigin + performance.now()`を使うため、realmをまたいで時系列に並べられます。MSEの実ownerと実class、内部generation、SourceBufferの操作・queue・epochも各entryに含まれます。event IDは`m2h-<freeze_us_base36>-<mpeg_instance_base36>-<generation_base36>-<failure_sequence_base36>`形式で、最大51文字です。
++
++最初に異常原因の候補として記録されたentryは、後続イベントでリングが回転しても保持します。失敗時は`src` / `srcObject`の解除、Object URLのrevoke、`video.load()`より先にsnapshot全体、entry配列、各entryとdetailを凍結します。完全なsnapshotは`error.lifecycleTrace`だけに置き、画面へ直接表示される`error.message`には最大240文字のevent ID、最初と最後のevent、直近最大8件のevent名だけのtail、件数を追加します。tailは古い側から表示領域へ収まる分だけ省略し、URL、path、detailは含めません。
++
++DPlayerなどのpage側ownerは`recordDiagnosticLifecycle(event, detail, { at, critical })`で、画質切替世代などを同じ時系列へ追加できます。critical eventが保持枠を取得した場合だけopaque tokenを返し、その操作が成功したときに同じtokenを`resolveDiagnosticLifecycle(token)`へ渡すと、そのentryを通常のリング回転へ戻します。別entryや別snapshotのtokenでは保持枠を解放しません。
++
++eventは英数字と`_.:-`で64文字まで、detailは16項目まで（keyは64文字、string値は256文字まで）で、値は文字列・有限の数値・真偽値・`null`だけを受け取ります。不正または上限超過のevent、timestamp、detail、options、tokenはその診断操作を無視し、再生処理へ例外を返しません。entryの`videoId`はHTMLVideoElementを区別する内部番号であり、録画・番組・配信のIDではありません。利用者向けUIには表示しません。
++
++リングとcritical保持枠は同じJavaScript module内で共有します。このbranchは1つのDPlayerが画質切替でplayerを交代する診断を対象とし、同じmoduleから無関係なplayerを同時に動かすとentryとcritical保持枠も共有されます。
+diff --git a/packages/player/src/index.ts b/packages/player/src/index.ts
+index 65885ba6d5feaebafbc1aeb317dfccca034a9f08..c890608b57c8040a8c3a60ce3e9994318e9ed862 100644
+--- a/packages/player/src/index.ts
++++ b/packages/player/src/index.ts
+@@ -20,6 +20,12 @@ export {
+   supportsPassthrough,
+   supportsWorkerMediaSource,
+ } from "./player.js";
++export {
++  isLifecycleError,
++  lifecycleNow,
++  LIFECYCLE_EVENT_ID_MAX_LENGTH,
++  LIFECYCLE_TRACE_CAPACITY,
++} from "./lifecycle.js";
+ export {
+   requiresManagedMediaSource,
+   supportsManagedMediaSource,
+@@ -27,9 +33,19 @@ export {
+ export type {
+   Mpeg2TsPlayerEventMap,
+   Mpeg2TsPlayerOptions,
++  DiagnosticLifecycleOptions,
+   PlayerDeinterlacer,
+   PlayerDeinterlacerFactory,
+ } from "./player.js";
++export type {
++  DiagnosticLifecycleToken,
++  LifecycleError,
++  LifecycleTraceDetail,
++  LifecycleTraceEntry,
++  LifecycleTraceSnapshot,
++  LifecycleTraceValue,
++  MediaSourceClassName,
++} from "./lifecycle.js";
+ export {
+   DEFAULT_KEEP_BEHIND_SECONDS,
+   DEFAULT_MAX_AHEAD_SECONDS,
+diff --git a/packages/player/src/lifecycle.ts b/packages/player/src/lifecycle.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..de2424559cdf5d0af86666c2aa16c590510ac1a1
+--- /dev/null
++++ b/packages/player/src/lifecycle.ts
+@@ -0,0 +1,496 @@
++/** A primitive value safe to copy between realms and serialize in an error. */
++export type LifecycleTraceValue = string | number | boolean | null;
++
++/** Extra state recorded beside one lifecycle event. */
++export type LifecycleTraceDetail = Readonly<
++  Record<string, LifecycleTraceValue>
++>;
++
++export type LifecycleTraceScope = "main" | "worker" | "external";
++export type MediaSourceClassName = "MediaSource" | "ManagedMediaSource";
++
++/** One event on the page/worker clock shared by a page diagnostic window. */
++export interface LifecycleTraceEntry {
++  /** Arrival order at the page-side trace owner. */
++  readonly sequence: number;
++  /** `performance.timeOrigin + performance.now()`, comparable across realms. */
++  readonly at: number;
++  readonly scope: LifecycleTraceScope;
++  readonly event: string;
++  readonly playerInstance: number;
++  readonly generation: number;
++  /** Internal element identity. This is never a recording or programme ID. */
++  readonly videoId: number;
++  readonly mediaSourceOwner: "main" | "worker";
++  readonly mediaSourceClass: MediaSourceClassName | null;
++  readonly detail: LifecycleTraceDetail;
++}
++
++export interface LifecycleTraceSnapshot {
++  readonly eventId: string;
++  /** Uses the same cross-realm-comparable clock as every entry's `at`. */
++  readonly frozenAt: number;
++  readonly dropped: number;
++  /** The first event marked as a possible cause, retained even when full. */
++  readonly firstCritical: LifecycleTraceEntry | null;
++  /** Bounded and sorted by `at`, then by page-side arrival order. */
++  readonly entries: readonly LifecycleTraceEntry[];
++}
++
++/** The error shape received through `Mpeg2TsPlayer`'s `error` event. */
++export interface LifecycleError extends Error {
++  readonly lifecycleEventId: string;
++  readonly lifecycleTrace: LifecycleTraceSnapshot;
++}
++
++declare const diagnosticLifecycleTokenBrand: unique symbol;
++
++/** Opaque identity for an integration-owned critical entry held by the ring. */
++export interface DiagnosticLifecycleToken {
++  readonly [diagnosticLifecycleTokenBrand]: true;
++}
++
++export interface LifecycleTraceEntryInput {
++  readonly at: number;
++  readonly scope: LifecycleTraceScope;
++  readonly event: string;
++  readonly playerInstance: number;
++  readonly generation: number;
++  readonly videoId: number;
++  readonly mediaSourceOwner: "main" | "worker";
++  readonly mediaSourceClass: MediaSourceClassName | null;
++  readonly detail?: LifecycleTraceDetail;
++  /** Preserve the first such event outside the rotating part of the buffer. */
++  readonly critical?: boolean;
++}
++
++/** A MediaSource-owned event before the page adds player and video identity. */
++export interface MseLifecycleTrace {
++  readonly at: number;
++  readonly event: string;
++  readonly mediaSourceClass: MediaSourceClassName;
++  readonly detail: LifecycleTraceDetail;
++  readonly critical: boolean;
++}
++
++/** The one monotonic clock coordinate shared by Window and Worker realms. */
++export function lifecycleNow(): number {
++  return performance.timeOrigin + performance.now();
++}
++
++export const LIFECYCLE_TRACE_CAPACITY = 48;
++const MAX_MESSAGE_SUFFIX_LENGTH = 240;
++/** Longest event ID emitted by safe-integer clock/counter components. */
++export const LIFECYCLE_EVENT_ID_MAX_LENGTH = 51;
++const LIFECYCLE_EVENT_ID = /^m2h-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+-[0-9a-z]+$/;
++const INVALID_LIFECYCLE_EVENT_ID_CHARACTER = /[^0-9a-z-]/;
++const MAX_COMPACT_EVENT_LENGTH = 32;
++const MAX_COMPACT_TAIL_EVENT_LENGTH = 24;
++const MAX_MESSAGE_TAIL_EVENTS = 8;
++const DIAGNOSTIC_EVENT_START = /^[A-Za-z0-9]/;
++const INVALID_DIAGNOSTIC_EVENT_CHARACTER = /[^A-Za-z0-9_.:-]/;
++const MAX_DIAGNOSTIC_EVENT_LENGTH = 64;
++const MAX_DIAGNOSTIC_DETAIL_FIELDS = 16;
++const MAX_DIAGNOSTIC_DETAIL_KEY_LENGTH = 64;
++const MAX_DIAGNOSTIC_DETAIL_STRING_LENGTH = 256;
++
++function isTraceValue(value: unknown): value is LifecycleTraceValue {
++  return (
++    value === null ||
++    typeof value === "string" ||
++    typeof value === "boolean" ||
++    (typeof value === "number" && Number.isFinite(value))
++  );
++}
++
++/**
++ * Copy an integration-owned detail object into the trace's serializable value
++ * contract. A malformed value rejects that diagnostic event as a whole.
++ */
++export function sanitizeLifecycleDetail(
++  detail: unknown,
++): LifecycleTraceDetail | null {
++  try {
++    if (typeof detail !== "object" || detail === null || Array.isArray(detail))
++      return null;
++    const entries = Object.entries(detail);
++    if (
++      entries.length > MAX_DIAGNOSTIC_DETAIL_FIELDS ||
++      !entries.every(
++        ([key, value]) =>
++          key.length > 0 &&
++          key.length <= MAX_DIAGNOSTIC_DETAIL_KEY_LENGTH &&
++          isTraceValue(value) &&
++          (typeof value !== "string" ||
++            value.length <= MAX_DIAGNOSTIC_DETAIL_STRING_LENGTH),
++      )
++    )
++      return null;
++    return Object.freeze(Object.fromEntries(entries));
++  } catch {
++    // Diagnostics called by an integration must never alter playback control.
++    return null;
++  }
++}
++
++/** Validate the complete integration-owned record without trusting its realm. */
++export function sanitizeDiagnosticLifecycleInput(
++  event: unknown,
++  detail: unknown,
++  options: unknown,
++): {
++  readonly event: string;
++  readonly detail: LifecycleTraceDetail;
++  readonly at: number | undefined;
++  readonly critical: boolean;
++} | null {
++  try {
++    if (
++      typeof event !== "string" ||
++      event.length === 0 ||
++      event.length > MAX_DIAGNOSTIC_EVENT_LENGTH ||
++      !DIAGNOSTIC_EVENT_START.test(event) ||
++      INVALID_DIAGNOSTIC_EVENT_CHARACTER.test(event) ||
++      typeof options !== "object" ||
++      options === null ||
++      Array.isArray(options)
++    )
++      return null;
++    const normalizedDetail = sanitizeLifecycleDetail(detail);
++    if (normalizedDetail === null) return null;
++    const { at, critical } = options as {
++      readonly at?: unknown;
++      readonly critical?: unknown;
++    };
++    if (at !== undefined && !Number.isFinite(at)) return null;
++    if (critical !== undefined && typeof critical !== "boolean") return null;
++    return Object.freeze({
++      event,
++      detail: normalizedDetail,
++      at: at as number | undefined,
++      critical: critical === true,
++    });
++  } catch {
++    return null;
++  }
++}
++
++function isFrozenEntry(value: unknown): value is LifecycleTraceEntry {
++  if (typeof value !== "object" || value === null || !Object.isFrozen(value))
++    return false;
++  const entry = value as Partial<LifecycleTraceEntry>;
++  return (
++    Number.isInteger(entry.sequence) &&
++    Number.isFinite(entry.at) &&
++    (entry.scope === "main" ||
++      entry.scope === "worker" ||
++      entry.scope === "external") &&
++    typeof entry.event === "string" &&
++    Number.isInteger(entry.playerInstance) &&
++    Number.isInteger(entry.generation) &&
++    Number.isInteger(entry.videoId) &&
++    (entry.mediaSourceOwner === "main" ||
++      entry.mediaSourceOwner === "worker") &&
++    (entry.mediaSourceClass === null ||
++      entry.mediaSourceClass === "MediaSource" ||
++      entry.mediaSourceClass === "ManagedMediaSource") &&
++    typeof entry.detail === "object" &&
++    entry.detail !== null &&
++    Object.isFrozen(entry.detail) &&
++    Object.values(entry.detail).every(isTraceValue)
++  );
++}
++
++/**
++ * Page-side owner of one bounded diagnostic window.
++ *
++ * The rotating portion keeps the events nearest a failure. The first event an
++ * owner marks critical is held separately, so a close/error that starts the
++ * failure cannot disappear when SourceBuffer updates fill the buffer.
++ */
++export class LifecycleTrace {
++  readonly #capacity: number;
++  #sequence = 0;
++  #recent: LifecycleTraceEntry[] = [];
++  #firstCritical: LifecycleTraceEntry | null = null;
++  readonly #criticalEntries = new Set<LifecycleTraceEntry>();
++  #dropped = 0;
++  #snapshot: LifecycleTraceSnapshot | null = null;
++
++  constructor(capacity = LIFECYCLE_TRACE_CAPACITY) {
++    if (!Number.isInteger(capacity) || capacity < 1)
++      throw new RangeError("lifecycle trace capacity must be an integer >= 1");
++    this.#capacity = capacity;
++  }
++
++  record(input: LifecycleTraceEntryInput): LifecycleTraceEntry | null {
++    if (this.#snapshot) return null;
++    const entry = Object.freeze({
++      sequence: ++this.#sequence,
++      at: input.at,
++      scope: input.scope,
++      event: input.event,
++      playerInstance: input.playerInstance,
++      generation: input.generation,
++      videoId: input.videoId,
++      mediaSourceOwner: input.mediaSourceOwner,
++      mediaSourceClass: input.mediaSourceClass,
++      detail: Object.freeze({ ...(input.detail ?? {}) }),
++    }) satisfies LifecycleTraceEntry;
++
++    if (input.critical === true) this.#criticalEntries.add(entry);
++    if (input.critical === true && this.#firstCritical === null) {
++      this.#firstCritical = entry;
++    } else {
++      this.#recent.push(entry);
++    }
++    const recentCapacity =
++      this.#capacity - (this.#firstCritical === null ? 0 : 1);
++    while (this.#recent.length > recentCapacity) {
++      this.#criticalEntries.delete(this.#recent.shift()!);
++      this.#dropped++;
++    }
++    return this.#firstCritical === entry ? entry : null;
++  }
++
++  /** Return exactly the held entry to normal ring rotation once it resolves. */
++  resolveCritical(entry: LifecycleTraceEntry): boolean {
++    if (this.#snapshot || this.#firstCritical !== entry) return false;
++    const following = this.#recent.findIndex(
++      (candidate) => candidate.sequence > entry.sequence,
++    );
++    if (following === -1) this.#recent.push(entry);
++    else this.#recent.splice(following, 0, entry);
++    this.#criticalEntries.delete(entry);
++    this.#firstCritical = null;
++    const nextCritical = this.#recent.find((candidate) =>
++      this.#criticalEntries.has(candidate),
++    );
++    if (nextCritical !== undefined) {
++      this.#recent.splice(this.#recent.indexOf(nextCritical), 1);
++      this.#firstCritical = nextCritical;
++    }
++    const recentCapacity =
++      this.#capacity - (this.#firstCritical === null ? 0 : 1);
++    while (this.#recent.length > recentCapacity) {
++      this.#criticalEntries.delete(this.#recent.shift()!);
++      this.#dropped++;
++    }
++    return true;
++  }
++
++  freeze(eventId: string, frozenAt = lifecycleNow()): LifecycleTraceSnapshot {
++    if (this.#snapshot) return this.#snapshot;
++    const entries = [
++      ...(this.#firstCritical === null ? [] : [this.#firstCritical]),
++      ...this.#recent,
++    ].sort(
++      (left, right) => left.at - right.at || left.sequence - right.sequence,
++    );
++    this.#snapshot = Object.freeze({
++      eventId,
++      frozenAt,
++      dropped: this.#dropped,
++      firstCritical: this.#firstCritical,
++      entries: Object.freeze(entries),
++    });
++    return this.#snapshot;
++  }
++}
++
++function compactEvent(event: string, limit = MAX_COMPACT_EVENT_LENGTH): string {
++  return event.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, limit);
++}
++
++function compactTailEvent(event: string): string {
++  return compactEvent(
++    event
++      .replace(/^mediasource-/, "ms.")
++      .replace(/^sourcebuffer-/, "sb.")
++      .replace(/^dplayer-/, "dp.")
++      .replace(/^player-/, "p.")
++      .replace(/^worker-/, "w.")
++      .replace(/^video-/, "v.")
++      .replace(/^object-url-/, "url.")
++      .replace(/^source-element-/, "source."),
++    MAX_COMPACT_TAIL_EVENT_LENGTH,
++  );
++}
++
++function lifecycleMessageSuffix(snapshot: LifecycleTraceSnapshot): string {
++  const first = snapshot.firstCritical?.event ?? "none";
++  const last = snapshot.entries.at(-1)?.event ?? "none";
++  const summary = [
++    `lifecycle=${snapshot.eventId}`,
++    `first=${compactEvent(first)}`,
++    `last=${compactEvent(last)}`,
++    `entries=${snapshot.entries.length}`,
++    `dropped=${snapshot.dropped}`,
++  ].join(" ");
++  const tailBudget = MAX_MESSAGE_SUFFIX_LENGTH - 2 - summary.length - 6;
++  let tail: string[] = [];
++  for (
++    let index = snapshot.entries.length - 1;
++    index >= 0 && tail.length < MAX_MESSAGE_TAIL_EVENTS;
++    index--
++  ) {
++    const candidate = [
++      compactTailEvent(snapshot.entries[index]!.event),
++      ...tail,
++    ];
++    if (candidate.join(">").length > tailBudget) break;
++    tail = candidate;
++  }
++  return `[${summary}${tail.length === 0 ? "" : ` tail=${tail.join(">")}`}]`;
++}
++
++function readableErrorString(
++  error: Error,
++  property: "message" | "name" | "stack",
++  fallback: string | null,
++): string | null {
++  try {
++    const value = error[property];
++    return typeof value === "string" ? value : fallback;
++  } catch {
++    return fallback;
++  }
++}
++
++/** Read an Error name without allowing a host getter to escape diagnostics. */
++export function readErrorName(error: Error): string {
++  return readableErrorString(error, "name", "Error")!;
++}
++
++function canDefineValue(
++  error: Error,
++  property: "message" | "lifecycleEventId" | "lifecycleTrace",
++  enumerable?: boolean,
++): boolean {
++  const descriptor = Object.getOwnPropertyDescriptor(error, property);
++  if (descriptor === undefined) return Object.isExtensible(error);
++  if (descriptor.configurable) return true;
++  return (
++    "writable" in descriptor &&
++    descriptor.writable === true &&
++    (enumerable === undefined || descriptor.enumerable === enumerable)
++  );
++}
++
++function canDecorateInPlace(error: Error): boolean {
++  try {
++    return (
++      canDefineValue(error, "message") &&
++      canDefineValue(error, "lifecycleEventId", true) &&
++      canDefineValue(error, "lifecycleTrace", true)
++    );
++  } catch {
++    return false;
++  }
++}
++
++function defineValue(
++  error: Error,
++  property: "message" | "lifecycleEventId" | "lifecycleTrace",
++  value: unknown,
++  enumerable: boolean,
++): void {
++  const descriptor = Object.getOwnPropertyDescriptor(error, property);
++  if (descriptor !== undefined && !descriptor.configurable) {
++    Object.defineProperty(error, property, { value });
++    return;
++  }
++  Object.defineProperty(error, property, {
++    value,
++    writable: property === "message",
++    enumerable,
++    configurable: property === "message",
++  });
++}
++
++function decorateError(
++  error: Error,
++  message: string,
++  snapshot: LifecycleTraceSnapshot,
++): LifecycleError {
++  defineValue(error, "message", message, false);
++  defineValue(error, "lifecycleEventId", snapshot.eventId, true);
++  defineValue(error, "lifecycleTrace", snapshot, true);
++  return error as LifecycleError;
++}
++
++/**
++ * Decorate the same Error instance when its own properties permit it. A
++ * readonly or non-extensible error is retained as the cause of a traced Error.
++ *
++ * The full trace is intentionally kept out of `message`: DPlayer displays that
++ * string directly. Consumers that want the chronology read `lifecycleTrace`.
++ */
++export function withLifecycleTrace(
++  error: Error,
++  snapshot: LifecycleTraceSnapshot,
++): LifecycleError {
++  const suffix = lifecycleMessageSuffix(snapshot);
++  const originalName = readableErrorString(error, "name", null);
++  const originalMessage = readableErrorString(
++    error,
++    "message",
++    "the original error message was unavailable",
++  )!;
++  const message = `${originalMessage}\n${suffix}`;
++
++  if (originalName !== null && canDecorateInPlace(error)) {
++    try {
++      return decorateError(error, message, snapshot);
++    } catch {
++      // Host errors and proxies can still reject a definition after preflight.
++    }
++  }
++
++  const fallback = new Error(message, { cause: error });
++  fallback.name = originalName ?? "Error";
++  const originalStack = readableErrorString(error, "stack", null);
++  if (originalStack !== null) {
++    fallback.stack = `${fallback.name}: ${fallback.message}\nCaused by original error:\n${originalStack}`;
++  }
++  return decorateError(fallback, message, snapshot);
++}
++
++export function isLifecycleError(error: unknown): error is LifecycleError {
++  try {
++    if (typeof error !== "object" || error === null) return false;
++    const candidate = error as Partial<LifecycleError>;
++    const eventId = candidate.lifecycleEventId;
++    const trace = candidate.lifecycleTrace;
++    return (
++      typeof candidate.name === "string" &&
++      typeof candidate.message === "string" &&
++      typeof eventId === "string" &&
++      eventId.length <= LIFECYCLE_EVENT_ID_MAX_LENGTH &&
++      LIFECYCLE_EVENT_ID.test(eventId) &&
++      !INVALID_LIFECYCLE_EVENT_ID_CHARACTER.test(eventId) &&
++      trace?.eventId === eventId &&
++      Number.isFinite(trace.frozenAt) &&
++      Number.isInteger(trace.dropped) &&
++      trace.dropped >= 0 &&
++      Object.isFrozen(trace) &&
++      Array.isArray(trace.entries) &&
++      trace.entries.length > 0 &&
++      trace.entries.length <= LIFECYCLE_TRACE_CAPACITY &&
++      Object.isFrozen(trace.entries) &&
++      trace.entries.every(isFrozenEntry) &&
++      trace.entries.every(
++        (entry, index) =>
++          index === 0 ||
++          entry.at > trace.entries[index - 1]!.at ||
++          (entry.at === trace.entries[index - 1]!.at &&
++            entry.sequence > trace.entries[index - 1]!.sequence),
++      ) &&
++      (trace.firstCritical === null ||
++        (isFrozenEntry(trace.firstCritical) &&
++          trace.entries.includes(trace.firstCritical)))
++    );
++  } catch {
++    return false;
++  }
++}
+diff --git a/packages/player/src/mse.ts b/packages/player/src/mse.ts
+index a2d288581f2a7e8cf91172127e4285f63a13fc37..76f477ec2560e6977f18c1d3cfa08fbe53dee172 100644
+--- a/packages/player/src/mse.ts
++++ b/packages/player/src/mse.ts
+@@ -7,6 +7,12 @@
+  * and reading it, go through `seek` and `setCurrentTime` -- so the same buffer
+  * management runs whether MSE is on the page or in the worker.
+  */
++import {
++  lifecycleNow,
++  type LifecycleTraceDetail,
++  type MediaSourceClassName,
++  type MseLifecycleTrace,
++} from "./lifecycle.js";
+ import { QUEUE_HIGH_WATER_FRAGMENTS } from "./protocol.js";
+ 
+ /**
+@@ -128,7 +134,7 @@ export interface FragmentSink {
+   /** No more fragments: drain what is queued and end the stream. */
+   finish(): Promise<void>;
+   /** Give up, releasing anyone waiting on `ready` or `finish`. */
+-  close(): void;
++  close(reason?: string): void;
+ }
+ 
+ /** A latch a producer can await, so backpressure costs no polling. */
+@@ -191,6 +197,8 @@ export interface MseSinkOptions {
+    * The two bracket everything MSE does before playback can begin.
+    */
+   onMark?(name: "sourceopen" | "appended"): void;
++  /** A bounded-trace input, timestamped before it leaves this realm. */
++  onLifecycle?(trace: MseLifecycleTrace): void;
+   onError?(error: Error): void;
+ }
+ 
+@@ -224,6 +232,7 @@ export class MseSink implements FragmentSink {
+ 
+   /** The one the source was made from, and the one that answers for codecs. */
+   readonly #class: MediaSourceConstructor;
++  readonly #mediaSourceClass: MediaSourceClassName;
+   readonly #options: MseSinkOptions;
+   readonly #opened: Promise<void>;
+   #sourceBuffer: SourceBuffer | null = null;
+@@ -260,6 +269,10 @@ export class MseSink implements FragmentSink {
+   #currentTime = 0;
+   #closed = false;
+   #ending = false;
++  #sourceOpenCount = 0;
++  #sourceCloseCount = 0;
++  #lastSourceOpenAt: number | null = null;
++  #lastSourceCloseAt: number | null = null;
+   readonly #room = new ReadyGate();
+   #drained: (() => void)[] = [];
+ 
+@@ -270,6 +283,11 @@ export class MseSink implements FragmentSink {
+     this.#class = source;
+     this.mediaSource = new source();
+     this.managed = source === managedMediaSource;
++    this.#mediaSourceClass = this.managed
++      ? "ManagedMediaSource"
++      : "MediaSource";
++    this.mediaSource.addEventListener("sourceopen", this.#onSourceOpen);
++    this.mediaSource.addEventListener("sourceclose", this.#onSourceClose);
+     if (this.managed) {
+       this.mediaSource.addEventListener(
+         "startstreaming",
+@@ -287,6 +305,9 @@ export class MseSink implements FragmentSink {
+         { once: true },
+       );
+     });
++    this.#lifecycle("mse-created", {
++      preferManaged: options.preferManaged === true,
++    });
+   }
+ 
+   ready(): Promise<void> {
+@@ -303,12 +324,25 @@ export class MseSink implements FragmentSink {
+     await this.#opened;
+     if (this.#closed) return;
+     if (!this.#sourceBuffer) {
+-      const sourceBuffer = this.mediaSource.addSourceBuffer(mimeCodec);
+-      sourceBuffer.mode = "segments";
+-      sourceBuffer.addEventListener("updateend", this.#onUpdateEnd);
+-      sourceBuffer.addEventListener("error", this.#onSourceBufferError);
+-      this.#sourceBuffer = sourceBuffer;
+-      this.#mimeCodec = mimeCodec;
++      try {
++        this.#lifecycle("sourcebuffer-add-call", {
++          mimeCodec,
++        });
++        const sourceBuffer = this.mediaSource.addSourceBuffer(mimeCodec);
++        sourceBuffer.mode = "segments";
++        sourceBuffer.addEventListener("updatestart", this.#onUpdateStart);
++        sourceBuffer.addEventListener("update", this.#onUpdate);
++        sourceBuffer.addEventListener("updateend", this.#onUpdateEnd);
++        sourceBuffer.addEventListener("abort", this.#onSourceBufferAbort);
++        sourceBuffer.addEventListener("error", this.#onSourceBufferError);
++        this.#sourceBuffer = sourceBuffer;
++        this.#mimeCodec = mimeCodec;
++        this.#lifecycle("sourcebuffer-added", {
++          mimeCodec,
++        });
++      } catch (error) {
++        throw this.#error("add or configure SourceBuffer", error);
++      }
+     } else if (mimeCodec !== this.#mimeCodec) {
+       // Resuming elsewhere in the same file can turn up a different profile,
+       // and only changeType lets a SourceBuffer accept one. It cannot run
+@@ -348,6 +382,9 @@ export class MseSink implements FragmentSink {
+    */
+   reset(): void {
+     if (this.#closed) return;
++    this.#lifecycle("mse-reset", {
++      nextEpoch: this.#epoch + 1,
++    });
+     this.#epoch++;
+     this.#queue = [];
+     this.#queuedBytes = 0;
+@@ -365,6 +402,7 @@ export class MseSink implements FragmentSink {
+   }
+ 
+   async finish(): Promise<void> {
++    this.#lifecycle("mse-finish");
+     this.#ending = true;
+     // Nothing was ever opened, so there is nothing to drain and no stream to
+     // end -- an input we could make no track out of takes this path.
+@@ -377,12 +415,22 @@ export class MseSink implements FragmentSink {
+     // A seek during the drain releases this without the queue having emptied,
+     // and what follows is a stream that is not ending after all.
+     if (this.#closed || this.#epoch !== epoch) return;
+-    if (this.mediaSource.readyState === "open") this.mediaSource.endOfStream();
++    if (this.mediaSource.readyState === "open") {
++      try {
++        this.#lifecycle("mediasource-end-of-stream-call");
++        this.mediaSource.endOfStream();
++      } catch (error) {
++        throw this.#error("end MediaSource", error);
++      }
++    }
+   }
+ 
+-  close(): void {
++  close(reason = "close"): void {
+     if (this.#closed) return;
++    this.#lifecycle("mse-close", { reason });
+     this.#closed = true;
++    this.mediaSource.removeEventListener("sourceopen", this.#onSourceOpen);
++    this.mediaSource.removeEventListener("sourceclose", this.#onSourceClose);
+     if (this.managed) {
+       this.mediaSource.removeEventListener(
+         "startstreaming",
+@@ -393,7 +441,10 @@ export class MseSink implements FragmentSink {
+         this.#onEndStreaming,
+       );
+     }
++    this.#sourceBuffer?.removeEventListener("updatestart", this.#onUpdateStart);
++    this.#sourceBuffer?.removeEventListener("update", this.#onUpdate);
+     this.#sourceBuffer?.removeEventListener("updateend", this.#onUpdateEnd);
++    this.#sourceBuffer?.removeEventListener("abort", this.#onSourceBufferAbort);
+     this.#sourceBuffer?.removeEventListener("error", this.#onSourceBufferError);
+     this.#sourceBuffer = null;
+     this.#queue = [];
+@@ -432,11 +483,12 @@ export class MseSink implements FragmentSink {
+     if (this.#clearing) {
+       this.#operation = { type: "clear" };
+       try {
++        this.#lifecycle("sourcebuffer-clear-call");
+         sourceBuffer.remove(0, Number.POSITIVE_INFINITY);
+       } catch (error) {
+         this.#operation = null;
+         this.#clearing = false;
+-        this.#fail(error);
++        this.#fail("clear SourceBuffer", error);
+       }
+       return;
+     }
+@@ -450,15 +502,20 @@ export class MseSink implements FragmentSink {
+       const mimeCodec = this.#retype;
+       this.#retype = null;
+       try {
++        this.#lifecycle("sourcebuffer-change-type-call", { mimeCodec });
+         sourceBuffer.changeType(mimeCodec);
+         this.#mimeCodec = mimeCodec;
+       } catch (error) {
+-        this.#fail(error);
++        this.#fail("change SourceBuffer type", error);
+         return;
+       }
+     }
+     this.#operation = { type: "append", pending: next, epoch: this.#epoch };
+     try {
++      this.#lifecycle("sourcebuffer-append-call", {
++        appendBytes: next.data.byteLength,
++        initSegment: next.init,
++      });
+       sourceBuffer.appendBuffer(next.data);
+     } catch (error) {
+       this.#operation = null;
+@@ -467,17 +524,21 @@ export class MseSink implements FragmentSink {
+         error.name === "QuotaExceededError"
+       ) {
+         this.#quotaBlocked = true;
++        this.#lifecycle("sourcebuffer-quota-exceeded", {
++          appendBytes: next.data.byteLength,
++        });
+         this.#updateRoom();
+         this.#updateBlocked();
+         // Try at once rather than waiting for playback to raise an event: if
+         // the buffer ahead runs out first, nothing will raise one.
+         this.#evict();
+-      } else this.#fail(error);
++      } else this.#fail("append SourceBuffer", error);
+     }
+   }
+ 
+   #onUpdateEnd = (): void => {
+     const operation = this.#operation;
++    this.#lifecycle("sourcebuffer-updateend");
+     if (operation?.type === "append") {
+       if (
+         operation.epoch === this.#epoch &&
+@@ -500,12 +561,22 @@ export class MseSink implements FragmentSink {
+     this.#pump();
+   };
+ 
++  #onUpdateStart = (): void => {
++    this.#lifecycle("sourcebuffer-updatestart");
++  };
++
++  #onUpdate = (): void => {
++    this.#lifecycle("sourcebuffer-update");
++  };
++
+   /**
+    * The managed source asking for data again, which is the only thing that
+    * reopens the door `endstreaming` closed.
+    */
+   #onStartStreaming = (): void => {
++    const previousStreaming = this.#streaming;
+     this.#streaming = true;
++    this.#lifecycle("mediasource-startstreaming", { previousStreaming });
+     this.#updateRoom();
+     this.#updateBlocked();
+   };
+@@ -519,13 +590,45 @@ export class MseSink implements FragmentSink {
+    * knows what the radio and the battery are doing and the page does not.
+    */
+   #onEndStreaming = (): void => {
++    const previousStreaming = this.#streaming;
+     this.#streaming = false;
++    this.#lifecycle("mediasource-endstreaming", { previousStreaming });
+     this.#updateRoom();
+     this.#updateBlocked();
+   };
+ 
++  #onSourceBufferAbort = (): void => {
++    this.#lifecycle("sourcebuffer-abort", {}, true);
++  };
++
+   #onSourceBufferError = (): void => {
+-    this.#fail(new Error("the SourceBuffer rejected what was appended"));
++    this.#lifecycle("sourcebuffer-error", {}, true);
++    this.#fail(
++      "complete SourceBuffer update",
++      new Error("the SourceBuffer rejected what was appended"),
++    );
++  };
++
++  #onSourceOpen = (): void => {
++    this.#sourceOpenCount++;
++    this.#lastSourceOpenAt = lifecycleNow();
++    this.#lifecycle(
++      "mediasource-sourceopen",
++      {},
++      false,
++      this.#lastSourceOpenAt,
++    );
++  };
++
++  #onSourceClose = (): void => {
++    this.#sourceCloseCount++;
++    this.#lastSourceCloseAt = lifecycleNow();
++    this.#lifecycle(
++      "mediasource-sourceclose",
++      {},
++      !this.#closed,
++      this.#lastSourceCloseAt,
++    );
+   };
+ 
+   /**
+@@ -566,9 +669,11 @@ export class MseSink implements FragmentSink {
+       buffered && buffered.length > 0 ? buffered.end(buffered.length - 1) : 0;
+     this.#pendingDuration = null;
+     try {
+-      this.mediaSource.duration = Math.max(duration, end);
++      const appliedDuration = Math.max(duration, end);
++      this.#lifecycle("mediasource-set-duration-call", { appliedDuration });
++      this.mediaSource.duration = appliedDuration;
+     } catch (error) {
+-      this.#fail(error);
++      this.#fail("set MediaSource duration", error);
+     }
+   }
+ 
+@@ -614,7 +719,13 @@ export class MseSink implements FragmentSink {
+       this.#randomAccessPoints.shift();
+     }
+     this.#operation = { type: "remove" };
+-    sourceBuffer.remove(0, removeEnd);
++    try {
++      this.#lifecycle("sourcebuffer-remove-call", { removeEnd });
++      sourceBuffer.remove(0, removeEnd);
++    } catch (error) {
++      this.#operation = null;
++      this.#fail("evict SourceBuffer range", error);
++    }
+   }
+ 
+   /** How far past the playhead the buffer reaches, in seconds. */
+@@ -655,9 +766,82 @@ export class MseSink implements FragmentSink {
+     for (const resolve of waiting) resolve();
+   }
+ 
+-  #fail(error: unknown): void {
+-    this.#options.onError?.(
+-      error instanceof Error ? error : new Error(String(error)),
++  #stateDetail(): LifecycleTraceDetail {
++    const operation = this.#operation;
++    return {
++      mediaSourceReadyState: this.mediaSource.readyState,
++      sinkClosed: this.#closed,
++      sourceOpenCount: this.#sourceOpenCount,
++      sourceCloseCount: this.#sourceCloseCount,
++      sourceBufferPresent: this.#sourceBuffer !== null,
++      sourceBufferUpdating: this.#sourceBuffer?.updating ?? false,
++      operation: operation?.type ?? "none",
++      operationEpoch: operation?.type === "append" ? operation.epoch : null,
++      queueLength: this.#queue.length,
++      queuedBytes: this.#queuedBytes,
++      epoch: this.#epoch,
++      streaming: this.#streaming,
++      clearing: this.#clearing,
++      quotaBlocked: this.#quotaBlocked,
++      ending: this.#ending,
++    };
++  }
++
++  #lifecycle(
++    event: string,
++    detail: LifecycleTraceDetail = {},
++    critical = false,
++    at = lifecycleNow(),
++  ): void {
++    const trace = Object.freeze({
++      at,
++      event,
++      mediaSourceClass: this.#mediaSourceClass,
++      detail: Object.freeze({ ...this.#stateDetail(), ...detail }),
++      critical,
++    });
++    try {
++      this.#options.onLifecycle?.(trace);
++    } catch {
++      // A diagnostic observer cannot become a new playback failure.
++    }
++  }
++
++  #error(operation: string, error: unknown): Error {
++    const cause = error instanceof Error ? error : new Error(String(error));
++    const sourceBuffer = this.#sourceBuffer;
++    const at = lifecycleNow();
++    this.#lifecycle(
++      "mse-error",
++      {
++        failedOperation: operation,
++        errorName: cause.name,
++      },
++      true,
++      at,
++    );
++    const detail = [
++      `mediaSource=${this.mediaSource.readyState}`,
++      `closed=${this.#closed}`,
++      `sourceOpens=${this.#sourceOpenCount}`,
++      `sourceCloses=${this.#sourceCloseCount}`,
++      `sinceSourceOpenMs=${this.#lastSourceOpenAt === null ? "none" : Math.round(at - this.#lastSourceOpenAt)}`,
++      `sinceSourceCloseMs=${this.#lastSourceCloseAt === null ? "none" : Math.round(at - this.#lastSourceCloseAt)}`,
++      `sourceBuffer=${sourceBuffer ? "present" : "absent"}`,
++      `updating=${sourceBuffer?.updating ?? false}`,
++      `operation=${this.#operation?.type ?? "none"}`,
++      `queue=${this.#queue.length}`,
++      `epoch=${this.#epoch}`,
++    ].join(", ");
++    const contextual = new Error(
++      `MSE ${operation} failed (${detail}): ${cause.name}: ${cause.message}`,
+     );
++    contextual.name = cause.name;
++    contextual.stack += `\nCaused by: ${cause.stack ?? cause.message}`;
++    return contextual;
++  }
++
++  #fail(operation: string, error: unknown): void {
++    this.#options.onError?.(this.#error(operation, error));
+   }
+ }
+diff --git a/packages/player/src/player.ts b/packages/player/src/player.ts
+index 54e3b085c2fbd97d45d045fb86bee379cb9814df..995d1342f54694dc05685043d74fba0e2fe7ab39 100644
+--- a/packages/player/src/player.ts
++++ b/packages/player/src/player.ts
+@@ -13,6 +13,19 @@ import {
+   mediaSourceSupports,
+   MseSink,
+ } from "./mse.js";
++import {
++  LifecycleTrace,
++  lifecycleNow,
++  readErrorName,
++  sanitizeDiagnosticLifecycleInput,
++  withLifecycleTrace,
++  type DiagnosticLifecycleToken,
++  type LifecycleTraceDetail,
++  type LifecycleTraceEntry,
++  type LifecycleTraceScope,
++  type MediaSourceClassName,
++  type MseLifecycleTrace,
++} from "./lifecycle.js";
+ import {
+   DEFAULT_KEEP_BEHIND_SECONDS,
+   DEFAULT_MAX_AHEAD_SECONDS,
+@@ -63,6 +76,41 @@ const TIMED_EVENTS: TimingMark[] = [
+   "waiting",
+ ];
+ 
++const VIDEO_LIFECYCLE_EVENTS = [
++  "loadstart",
++  "emptied",
++  "abort",
++  "error",
++] as const;
++
++let nextPlayerInstance = 0;
++let nextVideoId = 0;
++const videoIds = new WeakMap<HTMLVideoElement, number>();
++
++/**
++ * One page-side chronology spans replacement player instances.
++ *
++ * DPlayer briefly owns an old and a replacement video during a quality
++ * switch. Keeping the journal at module scope is what lets one fatal snapshot
++ * retain the old instance's teardown and the new instance's attachment.
++ */
++let lifecycleJournal = new LifecycleTrace();
++const diagnosticLifecycleTokens = new WeakMap<
++  DiagnosticLifecycleToken,
++  {
++    readonly journal: LifecycleTrace;
++    readonly entry: LifecycleTraceEntry;
++  }
++>();
++
++function lifecycleVideoId(video: HTMLVideoElement): number {
++  const known = videoIds.get(video);
++  if (known !== undefined) return known;
++  const assigned = ++nextVideoId;
++  videoIds.set(video, assigned);
++  return assigned;
++}
++
+ /** A replaceable deinterlacer controlled by the source picture timeline. */
+ export interface PlayerDeinterlacer {
+   readonly running: boolean;
+@@ -217,6 +265,19 @@ export interface Mpeg2TsPlayerEventMap {
+   error: CustomEvent<{ error: Error }>;
+ }
+ 
++export interface DiagnosticLifecycleOptions {
++  /** Timestamp already taken with `performance.timeOrigin + performance.now()`. */
++  readonly at?: number;
++  /** Retain this as the first possible cause even after the ring rotates. */
++  readonly critical?: boolean;
++}
++
++interface LifecycleRecordOptions extends DiagnosticLifecycleOptions {
++  readonly scope?: LifecycleTraceScope;
++  readonly generation?: number;
++  readonly mediaSourceClass?: MediaSourceClassName;
++}
++
+ /**
+  * Whether a worker can own the MediaSource.
+  *
+@@ -257,11 +318,6 @@ function toError(error: unknown): Error {
+   return error instanceof Error ? error : new Error(String(error));
+ }
+ 
+-/** The one clock reading the page and the worker both understand. */
+-function now(): number {
+-  return performance.timeOrigin + performance.now();
+-}
+-
+ /**
+  * Plays an MPEG-2 transport stream in a `<video>` by converting it to H.264.
+  *
+@@ -287,6 +343,8 @@ export class Mpeg2TsPlayer extends EventTarget {
+ 
+   readonly #options: Mpeg2TsPlayerOptions;
+   readonly #sinkKind: SinkKind;
++  readonly #instance = ++nextPlayerInstance;
++  readonly #videoId: number;
+   #worker: Worker | null = null;
+   /** Which load messages belong to. Bumped by every load and every stop. */
+   #generation = 0;
+@@ -294,6 +352,7 @@ export class Mpeg2TsPlayer extends EventTarget {
+   /** The sink, when the page owns the MediaSource. */
+   #sink: MseSink | null = null;
+   #objectUrl: string | null = null;
++  #mediaSourceClass: MediaSourceClassName | null = null;
+   /** The `<source>` child a Managed Media Source needs; see #attachManaged. */
+   #source: HTMLSourceElement | null = null;
+   /** Whether remote playback was turned off here, and so is ours to turn back. */
+@@ -316,10 +375,12 @@ export class Mpeg2TsPlayer extends EventTarget {
+   /** Whether deinterlacing was asked for. */
+   #wanted = false;
+   #destroyed = false;
++  #failureSequence = 0;
+ 
+   constructor(video: HTMLVideoElement, options: Mpeg2TsPlayerOptions = {}) {
+     super();
+     this.video = video;
++    this.#videoId = lifecycleVideoId(video);
+     this.#options = options;
+     const preference = options.mediaSource ?? "auto";
+     this.#sinkKind =
+@@ -331,6 +392,11 @@ export class Mpeg2TsPlayer extends EventTarget {
+     this.video.addEventListener("seeking", this.#onSeeking);
+     for (const name of TIMED_EVENTS)
+       this.video.addEventListener(name, this.#onTimedEvent);
++    for (const name of VIDEO_LIFECYCLE_EVENTS)
++      this.video.addEventListener(name, this.#onVideoLifecycle);
++    this.#recordLifecycle("player-created", {
++      requestedMediaSource: preference,
++    });
+     if (options.deinterlace) this.deinterlace = true;
+   }
+ 
+@@ -399,6 +465,58 @@ export class Mpeg2TsPlayer extends EventTarget {
+     return this.#sinkKind;
+   }
+ 
++  /** The constructor actually opened for this load, once MSE exists. */
++  get mediaSourceClass(): MediaSourceClassName | null {
++    return this.#mediaSourceClass;
++  }
++
++  /**
++   * Add a page-owner event to the diagnostic chronology.
++   *
++   * `at` must use `performance.timeOrigin + performance.now()` so it can be
++   * ordered beside worker events. Details are primitives by contract, which
++   * keeps the fatal snapshot cloneable and serializable. A malformed event,
++   * timestamp, detail, or options object is ignored without affecting playback.
++   */
++  recordDiagnosticLifecycle(
++    event: string,
++    detail: LifecycleTraceDetail = {},
++    options: DiagnosticLifecycleOptions = {},
++  ): DiagnosticLifecycleToken | null {
++    try {
++      const input = sanitizeDiagnosticLifecycleInput(event, detail, options);
++      if (input === null) return null;
++      const journal = lifecycleJournal;
++      const criticalEntry = this.#recordLifecycle(input.event, input.detail, {
++        at: input.at,
++        critical: input.critical,
++        scope: "external",
++      });
++      if (criticalEntry === null) return null;
++      const token = Object.freeze({}) as DiagnosticLifecycleToken;
++      diagnosticLifecycleTokens.set(token, { journal, entry: criticalEntry });
++      return token;
++    } catch {
++      // This integration-only hook must never interrupt the caller's workflow.
++      return null;
++    }
++  }
++
++  /**
++   * Release one integration-owned critical entry after its causal operation
++   * succeeds. Only the opaque token returned for that exact entry can do so.
++   */
++  resolveDiagnosticLifecycle(token: DiagnosticLifecycleToken): void {
++    try {
++      const retained = diagnosticLifecycleTokens.get(token);
++      if (retained === undefined) return;
++      diagnosticLifecycleTokens.delete(token);
++      retained.journal.resolveCritical(retained.entry);
++    } catch {
++      // As above, malformed integration input remains diagnostic-only.
++    }
++  }
++
+   /**
+    * Whether the picture is being deinterlaced, which is not quite the same as
+    * having asked for it: a source that says it is progressive is left alone,
+@@ -517,12 +635,16 @@ export class Mpeg2TsPlayer extends EventTarget {
+     }
+     this.stop();
+     const id = this.#generation;
++    this.#mediaSourceClass = null;
++    this.#recordLifecycle("player-load", {
++      passthrough: this.#options.passthrough === true,
++    });
+     this.#duration = null;
+     // Nothing is known about this source yet, so it gets whatever was asked
+     // for until its first fragment says what it is.
+     this.#clearVideoTimeline();
+     this.#applyDeinterlace();
+-    this.#loadedAt = now();
++    this.#loadedAt = lifecycleNow();
+     this.#markedAt = this.#loadedAt;
+     const worker = this.#ensureWorker();
+     const promise = new Promise<void>((resolve, reject) => {
+@@ -560,9 +682,10 @@ export class Mpeg2TsPlayer extends EventTarget {
+   /** Abandon the current load. The player stays usable. */
+   stop(): void {
+     const id = this.#generation;
++    this.#recordLifecycle("player-stop", { stoppedGeneration: id });
+     this.#generation++;
+     this.#worker?.postMessage({ type: "stop", id } satisfies Command);
+-    this.#teardown();
++    this.#teardown("stop", id);
+     this.#settle(new Error("the load was stopped"));
+     this.#setState("idle");
+   }
+@@ -575,9 +698,14 @@ export class Mpeg2TsPlayer extends EventTarget {
+     this.video.removeEventListener("seeking", this.#onSeeking);
+     for (const name of TIMED_EVENTS)
+       this.video.removeEventListener(name, this.#onTimedEvent);
++    for (const name of VIDEO_LIFECYCLE_EVENTS)
++      this.video.removeEventListener(name, this.#onVideoLifecycle);
+     this.#deinterlacer?.destroy();
+     this.#deinterlacer = null;
+-    this.#worker?.terminate();
++    if (this.#worker) {
++      this.#recordLifecycle("worker-terminate-call", { reason: "destroy" });
++      this.#worker.terminate();
++    }
+     this.#worker = null;
+   }
+ 
+@@ -626,15 +754,34 @@ export class Mpeg2TsPlayer extends EventTarget {
+         },
+       );
+       worker.onmessage = this.#onMessage;
+-      worker.onerror = (event) =>
++      worker.onerror = (event) => {
++        const at = lifecycleNow();
++        this.#recordLifecycle(
++          "worker-onerror",
++          {
++            messagePresent: event.message.length > 0,
++            line: event.lineno,
++            column: event.colno,
++          },
++          { at, critical: true },
++        );
+         this.#fail(new Error(event.message || "the worker failed"));
++      };
+       this.#worker = worker;
++      this.#recordLifecycle("worker-created");
+     }
+     return this.#worker;
+   }
+ 
+   #onMessage = (event: MessageEvent<Notification>): void => {
+     const notification = event.data;
++    // Teardown lifecycle messages are diagnostic-only and can arrive after
++    // stop() advances the accepted playback generation. Keep their own exact
++    // generation without admitting any other stale notification type.
++    if (notification.type === "lifecycle") {
++      this.#recordMseLifecycle(notification.trace, "worker", notification.id);
++      return;
++    }
+     if (notification.id !== this.#generation) return;
+     switch (notification.type) {
+       case "handle":
+@@ -642,11 +789,18 @@ export class Mpeg2TsPlayer extends EventTarget {
+         // #attachManaged uses is not on offer here; what a managed source
+         // still needs is the element to have given up remote playback.
+         if (notification.managed) this.#disableRemotePlayback();
++        this.#mediaSourceClass = notification.managed
++          ? "ManagedMediaSource"
++          : "MediaSource";
+         // MediaProvider was last widened before MSE in Workers shipped, so it
+         // still does not list MediaSourceHandle. This assignment is the entire
+         // point of the handle.
++        this.#recordLifecycle("video-source-attach-call", {
++          attachment: "srcObject",
++          reason: "worker-media-source-handle",
++        });
+         this.video.srcObject = notification.handle as unknown as MediaProvider;
+-        this.#mark("attached", now());
++        this.#mark("attached", lifecycleNow());
+         break;
+       case "open":
+         this.#openSink(notification.mimeCodec, notification.data);
+@@ -727,6 +881,11 @@ export class Mpeg2TsPlayer extends EventTarget {
+         if (this.#sinkKind === "worker") this.#stopPlayhead();
+         break;
+       case "error":
++        this.#recordLifecycle(
++          "worker-error",
++          { messagePresent: notification.message.length > 0 },
++          { at: notification.at, critical: true, scope: "worker" },
++        );
+         this.#fail(new Error(notification.message));
+         break;
+     }
+@@ -756,7 +915,8 @@ export class Mpeg2TsPlayer extends EventTarget {
+           .ready()
+           .then(() => this.#report(id, { type: "flow", id, ready: true })),
+       (error: unknown) => {
+-        if (id === this.#generation) this.#fail(toError(error));
++        if (id === this.#generation)
++          this.#fail(this.#withMseAttachmentContext(toError(error)));
+       },
+     );
+   }
+@@ -773,21 +933,35 @@ export class Mpeg2TsPlayer extends EventTarget {
+       seek: (time) => {
+         if (this.video.currentTime < time) this.video.currentTime = time;
+       },
+-      onMark: (name) => this.#mark(name, now()),
++      onMark: (name) => this.#mark(name, lifecycleNow()),
++      onLifecycle: (trace) => this.#recordMseLifecycle(trace, "main", id),
+       onReadyChange: (ready) => this.#report(id, { type: "flow", id, ready }),
+       onBlocked: (blocked) => {
+         if (id === this.#generation)
+           this.#setState(blocked ? "buffer-full" : "converting");
+       },
+       onError: (error) => {
+-        if (id === this.#generation) this.#fail(error);
++        if (id === this.#generation)
++          this.#fail(this.#withMseAttachmentContext(error));
+       },
+     });
+     this.#sink = sink;
+     this.#objectUrl = URL.createObjectURL(sink.mediaSource);
++    this.#recordLifecycle(
++      "object-url-created",
++      { reason: "main-media-source" },
++      { generation: id },
++    );
+     if (sink.managed) this.#attachManaged(this.#objectUrl);
+-    else this.video.src = this.#objectUrl;
+-    this.#mark("attached", now());
++    else {
++      this.#recordLifecycle(
++        "video-source-attach-call",
++        { attachment: "src", reason: "main-media-source" },
++        { generation: id },
++      );
++      this.video.src = this.#objectUrl;
++    }
++    this.#mark("attached", lifecycleNow());
+     if (this.#duration !== null) sink.setDuration(this.#duration);
+     return sink;
+   }
+@@ -802,15 +976,26 @@ export class Mpeg2TsPlayer extends EventTarget {
+    * arrives and the load waits for a stream that has not begun.
+    */
+   #attachManaged(url: string): void {
++    this.#recordLifecycle("video-source-detach-call", {
++      attachment: "src",
++      hadAttachment: this.video.hasAttribute("src"),
++      reason: "managed-media-source-attach",
++    });
+     this.video.removeAttribute("src");
+     this.#disableRemotePlayback();
+     const source = document.createElement("source");
+     source.type = "video/mp4";
+     source.src = url;
++    this.#recordLifecycle("source-element-attach-call", {
++      reason: "managed-media-source-attach",
++    });
+     this.video.append(source);
+     this.#source = source;
+     // A source child is not a src: nothing is loaded until the element is told
+     // to look at what it has been given.
++    this.#recordLifecycle("video-load-call", {
++      reason: "managed-media-source-attach",
++    });
+     this.video.load();
+   }
+ 
+@@ -867,10 +1052,32 @@ export class Mpeg2TsPlayer extends EventTarget {
+ 
+   #onTimedEvent = (event: Event): void => {
+     if (this.#state === "idle") return;
+-    this.#mark(event.type as TimingMark, now());
++    this.#mark(event.type as TimingMark, lifecycleNow());
+     if (event.type === "waiting") this.#crossGap();
+   };
+ 
++  #onVideoLifecycle = (event: Event): void => {
++    this.#recordLifecycle(
++      `video-${event.type}`,
++      this.#videoState(event.currentTarget === this.video),
++      { critical: event.type === "error" && this.video.error !== null },
++    );
++  };
++
++  #videoState(currentVideo: boolean): LifecycleTraceDetail {
++    return {
++      mediaErrorCode: this.video.error?.code ?? null,
++      readyState: this.video.readyState,
++      networkState: this.video.networkState,
++      currentVideo,
++      videoConnected: this.video.isConnected,
++      videoPaused: this.video.paused,
++      srcAttributePresent: this.video.hasAttribute("src"),
++      srcObjectPresent: this.video.srcObject !== null,
++      sourceElementPresent: this.#source !== null,
++    };
++  }
++
+   /**
+    * Move the playhead over a hole in the media, where playback has stopped at
+    * one.
+@@ -927,6 +1134,41 @@ export class Mpeg2TsPlayer extends EventTarget {
+     this.#emit("timing", { name, sinceLoad, sincePrevious });
+   }
+ 
++  #recordMseLifecycle(
++    trace: MseLifecycleTrace,
++    scope: Extract<LifecycleTraceScope, "main" | "worker">,
++    generation = this.#generation,
++  ): void {
++    if (generation === this.#generation)
++      this.#mediaSourceClass = trace.mediaSourceClass;
++    this.#recordLifecycle(trace.event, trace.detail, {
++      at: trace.at,
++      critical: trace.critical,
++      scope,
++      generation,
++      mediaSourceClass: trace.mediaSourceClass,
++    });
++  }
++
++  #recordLifecycle(
++    event: string,
++    detail: LifecycleTraceDetail = {},
++    options: LifecycleRecordOptions = {},
++  ): LifecycleTraceEntry | null {
++    return lifecycleJournal.record({
++      at: options.at ?? lifecycleNow(),
++      scope: options.scope ?? "main",
++      event,
++      playerInstance: this.#instance,
++      generation: options.generation ?? this.#generation,
++      videoId: this.#videoId,
++      mediaSourceOwner: this.#sinkKind,
++      mediaSourceClass: options.mediaSourceClass ?? this.#mediaSourceClass,
++      detail,
++      critical: options.critical,
++    });
++  }
++
+   #isBuffered(time: number): boolean {
+     const buffered = this.video.buffered;
+     for (let index = 0; index < buffered.length; index++) {
+@@ -970,29 +1212,85 @@ export class Mpeg2TsPlayer extends EventTarget {
+     this.#playhead = null;
+   }
+ 
+-  #teardown(): void {
++  #teardown(reason: string, generation = this.#generation): void {
++    const record = (event: string, detail: LifecycleTraceDetail) =>
++      this.#recordLifecycle(event, detail, { generation });
++    record("player-teardown", { reason });
+     this.#stopPlayhead();
+     this.#clearVideoTimeline();
+-    this.#sink?.close();
++    this.#sink?.close(reason);
+     this.#sink = null;
+-    if (this.#objectUrl) URL.revokeObjectURL(this.#objectUrl);
++    if (this.#objectUrl) {
++      record("object-url-revoke-call", { reason });
++      URL.revokeObjectURL(this.#objectUrl);
++    }
+     this.#objectUrl = null;
+-    this.#source?.remove();
++    if (this.#source) {
++      record("source-element-detach-call", { reason });
++      this.#source.remove();
++    }
+     this.#source = null;
+     if (this.#disabledRemotePlayback) {
+       this.video.disableRemotePlayback = false;
+       this.#disabledRemotePlayback = false;
+     }
++    record("video-source-detach-call", {
++      attachment: "src",
++      hadAttachment: this.video.hasAttribute("src"),
++      reason,
++    });
+     this.video.removeAttribute("src");
++    record("video-source-detach-call", {
++      attachment: "srcObject",
++      hadAttachment: this.video.srcObject !== null,
++      reason,
++    });
+     this.video.srcObject = null;
++    record("video-load-call", { reason });
+     this.video.load();
++    this.#mediaSourceClass = null;
+   }
+ 
+   #fail(error: Error): void {
+-    this.#teardown();
++    const at = lifecycleNow();
++    this.#recordLifecycle(
++      "player-fail",
++      { ...this.#videoState(true), errorName: readErrorName(error) },
++      { at, critical: true },
++    );
++    const eventId = [
++      "m2h",
++      Math.trunc(at * 1000).toString(36),
++      this.#instance.toString(36),
++      this.#generation.toString(36),
++      (++this.#failureSequence).toString(36),
++    ].join("-");
++    const snapshot = lifecycleJournal.freeze(eventId, at);
++    lifecycleJournal = new LifecycleTrace();
++    const tracedError = withLifecycleTrace(error, snapshot);
++    this.#teardown("fail");
+     this.#setState("error");
+-    this.#settle(error);
+-    this.#emit("error", { error });
++    this.#settle(tracedError);
++    this.#emit("error", { error: tracedError });
++  }
++
++  #withMseAttachmentContext(error: Error): Error {
++    const source = this.#source;
++    const objectUrl = this.#objectUrl;
++    const detail = [
++      `videoConnected=${this.video.isConnected}`,
++      `videoReadyState=${this.video.readyState}`,
++      `videoNetworkState=${this.video.networkState}`,
++      `videoPaused=${this.video.paused}`,
++      `sourceElement=${source ? "present" : "absent"}`,
++      `sourceConnected=${source?.isConnected ?? false}`,
++      `sourceMatchesObjectUrl=${source !== null && objectUrl !== null && source.src === objectUrl}`,
++      `currentSrcMatchesObjectUrl=${objectUrl !== null && this.video.currentSrc === objectUrl}`,
++    ].join(", ");
++    const contextual = new Error(`${error.message} (${detail})`);
++    contextual.name = error.name;
++    contextual.stack += `\nCaused by: ${error.stack ?? error.message}`;
++    return contextual;
+   }
+ 
+   #settle(error: Error | null): void {
+diff --git a/packages/player/src/protocol.ts b/packages/player/src/protocol.ts
+index 5ae9b88f56c8adf43cedcb441338f84bdaf3cd27..d780160e7ca551b6a95bbce98d52fe0dd8004109 100644
+--- a/packages/player/src/protocol.ts
++++ b/packages/player/src/protocol.ts
+@@ -6,6 +6,8 @@
+  * on, which is how a `load()` over a running conversion leaves no stragglers.
+  */
+ 
++import type { MseLifecycleTrace } from "./lifecycle.js";
++
+ /** Stop handing fragments to the sink above this many bytes waiting to append. */
+ export const DEFAULT_QUEUE_HIGH_WATER_MARK = 32 * 1024 * 1024;
+ 
+@@ -288,13 +290,21 @@ export type Notification =
+   | { type: "private_stream_1"; id: number; stream: PrivateStream }
+   | { type: "private_stream_2"; id: number; stream: PrivateStream }
+   | { type: "stats"; id: number; stats: Stats }
++  /** A MediaSource lifecycle event, timestamped on the shared page/worker clock. */
++  | { type: "lifecycle"; id: number; trace: MseLifecycleTrace }
+   /** The MSE buffer filled up, or made room again. Worker-sink loads only. */
+   | { type: "blocked"; id: number; blocked: boolean }
+   /** No more fragments are coming. Main-sink loads only. */
+   | { type: "finish"; id: number }
+   /** The whole input has been converted. */
+   | { type: "completed"; id: number }
+-  | { type: "error"; id: number; message: string };
++  | {
++      type: "error";
++      id: number;
++      message: string;
++      /** Failure time on the clock shared with page-side lifecycle entries. */
++      at: number;
++    };
+ 
+ /**
+  * The steps of getting from a URL to a picture, in the order they happen.
+diff --git a/packages/player/src/worker.ts b/packages/player/src/worker.ts
+index d6463a0e63b9e52154c2bef76f49d2bf05075951..152de2356247f155d8830ccb8554d043bed62560 100644
+--- a/packages/player/src/worker.ts
++++ b/packages/player/src/worker.ts
+@@ -12,6 +12,7 @@
+  * where the viewer asked to be. See `Playback`.
+  */
+ import { MseSink, ReadyGate, type FragmentSink } from "./mse.js";
++import { lifecycleNow } from "./lifecycle.js";
+ import {
+   SEEK_LEAD_SECONDS,
+   SEEK_PROBE_ATTEMPTS,
+@@ -95,7 +96,7 @@ function mark(id: number, name: TimingMark): void {
+     type: "mark",
+     id,
+     name,
+-    at: performance.timeOrigin + performance.now(),
++    at: lifecycleNow(),
+   });
+ }
+ 
+@@ -200,7 +201,9 @@ function createWorkerSink(command: LoadCommand): MseSink {
+     seek: (time) => post({ type: "seek", id, time }),
+     onMark: (name) => mark(id, name),
+     onBlocked: (blocked) => post({ type: "blocked", id, blocked }),
+-    onError: (error) => post({ type: "error", id, message: error.message }),
++    onLifecycle: (trace) => post({ type: "lifecycle", id, trace }),
++    onError: (error) =>
++      post({ type: "error", id, message: error.message, at: lifecycleNow() }),
+   });
+   const handle = created.mediaSource.handle;
+   post({ type: "handle", id, handle, managed: created.managed }, [handle]);
+@@ -443,7 +446,7 @@ class Playback {
+   }
+ 
+   /** Drop everything this load holds. */
+-  stop(): void {
++  stop(reason = "stop"): void {
+     this.#life.abort();
+     this.#leg?.abort();
+     this.#leg = null;
+@@ -453,7 +456,7 @@ class Playback {
+     this.#pool?.terminate();
+     this.#pool = null;
+     this.#private = [];
+-    this.#sink.close();
++    this.#sink.close(reason);
+   }
+ 
+   /**
+@@ -590,8 +593,13 @@ class Playback {
+       await this.#convert(leg, source, converter);
+     } catch (error) {
+       if (!this.#running(leg) || signal.aborted) return;
+-      post({ type: "error", id: this.#command.id, message: describe(error) });
+-      abandon();
++      post({
++        type: "error",
++        id: this.#command.id,
++        message: describe(error),
++        at: lifecycleNow(),
++      });
++      abandon("playback-error");
+     }
+   }
+ 
+@@ -924,14 +932,14 @@ function describeStreams(streams: AudioStream[]): string {
+ }
+ 
+ /** Drop whatever the current load is holding. */
+-function abandon(): void {
++function abandon(reason: string): void {
++  playback?.stop(reason);
+   current = -1;
+-  playback?.stop();
+   playback = null;
+ }
+ 
+ function load(command: LoadCommand): void {
+-  abandon();
++  abandon("superseded-by-load");
+   current = command.id;
+   mark(command.id, "load");
+   const started = new Playback(command);
+@@ -948,7 +956,7 @@ self.onmessage = (event: MessageEvent<Command>) => {
+   if (command.id !== current) return;
+   switch (command.type) {
+     case "stop":
+-      abandon();
++      abandon("stop-command");
+       break;
+     case "time":
+       playback?.setCurrentTime(command.currentTime);
+diff --git a/tools/test-lifecycle-trace.mjs b/tools/test-lifecycle-trace.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ec580ea385eb7e8d0afb2ba4074e7dee5bb340bc
+--- /dev/null
++++ b/tools/test-lifecycle-trace.mjs
+@@ -0,0 +1,500 @@
++import assert from "node:assert/strict";
++import { readFile, unlink } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { pathToFileURL } from "node:url";
++
++import { build } from "esbuild";
++
++const output = join(tmpdir(), `mpeg2toh264-lifecycle-test-${process.pid}.mjs`);
++
++function entry(at, event, critical = false) {
++  return {
++    at,
++    scope: "main",
++    event,
++    playerInstance: 7,
++    generation: 11,
++    videoId: 13,
++    mediaSourceOwner: "main",
++    mediaSourceClass: "ManagedMediaSource",
++    detail: { operation: "append", epoch: 3 },
++    critical,
++  };
++}
++
++try {
++  await build({
++    entryPoints: ["packages/player/src/lifecycle.ts"],
++    outfile: output,
++    bundle: true,
++    format: "esm",
++    platform: "browser",
++  });
++  const {
++    LifecycleTrace,
++    LIFECYCLE_EVENT_ID_MAX_LENGTH,
++    LIFECYCLE_TRACE_CAPACITY,
++    isLifecycleError,
++    lifecycleNow,
++    readErrorName,
++    sanitizeDiagnosticLifecycleInput,
++    sanitizeLifecycleDetail,
++    withLifecycleTrace,
++  } = await import(pathToFileURL(output));
++  assert.equal(LIFECYCLE_EVENT_ID_MAX_LENGTH, 51);
++  assert.equal(LIFECYCLE_TRACE_CAPACITY, 48);
++
++  for (const capacity of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
++    assert.throws(() => new LifecycleTrace(capacity), RangeError);
++  }
++
++  const trace = new LifecycleTrace(4);
++  trace.record(entry(30, "recent-a"));
++  trace.record(entry(10, "first-cause", true));
++  trace.record(entry(20, "recent-b"));
++  trace.record(entry(40, "recent-c"));
++  trace.record(entry(50, "recent-d"));
++  const snapshot = trace.freeze("m2h-abc-7-b-1", 60);
++
++  assert.equal(snapshot.dropped, 1);
++  assert.equal(snapshot.firstCritical.event, "first-cause");
++  assert.deepEqual(
++    snapshot.entries.map(({ event }) => event),
++    ["first-cause", "recent-b", "recent-c", "recent-d"],
++  );
++  assert.equal(trace.freeze("ignored", 100), snapshot);
++  trace.record(entry(70, "after-freeze"));
++  assert.equal(
++    snapshot.entries.some(({ event }) => event === "after-freeze"),
++    false,
++  );
++
++  assert.equal(Object.isFrozen(snapshot), true);
++  assert.equal(Object.isFrozen(snapshot.entries), true);
++  for (const frozenEntry of snapshot.entries) {
++    assert.equal(Object.isFrozen(frozenEntry), true);
++    assert.equal(Object.isFrozen(frozenEntry.detail), true);
++  }
++  assert.throws(() => {
++    snapshot.entries[0].detail.epoch = 99;
++  }, TypeError);
++  assert.throws(() => snapshot.entries.push(entry(80, "mutate")), TypeError);
++
++  const serialized = JSON.stringify(snapshot);
++  const parsed = JSON.parse(serialized);
++  assert.equal(parsed.eventId, "m2h-abc-7-b-1");
++  assert.deepEqual(
++    parsed.entries.map(({ at }) => at),
++    [10, 20, 40, 50],
++  );
++
++  const tied = new LifecycleTrace(2);
++  tied.record(entry(5, "tie-first"));
++  tied.record(entry(5, "tie-second"));
++  assert.deepEqual(
++    tied.freeze("tied", 6).entries.map(({ event }) => event),
++    ["tie-first", "tie-second"],
++  );
++
++  const one = new LifecycleTrace(1);
++  one.record(entry(1, "before"));
++  one.record(entry(2, "only-cause", true));
++  one.record(entry(3, "after"));
++  assert.deepEqual(
++    one.freeze("one", 4).entries.map(({ event }) => event),
++    ["only-cause"],
++  );
++
++  const resolved = new LifecycleTrace(4);
++  resolved.record(entry(0, "before-first-switch"));
++  const firstSwitch = resolved.record({
++    ...entry(1, "dplayer-quality-switch-start", true),
++    detail: { qualitySwitchGeneration: 1 },
++  });
++  assert.notEqual(firstSwitch, null);
++  resolved.record(entry(2, "dplayer-quality-switch-end"));
++  assert.equal(resolved.resolveCritical({ ...firstSwitch }), false);
++  assert.equal(resolved.resolveCritical(firstSwitch), true);
++  const secondSwitch = resolved.record({
++    ...entry(3, "dplayer-quality-switch-start", true),
++    detail: { qualitySwitchGeneration: 2 },
++  });
++  assert.notEqual(secondSwitch, null);
++  resolved.record(entry(4, "failure"));
++  resolved.record(entry(4.5, "after-failure"));
++  const resolvedSnapshot = resolved.freeze("m2h-def-7-b-1", 5);
++  assert.equal(
++    resolvedSnapshot.firstCritical.detail.qualitySwitchGeneration,
++    2,
++  );
++  assert.equal(
++    resolvedSnapshot.entries.some(
++      ({ detail }) => detail.qualitySwitchGeneration === 1,
++    ),
++    false,
++  );
++  assert.deepEqual(
++    resolvedSnapshot.entries.map(({ event }) => event),
++    [
++      "dplayer-quality-switch-end",
++      "dplayer-quality-switch-start",
++      "failure",
++      "after-failure",
++    ],
++  );
++
++  const promoted = new LifecycleTrace(3);
++  const resolvedTrigger = promoted.record(entry(1, "resolved-trigger", true));
++  promoted.record(entry(2, "independent-error", true));
++  assert.equal(promoted.resolveCritical(resolvedTrigger), true);
++  assert.equal(
++    promoted.freeze("m2h-ghi-7-b-1", 3).firstCritical.event,
++    "independent-error",
++  );
++
++  const original = new Error("original failure");
++  const decorated = withLifecycleTrace(original, snapshot);
++  assert.equal(decorated, original);
++  assert.equal(decorated.lifecycleEventId, "m2h-abc-7-b-1");
++  assert.equal(decorated.lifecycleTrace, snapshot);
++  assert.equal(isLifecycleError(decorated), true);
++  assert.equal(
++    isLifecycleError({
++      lifecycleEventId: snapshot.eventId,
++      lifecycleTrace: snapshot,
++    }),
++    false,
++  );
++  assert.equal(
++    isLifecycleError({
++      name: "Error",
++      message: "cross-realm structural error",
++      lifecycleEventId: snapshot.eventId,
++      lifecycleTrace: snapshot,
++    }),
++    true,
++  );
++  assert.equal(decorated.message.includes(serialized), false);
++  assert.equal(
++    decorated.message.slice("original failure\n".length).length <= 240,
++    true,
++  );
++  const screenshotTrace = new LifecycleTrace(8);
++  screenshotTrace.record(entry(1, "dplayer-quality-switch-start", true));
++  screenshotTrace.record(entry(2, "mediasource-sourceclose"));
++  screenshotTrace.record(entry(3, "sourcebuffer-append-call"));
++  screenshotTrace.record(entry(4, "mse-error"));
++  screenshotTrace.record(entry(5, "worker-error"));
++  screenshotTrace.record(entry(6, "player-fail"));
++  const screenshotSnapshot = screenshotTrace.freeze(
++    "m2h-zzzzzzzzzz-zzzzzzzzzzz-zzzzzzzzzzz-zzzzzzzzzzz",
++    7,
++  );
++  const screenshotError = withLifecycleTrace(
++    new Error("screenshot failure"),
++    screenshotSnapshot,
++  );
++  const screenshotSuffix = screenshotError.message.slice(
++    "screenshot failure\n".length,
++  );
++  assert.equal(screenshotSuffix.length <= 240, true);
++  assert.match(
++    screenshotSuffix,
++    /tail=.*ms\.sourceclose>sb\.append-call>mse-error>w\.error>p\.fail/,
++  );
++  assert.equal(
++    screenshotError.message.includes(JSON.stringify(screenshotSnapshot)),
++    false,
++  );
++  const serializedError = JSON.parse(JSON.stringify(decorated));
++  assert.equal(serializedError.lifecycleEventId, "m2h-abc-7-b-1");
++  assert.deepEqual(
++    serializedError.lifecycleTrace.entries.map(({ at }) => at),
++    [10, 20, 40, 50],
++  );
++
++  const domException = new DOMException(
++    "the MediaSource is closed",
++    "InvalidStateError",
++  );
++  const tracedDomException = withLifecycleTrace(domException, snapshot);
++  assert.equal(tracedDomException, domException);
++  assert.equal(tracedDomException.name, "InvalidStateError");
++  assert.match(tracedDomException.message, /the MediaSource is closed/);
++  assert.equal(isLifecycleError(tracedDomException), true);
++
++  const readonlyMessage = new Error("placeholder");
++  Object.defineProperty(readonlyMessage, "message", {
++    get: () => "readonly DOMException-like message",
++    configurable: false,
++  });
++  readonlyMessage.name = "InvalidStateError";
++  readonlyMessage.stack =
++    "InvalidStateError: readonly DOMException-like message";
++  const tracedReadonlyMessage = withLifecycleTrace(readonlyMessage, snapshot);
++  assert.notEqual(tracedReadonlyMessage, readonlyMessage);
++  assert.equal(tracedReadonlyMessage.cause, readonlyMessage);
++  assert.equal(tracedReadonlyMessage.name, "InvalidStateError");
++  assert.match(
++    tracedReadonlyMessage.message,
++    /readonly DOMException-like message/,
++  );
++  assert.match(tracedReadonlyMessage.stack, /Caused by original error/);
++  assert.equal(isLifecycleError(tracedReadonlyMessage), true);
++
++  const nonExtensible = Object.preventExtensions(
++    new Error("non-extensible failure"),
++  );
++  const tracedNonExtensible = withLifecycleTrace(nonExtensible, snapshot);
++  assert.notEqual(tracedNonExtensible, nonExtensible);
++  assert.equal(tracedNonExtensible.cause, nonExtensible);
++  assert.match(tracedNonExtensible.message, /non-extensible failure/);
++  assert.equal(isLifecycleError(tracedNonExtensible), true);
++
++  const frozen = Object.freeze(new Error("frozen failure"));
++  const tracedFrozen = withLifecycleTrace(frozen, snapshot);
++  assert.notEqual(tracedFrozen, frozen);
++  assert.equal(tracedFrozen.cause, frozen);
++  assert.match(tracedFrozen.message, /frozen failure/);
++  assert.equal(isLifecycleError(tracedFrozen), true);
++  assert.equal(Object.isFrozen(frozen), true);
++
++  const throwingName = new Error("throwing name failure");
++  Object.defineProperty(throwingName, "name", {
++    get() {
++      throw new Error("name getter failed");
++    },
++    configurable: false,
++  });
++  assert.equal(readErrorName(throwingName), "Error");
++  const tracedThrowingName = withLifecycleTrace(throwingName, snapshot);
++  assert.notEqual(tracedThrowingName, throwingName);
++  assert.equal(tracedThrowingName.cause, throwingName);
++  assert.equal(tracedThrowingName.name, "Error");
++  assert.equal(isLifecycleError(tracedThrowingName), true);
++
++  assert.equal(isLifecycleError(new Error("plain")), false);
++  assert.equal(
++    isLifecycleError({
++      name: "Error",
++      message: "unfrozen trace",
++      lifecycleEventId: "m2h-abc-7-b-1",
++      lifecycleTrace: { ...snapshot },
++    }),
++    false,
++  );
++  const newlineEventId = `${snapshot.eventId}\n`;
++  assert.equal(
++    isLifecycleError({
++      name: "Error",
++      message: "invalid event ID",
++      lifecycleEventId: newlineEventId,
++      lifecycleTrace: Object.freeze({
++        ...snapshot,
++        eventId: newlineEventId,
++      }),
++    }),
++    false,
++  );
++  assert.equal(
++    isLifecycleError({
++      name: "Error",
++      message: "empty trace",
++      lifecycleEventId: "m2h-abc-7-b-1",
++      lifecycleTrace: Object.freeze({
++        eventId: "m2h-abc-7-b-1",
++        frozenAt: 10,
++        dropped: 0,
++        firstCritical: null,
++        entries: Object.freeze([]),
++      }),
++    }),
++    false,
++  );
++  assert.equal(
++    isLifecycleError(
++      new Proxy(
++        {},
++        {
++          get() {
++            throw new Error("malformed error access");
++          },
++        },
++      ),
++    ),
++    false,
++  );
++  const nonFiniteEntry = Object.freeze({
++    ...snapshot.entries[0],
++    detail: Object.freeze({ invalid: Number.POSITIVE_INFINITY }),
++  });
++  const nonFiniteEntries = Object.freeze([
++    nonFiniteEntry,
++    ...snapshot.entries.slice(1),
++  ]);
++  const nonFiniteTrace = Object.freeze({
++    ...snapshot,
++    firstCritical: nonFiniteEntry,
++    entries: nonFiniteEntries,
++  });
++  assert.equal(
++    isLifecycleError({
++      name: "Error",
++      message: "non-finite detail",
++      lifecycleEventId: snapshot.eventId,
++      lifecycleTrace: nonFiniteTrace,
++    }),
++    false,
++  );
++
++  assert.deepEqual(sanitizeLifecycleDetail({ finite: 1, nullable: null }), {
++    finite: 1,
++    nullable: null,
++  });
++  assert.equal(sanitizeLifecycleDetail({ invalid: Number.NaN }), null);
++  assert.equal(
++    sanitizeLifecycleDetail({ invalid: Number.NEGATIVE_INFINITY }),
++    null,
++  );
++  assert.equal(sanitizeLifecycleDetail({ invalid: 1n }), null);
++  assert.equal(sanitizeLifecycleDetail({ oversized: "x".repeat(257) }), null);
++  assert.equal(
++    sanitizeLifecycleDetail({ ["x".repeat(65)]: "oversized-key" }),
++    null,
++  );
++  assert.equal(
++    sanitizeLifecycleDetail(
++      Object.fromEntries(
++        Array.from({ length: 17 }, (_, index) => [`field${index}`, index]),
++      ),
++    ),
++    null,
++  );
++  assert.equal(
++    sanitizeLifecycleDetail(
++      Object.defineProperty({}, "broken", {
++        enumerable: true,
++        get() {
++          throw new Error("getter must stay inside the diagnostic boundary");
++        },
++      }),
++    ),
++    null,
++  );
++  assert.deepEqual(
++    sanitizeDiagnosticLifecycleInput(
++      "dplayer-quality-switch-start",
++      { generation: 2 },
++      { at: 10, critical: true },
++    ),
++    {
++      event: "dplayer-quality-switch-start",
++      detail: { generation: 2 },
++      at: 10,
++      critical: true,
++    },
++  );
++  assert.equal(sanitizeDiagnosticLifecycleInput("x".repeat(65), {}, {}), null);
++  assert.equal(sanitizeDiagnosticLifecycleInput("line\nbreak", {}, {}), null);
++  assert.equal(sanitizeDiagnosticLifecycleInput("trailing\n", {}, {}), null);
++  assert.equal(
++    sanitizeDiagnosticLifecycleInput("valid-event", {}, { at: Number.NaN }),
++    null,
++  );
++  assert.equal(
++    sanitizeDiagnosticLifecycleInput(
++      "valid-event",
++      {},
++      new Proxy(
++        {},
++        {
++          get() {
++            throw new Error("options access must stay diagnostic-only");
++          },
++        },
++      ),
++    ),
++    null,
++  );
++
++  const before = lifecycleNow();
++  const after = lifecycleNow();
++  assert.equal(Number.isFinite(before), true);
++  assert.equal(before >= performance.timeOrigin, true);
++  assert.equal(after >= before, true);
++
++  const playerSource = await readFile("packages/player/src/player.ts", "utf8");
++  const onMessageSource = playerSource.slice(
++    playerSource.indexOf("  #onMessage ="),
++    playerSource.indexOf(
++      "  /** Open a MediaSource here",
++      playerSource.indexOf("  #onMessage ="),
++    ),
++  );
++  const staleFilterAt = onMessageSource.indexOf(
++    "if (notification.id !== this.#generation) return",
++  );
++  const lifecycleAt = onMessageSource.indexOf(
++    'if (notification.type === "lifecycle")',
++  );
++  assert.equal(lifecycleAt >= 0, true);
++  assert.equal(lifecycleAt < staleFilterAt, true);
++  assert.match(
++    onMessageSource,
++    /this\.#recordMseLifecycle\(\s*notification\.trace,\s*"worker",\s*notification\.id,?\s*\);\s*return;/,
++  );
++  assert.equal(
++    onMessageSource.slice(staleFilterAt).includes('case "lifecycle":'),
++    false,
++  );
++
++  const recordMseSource = playerSource.slice(
++    playerSource.indexOf("  #recordMseLifecycle("),
++    playerSource.indexOf(
++      "  #recordLifecycle(",
++      playerSource.indexOf("  #recordMseLifecycle("),
++    ),
++  );
++  assert.match(
++    recordMseSource,
++    /if \(generation === this\.#generation\)\s*this\.#mediaSourceClass = trace\.mediaSourceClass;/,
++  );
++  assert.match(recordMseSource, /mediaSourceClass: trace\.mediaSourceClass/);
++
++  const failSource = playerSource.slice(
++    playerSource.indexOf("  #fail(error: Error"),
++    playerSource.indexOf(
++      "  #withMseAttachmentContext",
++      playerSource.indexOf("  #fail(error: Error"),
++    ),
++  );
++  const freezeAt = failSource.indexOf("lifecycleJournal.freeze");
++  const replaceAt = failSource.indexOf("lifecycleJournal = new LifecycleTrace");
++  const teardownAt = failSource.indexOf('this.#teardown("fail")');
++  assert.equal(freezeAt >= 0, true);
++  assert.equal(failSource.includes("error.name"), false);
++  assert.match(failSource, /errorName: readErrorName\(error\)/);
++  assert.equal(freezeAt < replaceAt, true);
++  assert.equal(replaceAt < teardownAt, true);
++
++  const teardownSource = playerSource.slice(
++    playerSource.indexOf("  #teardown(reason:"),
++    playerSource.indexOf("  #fail(error: Error"),
++  );
++  for (const [traceCall, ownedCall] of [
++    ['record("object-url-revoke-call"', "URL.revokeObjectURL"],
++    ['record("source-element-detach-call"', "this.#source.remove()"],
++    ['attachment: "src"', 'this.video.removeAttribute("src")'],
++    ['attachment: "srcObject"', "this.video.srcObject = null"],
++    ['record("video-load-call"', "this.video.load()"],
++  ]) {
++    assert.equal(teardownSource.indexOf(traceCall) >= 0, true);
++    assert.equal(
++      teardownSource.indexOf(traceCall) < teardownSource.indexOf(ownedCall),
++      true,
++    );
++  }
++} finally {
++  await unlink(output).catch(() => {});
++}
+diff --git a/tools/test-mse-reset.mjs b/tools/test-mse-reset.mjs
+index b80b8cbeeb5e31cfcc36d5595b194416bac210f8..4aa7854f47a8cdb93cc104a26ddf9d8f41618d26 100644
+--- a/tools/test-mse-reset.mjs
++++ b/tools/test-mse-reset.mjs
+@@ -9,6 +9,7 @@ import { build } from "esbuild";
+ class FakeSourceBuffer extends EventTarget {
+   mode = "segments";
+   updating = false;
++  appendError = null;
+   appended = [];
+   removed = [];
+   buffered = {
+@@ -18,20 +19,24 @@ class FakeSourceBuffer extends EventTarget {
+   };
+ 
+   appendBuffer(data) {
++    if (this.appendError) throw this.appendError;
+     assert.equal(this.updating, false);
+     this.updating = true;
+     this.appended.push(data);
++    this.dispatchEvent(new Event("updatestart"));
+   }
+ 
+   remove(start, end) {
+     assert.equal(this.updating, false);
+     this.updating = true;
+     this.removed.push([start, end]);
++    this.dispatchEvent(new Event("updatestart"));
+   }
+ 
+   complete() {
+     assert.equal(this.updating, true);
+     this.updating = false;
++    this.dispatchEvent(new Event("update"));
+     this.dispatchEvent(new Event("updateend"));
+   }
+ 
+@@ -59,8 +64,11 @@ class FakeMediaSource extends EventTarget {
+   endOfStream() {}
+ }
+ 
++class FakeManagedMediaSource extends FakeMediaSource {}
++
+ const output = join(tmpdir(), `mpeg2toh264-mse-test-${process.pid}.mjs`);
+ globalThis.MediaSource = FakeMediaSource;
++globalThis.ManagedMediaSource = FakeManagedMediaSource;
+ 
+ try {
+   await build({
+@@ -71,6 +79,18 @@ try {
+     platform: "browser",
+   });
+   const { MseSink } = await import(pathToFileURL(output));
++  assert.doesNotThrow(
++    () =>
++      new MseSink({
++        queueHighWaterMark: 1024,
++        maxAheadSeconds: 8,
++        keepBehindSeconds: 10,
++        seek() {},
++        onLifecycle() {
++          throw new Error("diagnostic observer failure");
++        },
++      }),
++  );
+   const sink = new MseSink({
+     queueHighWaterMark: 1024 * 1024,
+     maxAheadSeconds: 8,
+@@ -95,7 +115,81 @@ try {
+   assert.equal(sourceBuffer.appended[1], newInit);
+   sourceBuffer.complete();
+   assert.equal(sourceBuffer.appended[2], newMedia);
++
++  const diagnosticErrors = [];
++  const lifecycle = [];
++  const diagnosticSink = new MseSink({
++    queueHighWaterMark: 1024 * 1024,
++    maxAheadSeconds: 8,
++    keepBehindSeconds: 10,
++    seek() {},
++    onError(error) {
++      diagnosticErrors.push(error);
++    },
++    onLifecycle(trace) {
++      lifecycle.push(trace);
++    },
++  });
++  const invalidState = new Error("The object is in an invalid state.");
++  invalidState.name = "InvalidStateError";
++  await diagnosticSink.open("video/mp4; codecs=avc1.640028", oldInit);
++  diagnosticSink.mediaSource.sourceBuffer.complete();
++  diagnosticSink.mediaSource.readyState = "closed";
++  diagnosticSink.mediaSource.dispatchEvent(new Event("sourceclose"));
++  diagnosticSink.mediaSource.sourceBuffer.appendError = invalidState;
++  diagnosticSink.push(oldMedia, 0, true);
++  assert.equal(diagnosticErrors.length, 1);
++  assert.equal(diagnosticErrors[0].name, "InvalidStateError");
++  assert.match(
++    diagnosticErrors[0].message,
++    /^MSE append SourceBuffer failed \(mediaSource=closed, closed=false, sourceOpens=1, sourceCloses=1, sinceSourceOpenMs=\d+, sinceSourceCloseMs=\d+, sourceBuffer=present, updating=false, operation=none, queue=1, epoch=0\): InvalidStateError: The object is in an invalid state\.$/,
++  );
++  assert.equal(lifecycle[0].event, "mse-created");
++  assert.equal(lifecycle[0].mediaSourceClass, "MediaSource");
++  assert.equal(
++    lifecycle.find(({ event }) => event === "mediasource-sourceclose").critical,
++    true,
++  );
++  const updateEnd = lifecycle.find(
++    ({ event }) => event === "sourcebuffer-updateend",
++  );
++  assert.equal(updateEnd.detail.operation, "append");
++  assert.equal(updateEnd.detail.operationEpoch, 0);
++  assert.equal(updateEnd.detail.queueLength, 1);
++  const mseError = lifecycle.find(({ event }) => event === "mse-error");
++  assert.equal(mseError.critical, true);
++  assert.equal(mseError.detail.failedOperation, "append SourceBuffer");
++  assert.equal(Object.isFrozen(mseError), true);
++  assert.equal(Object.isFrozen(mseError.detail), true);
++  assert.equal(
++    lifecycle.every(
++      (entry, index) => index === 0 || entry.at >= lifecycle[index - 1].at,
++    ),
++    true,
++  );
++  assert.equal(lifecycle[0].at >= performance.timeOrigin, true);
++
++  const managedLifecycle = [];
++  const managedSink = new MseSink({
++    preferManaged: true,
++    queueHighWaterMark: 1024 * 1024,
++    maxAheadSeconds: 8,
++    keepBehindSeconds: 10,
++    seek() {},
++    onLifecycle(trace) {
++      managedLifecycle.push(trace);
++    },
++  });
++  managedSink.mediaSource.dispatchEvent(new Event("endstreaming"));
++  managedSink.mediaSource.dispatchEvent(new Event("startstreaming"));
++  assert.equal(managedSink.managed, true);
++  assert.equal(managedLifecycle[0].mediaSourceClass, "ManagedMediaSource");
++  assert.deepEqual(
++    managedLifecycle.slice(-2).map(({ event }) => event),
++    ["mediasource-endstreaming", "mediasource-startstreaming"],
++  );
+ } finally {
+   delete globalThis.MediaSource;
++  delete globalThis.ManagedMediaSource;
+   await unlink(output).catch(() => {});
+ }
