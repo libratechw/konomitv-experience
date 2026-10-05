@@ -3,7 +3,7 @@
   "date": "2026-10-05",
   "purpose": "Historical candidate, experiment and diagnostic source preservation; not an adoption recommendation or a claim that all changes were merged.",
   "source_license": "Original repository licenses remain applicable (MIT or BSD-3-Clause); attribution is preserved. Starlette entries link to the included BSD license notice.",
-  "retired_repository_replay": "For Starlette, repository identifies the official replay base and historical_repository identifies the retired fork. recorded_tip is a historical fork tip, not an upstream commit; restore its source by applying the preserved patch.",
+  "retired_repository_replay": "For Starlette, repository identifies the official replay base and historical_repository identifies the comparison fork. recorded_tip is a historical fork tip, not an upstream commit; restore its source by applying the preserved patch. fork_verification_retired describes the end of independent verification, not confirmation that the repository was deleted.",
   "patch_format": "git diff --binary --full-index",
   "excluded_paths": [
     "dist/**",
@@ -180,7 +180,7 @@
     {
       "repository": "https://github.com/Kludex/starlette",
       "historical_repository": "libratechw/starlette",
-      "repository_retired": true,
+      "fork_verification_retired": true,
       "retired_branch": "add-early-hints",
       "base_commit": "4f250d6b814587e20c5365f0a5f0c4d42bcb929f",
       "base_url": "https://github.com/Kludex/starlette/commit/4f250d6b814587e20c5365f0a5f0c4d42bcb929f",
@@ -196,7 +196,7 @@
     {
       "repository": "https://github.com/Kludex/starlette",
       "historical_repository": "libratechw/starlette",
-      "repository_retired": true,
+      "fork_verification_retired": true,
       "retired_branch": "codex/add-opentelemetry-header-capture",
       "base_commit": "e4bd5981540ee0003deaae69d7f4881f11714b96",
       "base_url": "https://github.com/Kludex/starlette/commit/e4bd5981540ee0003deaae69d7f4881f11714b96",
@@ -212,7 +212,7 @@
     {
       "repository": "https://github.com/Kludex/starlette",
       "historical_repository": "libratechw/starlette",
-      "repository_retired": true,
+      "fork_verification_retired": true,
       "retired_branch": "codex/stream-testclient-responses",
       "base_commit": "e4bd5981540ee0003deaae69d7f4881f11714b96",
       "base_url": "https://github.com/Kludex/starlette/commit/e4bd5981540ee0003deaae69d7f4881f11714b96",
