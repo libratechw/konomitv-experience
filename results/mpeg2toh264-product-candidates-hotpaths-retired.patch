@@ -1,0 +1,2663 @@
+diff --git a/README.md b/README.md
+index 8ded9dae5b7f6dcc8f7eea15e74e188c3efdd96b..7212ca3028a85cca1d1cbed4bf584e0a91f7dc24 100644
+--- a/README.md
++++ b/README.md
+@@ -120,6 +120,8 @@ Main limitations:
+ - Resolution changes or switches between progressive and interlaced sequences during conversion are not supported.
+ - Transport-stream audio must be AAC-LC; channel-element rearrangement supports 44.1 kHz and 48 kHz.
+ - Corrupt slices, leading B pictures without all references, and unpaired field pictures are skipped.
++- At transport packet loss, the trailing picture whose completion cannot be proved is discarded while earlier pictures with a following picture boundary are preserved.
++- Session tests cover this transport-loss behavior; applications adopting the change must verify damaged-TS recovery in their browser and device environments.
+ - Output is lossy because of requantization, and fractional-pixel prediction uses the approximations shown in the table above.
+ 
+ Interlaced-video limitations:
+@@ -303,6 +305,8 @@ AACは再エンコードせず、通常のステレオと5.1chは保持し、モ
+ - 変換中の解像度またはプログレッシブ/インターレースシーケンスの変更は不可
+ - TSの音声はAAC-LC、チャンネルエレメントの組み替えは44.1 kHzまたは48 kHzを対象とする
+ - 破損スライス、参照が揃わない先頭Bピクチャ、片方だけのフィールドピクチャは読み飛ばす
++- TS packet欠落時は完了を確認できない末尾ピクチャを破棄し、次のピクチャ開始位置まで受信済みの先行ピクチャは保持する
++- この欠落処理はSession testで確認している。変更を取り込む側では、使用するbrowserと端末で異常TSから復帰できることを確認する必要がある
+ - 出力は再量子化による非可逆変換であり、小数画素予測には表の通りの近似がある
+ 
+ インターレースの映像の制約:
+diff --git a/crates/mpeg2toh264-wasm/Cargo.toml b/crates/mpeg2toh264-wasm/Cargo.toml
+index cb799b50626af05f98105a93e784c744d43d5d1f..0f52257de00723cdf0e4237d12be8227db977e38 100644
+--- a/crates/mpeg2toh264-wasm/Cargo.toml
++++ b/crates/mpeg2toh264-wasm/Cargo.toml
+@@ -14,6 +14,9 @@ crate-type = ["cdylib", "rlib"]
+ unsafe_code = "forbid"
+ 
+ [dependencies]
+-mpeg2toh264.workspace = true
++mpeg2toh264 = { workspace = true, features = [
++  "experimental-symmetric-field-basis",
++  "experimental-symmetric-idct",
++] }
+ js-sys = "0.3"
+ wasm-bindgen = "0.2"
+diff --git a/crates/mpeg2toh264/Cargo.toml b/crates/mpeg2toh264/Cargo.toml
+index 8d5968b0c89615c9e35ddcf5623726a0dde293d5..60618c6dd977fcf34f292cfabbfa7c9d15aaca75 100644
+--- a/crates/mpeg2toh264/Cargo.toml
++++ b/crates/mpeg2toh264/Cargo.toml
+@@ -7,6 +7,11 @@ rust-version.workspace = true
+ license.workspace = true
+ repository.workspace = true
+ 
++[features]
++default = []
++experimental-symmetric-field-basis = []
++experimental-symmetric-idct = []
++
+ [lints.rust]
+ unsafe_code = "forbid"
+ 
+diff --git a/crates/mpeg2toh264/README.md b/crates/mpeg2toh264/README.md
+index d0ec946f3a1b5d841ee5088d3d43faeb13d2c871..61ce68335e94fb8d05f9cf978664b97e393106e1 100644
+--- a/crates/mpeg2toh264/README.md
++++ b/crates/mpeg2toh264/README.md
+@@ -2,6 +2,21 @@
+ 
+ MPEG-2 VideoからH.264/AVCへの変換、MPEG-TSの分離、AAC-LCの処理、fragmented MP4の生成を行うコアクレートです。
+ 
++## 統合検証用の演算試作
++
++このブランチは統合検証用で、全体をそのまま採用するためのPR候補ではありません。次の演算試作は、個別または両方を明示的に有効にしてソースからbuildした場合だけ適用されます。どちらも既定では無効で、有効時の出力は旧経路と完全一致しません。
++
++- `experimental-symmetric-idct`: 色差IDCTの対称性を使った演算削減。
++- `experimental-symmetric-field-basis`: frame→field基底変換の対称性を使った演算削減。単独の性能効果は未確定で、組み合わせの評価用にも残しています。
++
++画質・ブラウザー・実機での検証が残るため、通常利用への既定化はしていません。旧品質の演算経路へ戻すには、両featureを指定せずに再buildしてください。チェックイン済みの`packages/*/dist`は、これらの試作を有効にした配布物ではありません。
++
++CLIで両方を試すbuild例（片方だけの評価ではfeature名も片方だけ指定します）:
++
++```bash
++cargo build --release -p mpeg2toh264-cli --features mpeg2toh264/experimental-symmetric-idct,mpeg2toh264/experimental-symmetric-field-basis
++```
++
+ ## 一括変換
+ 
+ `transcode`はMPEG-2 VideoエレメンタリーストリームをAnnex B H.264へ変換します。
+diff --git a/crates/mpeg2toh264/src/container/mpegts.rs b/crates/mpeg2toh264/src/container/mpegts.rs
+index e2ce0afdc3a1f9be4e420e183309d771fa2fb5c6..26bc2c2a88addc15e57ee91cd0d0d5ae3c1a7f11 100644
+--- a/crates/mpeg2toh264/src/container/mpegts.rs
++++ b/crates/mpeg2toh264/src/container/mpegts.rs
+@@ -229,8 +229,9 @@ pub struct ElementaryPacket {
+     /// Bytes belonging to this elementary stream were lost before this PES.
+     /// Stateful parsers discard unfinished access units before reading it.
+     pub discontinuity: bool,
+-    /// The preceding PES itself lost bytes, so video parsing also discards the
+-    /// unfinished GOP before reading this packet.
++    /// The preceding PES itself lost bytes, so video parsing must finish or
++    /// discard its pending tail before reading this packet. The demuxer never
++    /// emits bytes received after the gap as part of that tail.
+     pub damaged_previous_pes: bool,
+     /// Earliest recent program-table packet a new demuxer for the same service
+     /// can start at and still discover this PES packet's PID.
+diff --git a/crates/mpeg2toh264/src/h264/bitwriter.rs b/crates/mpeg2toh264/src/h264/bitwriter.rs
+index 5a75507cbd477208cdf48dac09a87eec0967104c..2de4d46b562ee190cb324a366ea195a1ab01dbfd 100644
+--- a/crates/mpeg2toh264/src/h264/bitwriter.rs
++++ b/crates/mpeg2toh264/src/h264/bitwriter.rs
+@@ -66,7 +66,32 @@ impl BitWriter {
+         // Fewer than 32 bits are held, so at most 63 end up in the accumulator
+         // and nothing is shifted out of the top.
+         let value = (value as u64) & (u64::MAX >> (64 - n));
+-        self.acc = (self.acc << n) | value;
++        self.u_fitted(n, value as u32);
++    }
++
++    /// Write the low `n` bits of `value`, most significant first, without
++    /// masking the value against `n`.
++    ///
++    /// The caller must ensure `value` already fits in `n` bits -- only the
++    /// low `n` set. The debug assertions check that, with `n == 32`
++    /// short-circuited so no shift is ever out of range. The CAVLC writers
++    /// call this because their codewords and fields are constructed to fit
++    /// exactly, and skipping the mask removes several instructions from every
++    /// codeword they emit. Everything else goes through [`Self::u`], whose
++    /// masking keeps the "low `n` bits" contract self-contained.
++    #[inline]
++    pub(crate) fn u_fitted(&mut self, n: u32, value: u32) {
++        debug_assert!(n <= 32, "u_fitted({n}) exceeds 32 bits");
++        debug_assert!(
++            n == 32 || value < (1u32 << n),
++            "u_fitted({n}) value {value:#x} exceeds its width"
++        );
++        if n == 0 {
++            return;
++        }
++        // Fewer than 32 bits are held, so at most 63 end up in the accumulator
++        // and nothing is shifted out of the top.
++        self.acc = (self.acc << n) | value as u64;
+         self.bits += n;
+         if self.bits >= 32 {
+             self.bits -= 32;
+@@ -212,6 +237,56 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn u_masks_upper_bits_of_the_value() {
++        // The public contract of u(n, value) is "the low n bits": whatever
++        // the value carries above its width must stay out of the stream.
++        for n in [1u32, 4, 13, 17, 31] {
++            let fit = (1u32 << n) - 1;
++            let mut masked = BitWriter::new();
++            let mut wide = BitWriter::new();
++            for _ in 0..5 {
++                masked.u(n, fit);
++                wide.u(n, fit | 0x8000_0000);
++                masked.u(3, 0b101);
++                wide.u(3, 0b101);
++            }
++            assert_eq!(masked.buf, wide.buf, "n = {n}");
++            assert_eq!(masked.bits, wide.bits);
++        }
++    }
++
++    #[test]
++    fn u_fitted_matches_u_for_fitted_values_across_widths_and_flushes() {
++        // u_fitted skips the mask; for a value that already fits, u must
++        // produce exactly the same stream, across the flush boundary and at
++        // the width extremes.
++        for n in [0u32, 1, 4, 13, 17, 31, 32] {
++            let fitted = if n == 0 {
++                0
++            } else if n == 32 {
++                u32::MAX
++            } else {
++                (1u32 << n) - 1
++            };
++            let mut fast = BitWriter::new();
++            let mut plain = BitWriter::new();
++            for _ in 0..5 {
++                fast.ue(7);
++                plain.ue(7);
++                fast.u_fitted(n, fitted);
++                plain.u(n, fitted);
++                fast.u_fitted(3, 0b101);
++                plain.u(3, 0b101);
++            }
++            fast.u_fitted(3, 0b101);
++            plain.u(3, 0b101);
++            assert_eq!(fast.buf, plain.buf, "n = {n}");
++            assert_eq!(fast.bits, plain.bits);
++            assert_eq!(fast.acc, plain.acc, "n = {n}: no masking leaves no residue");
++        }
++    }
++
+     #[test]
+     fn ue_spans_the_wide_codeword_path() {
+         // A codeword of more than 32 bits cannot go through one u(n) call, so
+diff --git a/crates/mpeg2toh264/src/h264/cavlc.rs b/crates/mpeg2toh264/src/h264/cavlc.rs
+index 05d29331f23b28c5d58512788ae4bba6fc6fd2ab..1feccefc6edfb6d8c13deb60c32bf670aa7860f0 100644
+--- a/crates/mpeg2toh264/src/h264/cavlc.rs
++++ b/crates/mpeg2toh264/src/h264/cavlc.rs
+@@ -13,7 +13,9 @@ use crate::h264::cavlc_tables::{
+ 
+ #[inline]
+ fn write_code(w: &mut BitWriter, code: Vlc) {
+-    w.u(code.len, code.bits);
++    // `code.bits` is the value of the `code.len`-bit codeword the generated
++    // tables were built from, so it always fits in `code.len` bits.
++    w.u_fitted(code.len, code.bits);
+ }
+ 
+ /// Which total_zeros table applies, given the block size being coded.
+@@ -90,10 +92,14 @@ fn write_level(w: &mut BitWriter, level_code: i32, suffix_length: u32) -> Result
+     // exceed its 32-bit input and need the split form.
+     let codeword_bits = prefix + 1 + suffix_bits;
+     if codeword_bits <= 32 {
+-        w.u(codeword_bits, (1 << suffix_bits) | suffix);
++        // The prefix's leading one plus a suffix_bits-wide suffix: the value
++        // is < 2^(suffix_bits+1) and codeword_bits is at least that wide.
++        w.u_fitted(codeword_bits, (1 << suffix_bits) | suffix);
+     } else {
+-        w.u(prefix + 1, 1);
+-        w.u(suffix_bits, suffix);
++        // Escape: prefix 15 (or more) with a widening suffix, all fields
++        // constructed to their own width.
++        w.u_fitted(prefix + 1, 1);
++        w.u_fitted(suffix_bits, suffix);
+     }
+     Ok(())
+ }
+@@ -171,7 +177,8 @@ pub fn write_masked_levels(
+     // while identifying the run, so emit them as one codeword and continue
+     // from the already-reduced mask.
+     if trailing_ones > 0 {
+-        w.u(trailing_ones as u32, trailing_signs);
++        // One sign bit was shifted in per trailing one.
++        w.u_fitted(trailing_ones as u32, trailing_signs);
+     }
+ 
+     // Remaining levels, still highest frequency first.
+diff --git a/crates/mpeg2toh264/src/h264/chroma.rs b/crates/mpeg2toh264/src/h264/chroma.rs
+index 8b26a66d7108907f8e51971a47a57dcbfaca740a..4582853547d240d57b1e584e8d39267383d1af99 100644
+--- a/crates/mpeg2toh264/src/h264/chroma.rs
++++ b/crates/mpeg2toh264/src/h264/chroma.rs
+@@ -51,7 +51,7 @@ static CHROMA_RECIPROCAL_GAIN: LazyLock<([[f32; 16]; 40], [f32; 40])> = LazyLock
+     (ac, dc)
+ });
+ 
+-/// H.264 Table 8-14: 4x4 field scan for field-coded macroblocks.
++/// H.264 Table 8-13: 4x4 field scan for field-coded macroblocks.
+ pub static FIELD_SCAN_4X4: [usize; 16] = [0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
+ 
+ /// Chroma QP for a given luma QP and PPS offset, via Table 8-15.
+@@ -60,6 +60,7 @@ pub fn chroma_qp(luma_qp: i32, offset: i32) -> i32 {
+ }
+ 
+ /// Inverse 8x8 DCT, orthonormal, into `out` in raster order.
++#[cfg(not(feature = "experimental-symmetric-idct"))]
+ pub fn idct8(coeff: &[f32; 64], out: &mut [f32; 64], tmp: &mut [f32; 64]) {
+     let c8 = &*C8;
+     // Columns first: tmp = C8^T * coeff
+@@ -84,6 +85,38 @@ pub fn idct8(coeff: &[f32; 64], out: &mut [f32; 64], tmp: &mut [f32; 64]) {
+     }
+ }
+ 
++/// The same basis as the dense IDCT, with mirrored samples sharing their
++/// even/odd frequency sums. Regrouping f32 additions can change rounding;
++/// this experimental path does not promise the dense path's output bytes.
++#[cfg(feature = "experimental-symmetric-idct")]
++pub fn idct8(coeff: &[f32; 64], out: &mut [f32; 64], tmp: &mut [f32; 64]) {
++    #[inline]
++    fn transform(input: [f32; 8], c8: &[f32; 64]) -> [f32; 8] {
++        let mut result = [0.0; 8];
++        for x in 0..4 {
++            let even = ((c8[x] * input[0] + c8[16 + x] * input[2]) + c8[32 + x] * input[4])
++                + c8[48 + x] * input[6];
++            let odd = ((c8[8 + x] * input[1] + c8[24 + x] * input[3]) + c8[40 + x] * input[5])
++                + c8[56 + x] * input[7];
++            result[x] = even + odd;
++            result[7 - x] = even - odd;
++        }
++        result
++    }
++
++    let c8 = &*C8;
++    for v in 0..8 {
++        let row = transform(std::array::from_fn(|u| coeff[v * 8 + u]), c8);
++        tmp[v * 8..v * 8 + 8].copy_from_slice(&row);
++    }
++    for x in 0..8 {
++        let column = transform(std::array::from_fn(|v| tmp[v * 8 + x]), c8);
++        for y in 0..8 {
++            out[y * 8 + x] = column[y];
++        }
++    }
++}
++
+ /// H.264's forward 4x4 core transform, `W = Cf * X * Cf^T`, applied to the 4x4
+ /// sub-block at (bx, by) of an 8x8 sample block.
+ fn forward4x4(block: &[f32; 64], bx: usize, by: usize, out: &mut [f32; 16]) {
+@@ -162,15 +195,7 @@ fn spatial_to_chroma_levels(
+     for b in 0..4 {
+         forward4x4(samples, (b & 1) * 4, (b >> 1) * 4, &mut coeff4);
+         dc_target[b] = coeff4[0];
+-        let ac_out = &mut out.ac[b];
+-        for k in 1..16 {
+-            let pos = scan[k];
+-            let level = round_half_up_i32(coeff4[pos] * ac_reciprocal[pos]);
+-            ac_out[k - 1] = level;
+-            if level != 0 {
+-                out.any_ac = true;
+-            }
+-        }
++        out.any_ac |= ac_levels_for(&coeff4, ac_reciprocal, scan, &mut out.ac[b]);
+     }
+ 
+     let f0 = dc_target[0] * dc_reciprocal;
+@@ -184,6 +209,36 @@ fn spatial_to_chroma_levels(
+     out.any_dc = out.dc.iter().any(|&v| v != 0);
+ }
+ 
++/// Quantise the 15 AC coefficients of one 4x4 block into the coding scan
++/// order `scan` names, which is the order the residual writer consumes.
++///
++/// Each level is first computed in raster order -- position by position, so
++/// the loads from `coeff4` and `ac_reciprocal` are contiguous and no scan
++/// dereference sits between the f32 product and the rounding -- and the
++/// integer levels are then copied to where `scan` puts them. The arithmetic is
++/// exactly what the previous single gather loop performed: every element is
++/// still `round_half_up_i32(coeff4[pos] * ac_reciprocal[pos])` for its own
++/// position, and the reorder is pure integer copying. Returns whether any of
++/// the 15 levels is non-zero, which is the caller's coded-block-pattern bit.
++fn ac_levels_for(
++    coeff4: &[f32; 16],
++    ac_reciprocal: &[f32; 16],
++    scan: &[usize; 16],
++    out: &mut [i32; 15],
++) -> bool {
++    let mut raster = [0i32; 16];
++    let mut any = false;
++    for pos in 1..16 {
++        let level = round_half_up_i32(coeff4[pos] * ac_reciprocal[pos]);
++        raster[pos] = level;
++        any |= level != 0;
++    }
++    for k in 1..16 {
++        out[k - 1] = raster[scan[k]];
++    }
++    any
++}
++
+ fn dequant_chroma(
+     levels: Option<&[i16; 64]>,
+     weight_scale: &[i32; 64],
+@@ -414,6 +469,97 @@ mod tests {
+         }
+     }
+ 
++    #[cfg(feature = "experimental-symmetric-idct")]
++    #[test]
++    fn the_rounded_basis_preserves_idct_mirror_symmetry() {
++        let c8 = &*C8;
++        for k in 0..8 {
++            for x in 0..4 {
++                let reflected = if k % 2 == 0 {
++                    c8[k * 8 + x]
++                } else {
++                    -c8[k * 8 + x]
++                };
++                assert_eq!(c8[k * 8 + 7 - x].to_bits(), reflected.to_bits());
++            }
++        }
++    }
++
++    fn check_idct_against_f64_matrix(coeff: &[f32; 64]) {
++        let c8 = &*C8;
++        let mut out = [f32::NAN; 64];
++        let mut tmp = [f32::NAN; 64];
++        idct8(coeff, &mut out, &mut tmp);
++        for y in 0..8 {
++            for x in 0..8 {
++                let mut expected = 0.0f64;
++                let mut absolute_sum = 0.0f64;
++                // Direct 2D matrix product in double precision: no shared
++                // intermediate layout or even/odd decomposition with idct8.
++                for v in 0..8 {
++                    for u in 0..8 {
++                        let term =
++                            coeff[v * 8 + u] as f64 * c8[u * 8 + x] as f64 * c8[v * 8 + y] as f64;
++                        expected += term;
++                        absolute_sum += term.abs();
++                    }
++                }
++                // Conservative roundoff allowance scaled to the input, not
++                // a pixel-quality threshold. Cancellation may make expected
++                // zero even for a large block, hence absolute_sum, not |expected|.
++                let tolerance = 32.0 * f32::EPSILON as f64 * (absolute_sum + 1.0);
++                let actual = out[y * 8 + x] as f64;
++                assert!(
++                    actual.is_finite() && (actual - expected).abs() <= tolerance,
++                    "sample ({x},{y}): actual={actual}, expected={expected}, tolerance={tolerance}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn idct_matches_the_f64_matrix_for_basis_sparse_and_dense_blocks() {
++        check_idct_against_f64_matrix(&[0.0; 64]);
++        for pos in 0..64 {
++            for level in [-3064.0, 1.0, 2047.0] {
++                let mut coeff = [0.0; 64];
++                coeff[pos] = level;
++                check_idct_against_f64_matrix(&coeff);
++            }
++        }
++        for scale in [1.0, 4096.0, 1.0e12] {
++            for axis in 0..3 {
++                let coeff = std::array::from_fn(|pos| {
++                    let parity = match axis {
++                        0 => pos % 8,
++                        1 => pos / 8,
++                        _ => pos % 8 + pos / 8,
++                    };
++                    if parity % 2 == 0 {
++                        scale
++                    } else {
++                        -scale
++                    }
++                });
++                check_idct_against_f64_matrix(&coeff);
++            }
++        }
++        let mut state = 0x9e37_79b9u32;
++        for block in 0..256 {
++            let coeff = std::array::from_fn(|_| {
++                state ^= state << 13;
++                state ^= state >> 17;
++                state ^= state << 5;
++                if block % 2 == 0 && state % 4 != 0 {
++                    0.0
++                } else {
++                    ((state & 8191) as i32 - 4096) as f32
++                }
++            });
++            check_idct_against_f64_matrix(&coeff);
++        }
++    }
++
+     #[test]
+     fn a_flat_residual_becomes_a_chroma_dc_level_and_no_ac() {
+         // A constant block has one non-zero 4x4 DC per sub-block, which the 2x2
+@@ -453,4 +599,88 @@ mod tests {
+         assert_eq!(out.dc, [0; 4]);
+         assert!(out.ac.iter().all(|block| block.iter().all(|&v| v == 0)));
+     }
++
++    #[test]
++    fn the_raster_reorder_path_is_identical_to_the_gather_loop() {
++        // The reorder must not change a single level, so a test-local copy of
++        // the previous one-pass algorithm is the reference and the two are
++        // compared over deterministic pseudo-random blocks, both scans, and a
++        // spread of chroma QPs.
++        fn reference_ac(
++            samples: &[f32; 64],
++            qp_c: i32,
++            field_scan: bool,
++        ) -> ([[i32; 15]; 4], bool) {
++            let qp_c = qp_c as usize;
++            let ac_reciprocal = &CHROMA_RECIPROCAL_GAIN.0[qp_c];
++            let scan: &[usize; 16] = if field_scan {
++                &FIELD_SCAN_4X4
++            } else {
++                &ZIGZAG_4X4
++            };
++            let mut out = [[0i32; 15]; 4];
++            let mut any_ac = false;
++            let mut coeff4 = [0.0f32; 16];
++            for b in 0..4 {
++                forward4x4(samples, (b & 1) * 4, (b >> 1) * 4, &mut coeff4);
++                for k in 1..16 {
++                    let pos = scan[k];
++                    let level = round_half_up_i32(coeff4[pos] * ac_reciprocal[pos]);
++                    out[b][k - 1] = level;
++                    if level != 0 {
++                        any_ac = true;
++                    }
++                }
++            }
++            (out, any_ac)
++        }
++
++        let mut seed = 0x9e37_79b9u32;
++        let mut next = move || {
++            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
++            (seed >> 8) as f32 / 16_777_216.0 - 0.5
++        };
++        for qp_c in [0, 13, 26, 39] {
++            for field_scan in [false, true] {
++                for _ in 0..100 {
++                    let mut samples = [0.0f32; 64];
++                    for sample in samples.iter_mut() {
++                        *sample = next() * 600.0;
++                    }
++                    let mut candidate = ChromaBlockLevels::default();
++                    spatial_to_chroma_levels(&samples, qp_c, &mut candidate, field_scan);
++                    let (expected_ac, expected_any) = reference_ac(&samples, qp_c, field_scan);
++                    assert_eq!(
++                        candidate.ac, expected_ac,
++                        "qp_c {qp_c} field_scan {field_scan}"
++                    );
++                    assert_eq!(
++                        candidate.any_ac, expected_any,
++                        "qp_c {qp_c} field_scan {field_scan}"
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn an_all_zero_block_stays_empty_and_a_nonzero_one_reports_ac_for_either_scan() {
++        for field_scan in [false, true] {
++            let mut out = ChromaBlockLevels::default();
++            spatial_to_chroma_levels(&[0.0; 64], 20, &mut out, field_scan);
++            assert!(out.is_empty(), "no samples, no levels, {field_scan}");
++
++            let mut samples = [0.0f32; 64];
++            // An impulse in the top-left sub-block puts energy into that
++            // block's own AC and DC; the other three sub-blocks read none of
++            // it. Either scan still has to carry it in the top-left block's AC.
++            samples[0] = 400.0;
++            spatial_to_chroma_levels(&samples, 20, &mut out, field_scan);
++            assert!(out.any_ac, "the impulse lands on AC, {field_scan}");
++            assert!(
++                out.ac.iter().any(|block| block.iter().any(|&v| v != 0)),
++                "the AC record itself holds it, {field_scan}"
++            );
++        }
++    }
+ }
+diff --git a/crates/mpeg2toh264/src/h264/mb.rs b/crates/mpeg2toh264/src/h264/mb.rs
+index b0a03b44266f72752f3c3b6856c50274c2dbfa02..a2c37bf2af284328fe4a70e797a916ee93e2163c 100644
+--- a/crates/mpeg2toh264/src/h264/mb.rs
++++ b/crates/mpeg2toh264/src/h264/mb.rs
+@@ -478,27 +478,34 @@ fn write_luma_residual_8x8(
+     luma: &[Option<&[i32; 64]>; 4],
+     cbp_luma: u32,
+ ) -> Result<()> {
+-    let mut sub = [0i32; 16];
++    let mut sub = [[0i32; 16]; 4];
+     for i8x8 in 0..4 {
+-        let block = luma[i8x8];
++        let (true, Some(block)) = (cbp_luma & (1 << i8x8) != 0, luma[i8x8]) else {
++            for i4x4 in 0..4 {
++                let blk_idx = i8x8 * 4 + i4x4;
++                let (x, y) = LUMA_4X4_XY[blk_idx];
++                let bx = mb_x * 4 + x;
++                let by = mb_y * 4 + y;
++                counts.set(bx, by, 0);
++            }
++            continue;
++        };
++
++        let mut masks = [0u32; 4];
++        for i in 0..16 {
++            let base = 4 * i;
++            for i4x4 in 0..4 {
++                let level = block[base + i4x4];
++                sub[i4x4][i] = level;
++                masks[i4x4] |= u32::from(level != 0) << i;
++            }
++        }
+         for i4x4 in 0..4 {
+             let blk_idx = i8x8 * 4 + i4x4;
+             let (x, y) = LUMA_4X4_XY[blk_idx];
+             let bx = mb_x * 4 + x;
+             let by = mb_y * 4 + y;
+-
+-            let (true, Some(block)) = (cbp_luma & (1 << i8x8) != 0, block) else {
+-                counts.set(bx, by, 0);
+-                continue;
+-            };
+-
+-            let mut mask = 0u32;
+-            for i in 0..16 {
+-                let level = block[4 * i + i4x4];
+-                sub[i] = level;
+-                mask |= u32::from(level != 0) << i;
+-            }
+-            let total = write_masked_levels(w, &sub, mask, 16, counts.n_c(bx, by))?;
++            let total = write_masked_levels(w, &sub[i4x4], masks[i4x4], 16, counts.n_c(bx, by))?;
+             counts.set(bx, by, total);
+         }
+     }
+@@ -607,4 +614,123 @@ mod tests {
+         counts.set(1, 0, 8);
+         assert_eq!(counts.n_c(2, 0), 8, "an absent upper neighbour is skipped");
+     }
++
++    fn reference_write_luma_residual_8x8(
++        w: &mut BitWriter,
++        counts: &mut CoeffCountMap,
++        mb_x: usize,
++        mb_y: usize,
++        luma: &[Option<&[i32; 64]>; 4],
++        cbp_luma: u32,
++    ) -> Result<()> {
++        let mut sub = [0i32; 16];
++        for i8x8 in 0..4 {
++            let block = luma[i8x8];
++            for i4x4 in 0..4 {
++                let blk_idx = i8x8 * 4 + i4x4;
++                let (x, y) = LUMA_4X4_XY[blk_idx];
++                let bx = mb_x * 4 + x;
++                let by = mb_y * 4 + y;
++
++                let (true, Some(block)) = (cbp_luma & (1 << i8x8) != 0, block) else {
++                    counts.set(bx, by, 0);
++                    continue;
++                };
++
++                let mut mask = 0u32;
++                for i in 0..16 {
++                    let level = block[4 * i + i4x4];
++                    sub[i] = level;
++                    mask |= u32::from(level != 0) << i;
++                }
++                let total = write_masked_levels(w, &sub, mask, 16, counts.n_c(bx, by))?;
++                counts.set(bx, by, total);
++            }
++        }
++        Ok(())
++    }
++
++    fn run_luma_residual(
++        write: fn(
++            &mut BitWriter,
++            &mut CoeffCountMap,
++            usize,
++            usize,
++            &[Option<&[i32; 64]>; 4],
++            u32,
++        ) -> Result<()>,
++        luma: &[Option<&[i32; 64]>; 4],
++        cbp_luma: u32,
++        seeds: &[(usize, usize, i16)],
++    ) -> (usize, Vec<u8>, Vec<i16>) {
++        let mut counts = CoeffCountMap::new(12, 12);
++        for &(bx, by, total) in seeds {
++            counts.counts[by * 12 + bx] = total;
++        }
++        let mut w = BitWriter::new();
++        write(&mut w, &mut counts, 1, 1, luma, cbp_luma).expect("writes the residual");
++        let bit_length = w.bit_length();
++        while !w.is_byte_aligned() {
++            w.u(1, 0);
++        }
++        (bit_length, w.bytes().to_vec(), counts.counts)
++    }
++
++    fn deinterleave_blocks() -> [[i32; 64]; 4] {
++        std::array::from_fn(|b| {
++            std::array::from_fn(|i| ((i as i32 * 13 + b as i32 * 17 + 5) % 6) - 2)
++        })
++    }
++
++    #[test]
++    fn the_deinterleaved_write_matches_the_reference_gather_for_every_cbp() {
++        let blocks = deinterleave_blocks();
++        let seeds = [(3, 4, 5), (4, 3, 3)];
++        for cbp_luma in 0..16u32 {
++            let mut luma: [Option<&[i32; 64]>; 4] = [None; 4];
++            for b in 0..4 {
++                if cbp_luma & (1 << b) != 0 {
++                    luma[b] = Some(&blocks[b]);
++                }
++            }
++            let reference =
++                run_luma_residual(reference_write_luma_residual_8x8, &luma, cbp_luma, &seeds);
++            let candidate = run_luma_residual(write_luma_residual_8x8, &luma, cbp_luma, &seeds);
++            assert_eq!(
++                candidate, reference,
++                "cbp_luma pattern {cbp_luma:#06b} changed the bit column or the counts update"
++            );
++        }
++    }
++
++    #[test]
++    fn a_coded_8x8_reads_left_and_upper_neighbours_into_n_c_in_the_same_order() {
++        let mut block = [0i32; 64];
++        block[0] = 2;
++        block[5] = -1;
++        block[10] = 1;
++        block[20] = 3;
++        let luma: [Option<&[i32; 64]>; 4] = [Some(&block), None, None, None];
++
++        let plain = run_luma_residual(write_luma_residual_8x8, &luma, 1, &[]);
++        let (seeded_bits, seeded_bytes, seeded_counts) =
++            run_luma_residual(write_luma_residual_8x8, &luma, 1, &[(3, 4, 5), (4, 3, 3)]);
++        assert_ne!(
++            (plain.0, &plain.1),
++            (seeded_bits, &seeded_bytes),
++            "left and upper neighbour totals must reach n_c and change the coeff_token table"
++        );
++
++        let reference = run_luma_residual(
++            reference_write_luma_residual_8x8,
++            &luma,
++            1,
++            &[(3, 4, 5), (4, 3, 3)],
++        );
++        assert_eq!(
++            (seeded_bits, seeded_bytes, seeded_counts),
++            reference,
++            "with the same neighbours the de-interleaved write must update counts identically"
++        );
++    }
+ }
+diff --git a/crates/mpeg2toh264/src/h264/params.rs b/crates/mpeg2toh264/src/h264/params.rs
+index be78c1495ef6929e755faa84eccb4bc6dd2c7c81..2a0be4ce755e1f2b68e78471f5ead6f372d737a0 100644
+--- a/crates/mpeg2toh264/src/h264/params.rs
++++ b/crates/mpeg2toh264/src/h264/params.rs
+@@ -17,7 +17,7 @@
+ use crate::h264::bitwriter::{nal_type, to_nal_unit, BitWriter};
+ use crate::mpeg2::headers::SampleAspectRatio;
+ 
+-/// H.264's 8x8 zig-zag scan (Table 8-13), used to serialise scaling lists.
++/// H.264's 8x8 zig-zag scan (Table 8-14), used to serialise scaling lists.
+ /// Identical to the MPEG-2 scan, but repeated here so the H.264 writer does not
+ /// reach into the MPEG-2 module for it.
+ pub static ZIGZAG_8X8: [usize; 64] = [
+@@ -90,7 +90,18 @@ pub struct FrameGeometry {
+ 
+ pub fn frame_geometry(width: u32, height: u32, frame_mbs_only: bool) -> FrameGeometry {
+     let mb_width = ((width + 15) >> 4) as usize;
+-    let mb_height = ((height + 15) >> 4) as usize;
++    let frame_mb_height = ((height + 15) >> 4) as usize;
++    // An MBAFF map unit always contains two macroblock rows. Keep one padded
++    // row when the coded height would otherwise be odd; the source grid may
++    // still end at the preceding row, and the writer will emit the padding
++    // macroblock with the same empty/constant semantics as any missing source
++    // macroblock. This is required by FrameHeightInMbs = 2 *
++    // PicHeightInMapUnits when frame_mbs_only_flag is zero.
++    let mb_height = if frame_mbs_only {
++        frame_mb_height
++    } else {
++        (frame_mb_height + 1) & !1
++    };
+     // With MBAFF or field coding, a map unit is a macroblock pair.
+     let map_units = if frame_mbs_only {
+         mb_height
+@@ -270,3 +281,64 @@ pub fn write_pps(cfg: &PpsConfig<'_>) -> Vec<u8> {
+     w.rbsp_trailing_bits();
+     to_nal_unit(w.bytes(), 3, nal_type::PPS)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Table 8-14 as the column and row each entry names, which is how the
++    /// standard prints it. Stating the table a second way is the point:
++    /// comparing the array with itself says nothing about whether it is right.
++    #[test]
++    fn zigzag_8x8_visits_the_positions_table_8_14_names() {
++        #[rustfmt::skip]
++        let coordinates: [(usize, usize); 64] = [
++            (0, 0), (1, 0), (0, 1), (0, 2), (1, 1), (2, 0), (3, 0), (2, 1),
++            (1, 2), (0, 3), (0, 4), (1, 3), (2, 2), (3, 1), (4, 0), (5, 0),
++            (4, 1), (3, 2), (2, 3), (1, 4), (0, 5), (0, 6), (1, 5), (2, 4),
++            (3, 3), (4, 2), (5, 1), (6, 0), (7, 0), (6, 1), (5, 2), (4, 3),
++            (3, 4), (2, 5), (1, 6), (0, 7), (1, 7), (2, 6), (3, 5), (4, 4),
++            (5, 3), (6, 2), (7, 1), (7, 2), (6, 3), (5, 4), (4, 5), (3, 6),
++            (2, 7), (3, 7), (4, 6), (5, 5), (6, 4), (7, 3), (7, 4), (6, 5),
++            (5, 6), (4, 7), (5, 7), (6, 6), (7, 5), (7, 6), (6, 7), (7, 7),
++        ];
++        let expected: Vec<usize> = coordinates.iter().map(|&(x, y)| y * 8 + x).collect();
++        assert_eq!(ZIGZAG_8X8.to_vec(), expected);
++
++        let mut seen = [false; 64];
++        for &p in &ZIGZAG_8X8 {
++            assert!(!seen[p], "position {p} is scanned twice");
++            seen[p] = true;
++        }
++    }
++
++    /// Table 8-13 as the column and row each entry names, which is how the
++    /// standard prints it. Stating the table a second way is the point:
++    /// comparing the array with itself says nothing about whether it is right.
++    #[test]
++    fn zigzag_4x4_visits_the_positions_table_8_13_names() {
++        #[rustfmt::skip]
++        let coordinates: [(usize, usize); 16] = [
++            (0, 0), (1, 0), (0, 1), (0, 2),
++            (1, 1), (2, 0), (3, 0), (2, 1),
++            (1, 2), (0, 3), (1, 3), (2, 2),
++            (3, 1), (3, 2), (2, 3), (3, 3),
++        ];
++        let expected: Vec<usize> = coordinates.iter().map(|&(x, y)| y * 4 + x).collect();
++        assert_eq!(ZIGZAG_4X4.to_vec(), expected);
++
++        let mut seen = [false; 16];
++        for &p in &ZIGZAG_4X4 {
++            assert!(!seen[p], "position {p} is scanned twice");
++            seen[p] = true;
++        }
++    }
++
++    #[test]
++    fn mbaff_geometry_rounds_an_odd_row_count_to_a_complete_pair() {
++        let g = frame_geometry(1280, 720, false);
++        assert_eq!(g.mb_height, 46);
++        assert_eq!(g.map_units, 23);
++        assert_eq!(g.crop_bottom, 4, "16 padded lines at CropUnitY 4");
++    }
++}
+diff --git a/crates/mpeg2toh264/src/h264/quant.rs b/crates/mpeg2toh264/src/h264/quant.rs
+index c61b4b22e0a7795f5188dfec5e2a8209cfdbde25..7723ccff243f70bf2b52b8be0288a023ccdb54df 100644
+--- a/crates/mpeg2toh264/src/h264/quant.rs
++++ b/crates/mpeg2toh264/src/h264/quant.rs
+@@ -94,9 +94,36 @@ impl Quantiser8x8 {
+         round_half_up_i32(target / self.gain[qp as usize * 64 + pos])
+     }
+ 
+-    /// Quantise a whole block directly into the scan order the residual coder
+-    /// consumes. This avoids first writing raster levels and then copying all
+-    /// 64 of them through a separate scan pass.
++    /// Quantise a whole block in raster order: `out[pos]` is the level for
++    /// position `pos`.
++    ///
++    /// The per-position arithmetic is exactly what the residual coder has
++    /// always received -- the same f32 product with the precomputed reciprocal,
++    /// rounded by [`crate::round_half_up_i32`] -- but the loop walks `targets`
++    /// and `reciprocal_gains` in the order they are laid out, so no scan-table
++    /// dereference separates the loads from the multiply. The levels only reach
++    /// scan order afterwards, in `reorder_levels`, which is pure integer
++    /// copying.
++    #[inline]
++    fn raster_levels_for(&self, targets: &[f32; 64], qp: i32, out: &mut [i32; 64]) {
++        let base = qp as usize * 64;
++        let reciprocal_gains: &[f32; 64] = self.reciprocal_gain[base..base + 64]
++            .try_into()
++            .expect("64 reciprocal gains");
++        for pos in 0..64 {
++            out[pos] = round_half_up_i32(targets[pos] * reciprocal_gains[pos]);
++        }
++    }
++
++    /// Quantise a whole block into the scan order the residual coder consumes:
++    /// the private `raster_levels_for` pass followed by `reorder_levels`. Every
++    /// level is computed from its own position and then copied to where `scan`
++    /// puts it, which produces the same 64 levels as quantising through `scan`
++    /// in one pass would.
++    ///
++    /// Returns whether any of the 64 written levels is non-zero. The caller
++    /// turns that into the coded block pattern, so an all-zero block must
++    /// report `false` no matter which scan the levels were written in.
+     #[inline]
+     pub fn scanned_levels_for(
+         &self,
+@@ -105,18 +132,9 @@ impl Quantiser8x8 {
+         scan: &[usize; 64],
+         out: &mut [i32; 64],
+     ) -> bool {
+-        let base = qp as usize * 64;
+-        let reciprocal_gains: &[f32; 64] = self.reciprocal_gain[base..base + 64]
+-            .try_into()
+-            .expect("64 reciprocal gains");
+-        let mut any = false;
+-        for k in 0..64 {
+-            let pos = scan[k];
+-            let level = round_half_up_i32(targets[pos] * reciprocal_gains[pos]);
+-            out[k] = level;
+-            any |= level != 0;
+-        }
+-        any
++        let mut raster = [0i32; 64];
++        self.raster_levels_for(targets, qp, &mut raster);
++        reorder_levels(&raster, scan, out)
+     }
+ 
+     /// Pick the QP whose step is `oversample` times finer than the MPEG-2 step.
+@@ -142,6 +160,25 @@ impl Quantiser8x8 {
+     }
+ }
+ 
++/// Move a block from raster order into the coding scan order `scan` names,
++/// which is the order the residual coder and the intra reconstruction expect.
++/// Integer copies only: the levels have already been rounded, so this pass
++/// touches nothing that decides a level's value.
++///
++/// Returns whether any of the 64 written levels is non-zero, which is the
++/// caller's coded-block-pattern bit and so must be true for exactly the blocks
++/// whose levels are non-zero.
++#[inline]
++fn reorder_levels(raster: &[i32; 64], scan: &[usize; 64], out: &mut [i32; 64]) -> bool {
++    let mut any = false;
++    for k in 0..64 {
++        let level = raster[scan[k]];
++        out[k] = level;
++        any |= level != 0;
++    }
++    any
++}
++
+ /// The constant an intra macroblock is predicted from; see
+ /// [`crate::h264::slice`].
+ ///
+@@ -280,7 +317,10 @@ pub fn field_dct_to_frame_targets(
+ /// macroblock pair must be field-coded because either source macroblock uses
+ /// field motion: frame-DCT neighbours in the same pair then have to be expressed
+ /// in the field transform basis as well.
+-#[cfg(not(target_arch = "wasm32"))]
++#[cfg(all(
++    not(target_arch = "wasm32"),
++    not(feature = "experimental-symmetric-field-basis")
++))]
+ pub fn frame_dct_to_field_targets(
+     upper: &[f32; 64],
+     lower: &[f32; 64],
+@@ -320,7 +360,72 @@ pub fn frame_dct_to_field_targets(
+     }
+ }
+ 
+-#[cfg(target_arch = "wasm32")]
++#[cfg(all(
++    not(target_arch = "wasm32"),
++    feature = "experimental-symmetric-field-basis"
++))]
++pub fn frame_dct_to_field_targets(
++    upper: &[f32; 64],
++    lower: &[f32; 64],
++    first_field: &mut [f32; 64],
++    second_field: &mut [f32; 64],
++) {
++    // The rounded basis is unchanged. This reassociates f32 sums, so downstream
++    // quantisation can change levels and no byte-equivalence promise is made.
++    let dct = &*DCT8_BASIS;
++    let mut upper_samples = [0.0f32; 8];
++    let mut lower_samples = [0.0f32; 8];
++
++    for horizontal_frequency in 0..8 {
++        for (input, samples) in [(upper, &mut upper_samples), (lower, &mut lower_samples)] {
++            for y in 0..4 {
++                let mut even = 0.0;
++                let mut odd = 0.0;
++                for vertical_frequency in (0..8).step_by(2) {
++                    even += dct[y * 8 + vertical_frequency]
++                        * input[vertical_frequency * 8 + horizontal_frequency];
++                }
++                for vertical_frequency in (1..8).step_by(2) {
++                    odd += dct[y * 8 + vertical_frequency]
++                        * input[vertical_frequency * 8 + horizontal_frequency];
++                }
++                samples[y] = even + odd;
++                samples[7 - y] = even - odd;
++            }
++        }
++
++        for field in 0..2 {
++            let out: &mut [f32; 64] = if field == 0 {
++                &mut *first_field
++            } else {
++                &mut *second_field
++            };
++            let mut coefficients = [0.0f32; 8];
++            for y in 0..4 {
++                let near = upper_samples[y * 2 + field];
++                let mirrored = lower_samples[6 - y * 2 + field];
++                let sum = near + mirrored;
++                let difference = near - mirrored;
++                for vertical_frequency in (0..8).step_by(2) {
++                    coefficients[vertical_frequency] += dct[y * 8 + vertical_frequency] * sum;
++                }
++                for vertical_frequency in (1..8).step_by(2) {
++                    coefficients[vertical_frequency] +=
++                        dct[y * 8 + vertical_frequency] * difference;
++                }
++            }
++            for vertical_frequency in 0..8 {
++                out[vertical_frequency * 8 + horizontal_frequency] =
++                    coefficients[vertical_frequency];
++            }
++        }
++    }
++}
++
++#[cfg(all(
++    target_arch = "wasm32",
++    not(feature = "experimental-symmetric-field-basis")
++))]
+ #[target_feature(enable = "simd128")]
+ pub fn frame_dct_to_field_targets(
+     upper: &[f32; 64],
+@@ -402,11 +507,226 @@ pub fn frame_dct_to_field_targets(
+     }
+ }
+ 
++#[cfg(all(target_arch = "wasm32", feature = "experimental-symmetric-field-basis"))]
++#[target_feature(enable = "simd128")]
++pub fn frame_dct_to_field_targets(
++    upper: &[f32; 64],
++    lower: &[f32; 64],
++    first_field: &mut [f32; 64],
++    second_field: &mut [f32; 64],
++) {
++    use core::arch::wasm32::{
++        f32x4, f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_splat, f32x4_sub, v128,
++    };
++
++    #[inline]
++    fn load4(values: &[f32; 64], pos: usize) -> v128 {
++        f32x4(
++            values[pos],
++            values[pos + 1],
++            values[pos + 2],
++            values[pos + 3],
++        )
++    }
++
++    #[inline]
++    fn store4(values: &mut [f32; 64], pos: usize, lanes: v128) {
++        values[pos] = f32x4_extract_lane::<0>(lanes);
++        values[pos + 1] = f32x4_extract_lane::<1>(lanes);
++        values[pos + 2] = f32x4_extract_lane::<2>(lanes);
++        values[pos + 3] = f32x4_extract_lane::<3>(lanes);
++    }
++
++    let dct = &*DCT8_BASIS;
++    let mut upper_samples = [0.0f32; 64];
++    let mut lower_samples = [0.0f32; 64];
++
++    // D[7-y, k] is D[y, k] for even k and -D[y, k] for odd k. Reusing each
++    // mirror pair halves the mathematical product count from 256 to 128 per
++    // horizontal frequency; this does not predict emitted instructions or time.
++    for horizontal_frequency in (0..8).step_by(4) {
++        for y in 0..4 {
++            let mut upper_even = f32x4_splat(0.0);
++            let mut upper_odd = f32x4_splat(0.0);
++            let mut lower_even = f32x4_splat(0.0);
++            let mut lower_odd = f32x4_splat(0.0);
++            for vertical_frequency in (0..8).step_by(2) {
++                let basis = f32x4_splat(dct[y * 8 + vertical_frequency]);
++                let pos = vertical_frequency * 8 + horizontal_frequency;
++                upper_even = f32x4_add(upper_even, f32x4_mul(basis, load4(upper, pos)));
++                lower_even = f32x4_add(lower_even, f32x4_mul(basis, load4(lower, pos)));
++            }
++            for vertical_frequency in (1..8).step_by(2) {
++                let basis = f32x4_splat(dct[y * 8 + vertical_frequency]);
++                let pos = vertical_frequency * 8 + horizontal_frequency;
++                upper_odd = f32x4_add(upper_odd, f32x4_mul(basis, load4(upper, pos)));
++                lower_odd = f32x4_add(lower_odd, f32x4_mul(basis, load4(lower, pos)));
++            }
++            store4(
++                &mut upper_samples,
++                y * 8 + horizontal_frequency,
++                f32x4_add(upper_even, upper_odd),
++            );
++            store4(
++                &mut upper_samples,
++                (7 - y) * 8 + horizontal_frequency,
++                f32x4_sub(upper_even, upper_odd),
++            );
++            store4(
++                &mut lower_samples,
++                y * 8 + horizontal_frequency,
++                f32x4_add(lower_even, lower_odd),
++            );
++            store4(
++                &mut lower_samples,
++                (7 - y) * 8 + horizontal_frequency,
++                f32x4_sub(lower_even, lower_odd),
++            );
++        }
++
++        for field in 0..2 {
++            let out: &mut [f32; 64] = if field == 0 {
++                &mut *first_field
++            } else {
++                &mut *second_field
++            };
++            let mut coefficients = [f32x4_splat(0.0); 8];
++            for y in 0..4 {
++                let near = load4(&upper_samples, (y * 2 + field) * 8 + horizontal_frequency);
++                let mirrored = load4(
++                    &lower_samples,
++                    (6 - y * 2 + field) * 8 + horizontal_frequency,
++                );
++                let sum = f32x4_add(near, mirrored);
++                let difference = f32x4_sub(near, mirrored);
++                for vertical_frequency in (0..8).step_by(2) {
++                    coefficients[vertical_frequency] = f32x4_add(
++                        coefficients[vertical_frequency],
++                        f32x4_mul(f32x4_splat(dct[y * 8 + vertical_frequency]), sum),
++                    );
++                }
++                for vertical_frequency in (1..8).step_by(2) {
++                    coefficients[vertical_frequency] = f32x4_add(
++                        coefficients[vertical_frequency],
++                        f32x4_mul(f32x4_splat(dct[y * 8 + vertical_frequency]), difference),
++                    );
++                }
++            }
++            for vertical_frequency in 0..8 {
++                store4(
++                    out,
++                    vertical_frequency * 8 + horizontal_frequency,
++                    coefficients[vertical_frequency],
++                );
++            }
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::h264::mb::FIELD_SCAN_8X8;
++    use crate::h264::params::ZIGZAG_8X8;
+     use crate::mpeg2::constants::{DEFAULT_INTRA_QUANT, DEFAULT_NON_INTRA_QUANT};
+ 
++    fn direct_frame_dct_to_field_targets(
++        upper: &[f32; 64],
++        lower: &[f32; 64],
++    ) -> ([f64; 64], [f64; 64], [f64; 64], [f64; 64]) {
++        let dct = &*DCT8_BASIS;
++        let mut first_field = [0.0f64; 64];
++        let mut second_field = [0.0f64; 64];
++        let mut first_absolute_sum = [0.0f64; 64];
++        let mut second_absolute_sum = [0.0f64; 64];
++
++        for horizontal_frequency in 0..8 {
++            for (field, out, absolute_sum) in [
++                (0, &mut first_field, &mut first_absolute_sum),
++                (1, &mut second_field, &mut second_absolute_sum),
++            ] {
++                for vertical_frequency in 0..8 {
++                    for y in 0..8 {
++                        let spatial_y = y * 2 + field;
++                        let (input, source_y) = if spatial_y < 8 {
++                            (upper, spatial_y)
++                        } else {
++                            (lower, spatial_y - 8)
++                        };
++                        for source_frequency in 0..8 {
++                            let term = dct[y * 8 + vertical_frequency] as f64
++                                * dct[source_y * 8 + source_frequency] as f64
++                                * input[source_frequency * 8 + horizontal_frequency] as f64;
++                            out[vertical_frequency * 8 + horizontal_frequency] += term;
++                            absolute_sum[vertical_frequency * 8 + horizontal_frequency] +=
++                                term.abs();
++                        }
++                    }
++                }
++            }
++        }
++        (
++            first_field,
++            second_field,
++            first_absolute_sum,
++            second_absolute_sum,
++        )
++    }
++
++    fn fixed_random_block(seed: u32, sparse: bool) -> [f32; 64] {
++        std::array::from_fn(|i| {
++            let word = seed
++                .wrapping_add((i as u32).wrapping_mul(0x9e37_79b9))
++                .wrapping_mul(1_103_515_245)
++                .wrapping_add(12_345);
++            if sparse && word & 7 != 0 {
++                0.0
++            } else {
++                ((word >> 16) & 0x0fff) as f32 - 2048.0
++            }
++        })
++    }
++
++    fn assert_frame_dct_to_field_targets_match_reference(
++        upper: &[f32; 64],
++        lower: &[f32; 64],
++        case: &str,
++    ) {
++        let mut first_field = [f32::NAN; 64];
++        let mut second_field = [f32::NAN; 64];
++        frame_dct_to_field_targets(upper, lower, &mut first_field, &mut second_field);
++        let (expected_first, expected_second, first_absolute_sum, second_absolute_sum) =
++            direct_frame_dct_to_field_targets(upper, lower);
++
++        for (field, actual, expected, absolute_sum) in [
++            ("first", &first_field, &expected_first, &first_absolute_sum),
++            (
++                "second",
++                &second_field,
++                &expected_second,
++                &second_absolute_sum,
++            ),
++        ] {
++            for i in 0..64 {
++                let actual = actual[i];
++                let expected = expected[i];
++                // Bound rounding across both transforms by 16 f32 epsilons
++                // times the direct composition's absolute term sum, including
++                // terms which cancel. This covers both implementations and is
++                // a numerical regression bound, not a quality tolerance.
++                let tolerance = 16.0 * f32::EPSILON as f64 * absolute_sum[i];
++                assert!(
++                    actual.is_finite(),
++                    "{case}: {field} field slot {i} was not written"
++                );
++                assert!(
++                    ((actual as f64) - expected).abs() <= tolerance,
++                    "{case}: {field} field slot {i}: actual {actual}, expected {expected}, tolerance {tolerance}"
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn doubling_the_mpeg2_step_is_exactly_six_h264_qp() {
+         // The linear quantiser_scale table is what makes the mapping clean.
+@@ -506,6 +826,177 @@ mod tests {
+     /// nothing is given up by checking to a thousandth.
+     const ROUND_TRIP_TOLERANCE: f32 = 1e-3;
+ 
++    #[test]
++    fn dct8_basis_has_the_exact_rounded_mirror_identity() {
++        let dct = &*DCT8_BASIS;
++        for y in 0..4 {
++            for vertical_frequency in 0..8 {
++                let expected = if vertical_frequency & 1 == 0 {
++                    dct[y * 8 + vertical_frequency]
++                } else {
++                    -dct[y * 8 + vertical_frequency]
++                };
++                assert_eq!(
++                    dct[(7 - y) * 8 + vertical_frequency].to_bits(),
++                    expected.to_bits(),
++                    "sample {y}, frequency {vertical_frequency}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn frame_dct_to_field_targets_matches_the_f64_direct_reference() {
++        assert_frame_dct_to_field_targets_match_reference(&[0.0; 64], &[0.0; 64], "zero");
++
++        let mut dc_upper = [0.0f32; 64];
++        let mut dc_lower = [0.0f32; 64];
++        dc_upper[0] = 2047.0;
++        dc_lower[0] = -2048.0;
++        assert_frame_dct_to_field_targets_match_reference(&dc_upper, &dc_lower, "DC");
++
++        for value in [-127.25, 127.25] {
++            for basis_vector in 0..128 {
++                let mut upper = [0.0f32; 64];
++                let mut lower = [0.0f32; 64];
++                if basis_vector < 64 {
++                    upper[basis_vector] = value;
++                } else {
++                    lower[basis_vector - 64] = value;
++                }
++                assert_frame_dct_to_field_targets_match_reference(
++                    &upper,
++                    &lower,
++                    &format!("basis vector {basis_vector} value {value}"),
++                );
++            }
++        }
++
++        let mut sparse_upper = [0.0f32; 64];
++        let mut sparse_lower = [0.0f32; 64];
++        for (pos, value) in [(0, 2047.0), (7, -2048.0), (18, 511.5), (63, -255.25)] {
++            sparse_upper[pos] = value;
++        }
++        for (pos, value) in [(1, -2048.0), (14, 2047.0), (41, -1023.75), (56, 255.5)] {
++            sparse_lower[pos] = value;
++        }
++        assert_frame_dct_to_field_targets_match_reference(&sparse_upper, &sparse_lower, "sparse");
++
++        for seed in [0x0c0f_feeeu32, 0x1234_5678, 0xfedc_ba98] {
++            let dense_upper = fixed_random_block(seed, false);
++            let dense_lower = fixed_random_block(!seed, false);
++            assert_frame_dct_to_field_targets_match_reference(
++                &dense_upper,
++                &dense_lower,
++                &format!("dense fixed-random seed {seed:#010x}"),
++            );
++
++            let sparse_upper = fixed_random_block(seed, true);
++            let sparse_lower = fixed_random_block(!seed, true);
++            assert_frame_dct_to_field_targets_match_reference(
++                &sparse_upper,
++                &sparse_lower,
++                &format!("sparse fixed-random seed {seed:#010x}"),
++            );
++        }
++
++        let cancellation_upper = std::array::from_fn(|i| if i & 1 == 0 { 2047.0 } else { -2048.0 });
++        let cancellation_lower = std::array::from_fn(|i| if i & 8 == 0 { -2048.0 } else { 2047.0 });
++        assert_frame_dct_to_field_targets_match_reference(
++            &cancellation_upper,
++            &cancellation_lower,
++            "cancellation at finite input limits",
++        );
++    }
++
++    #[test]
++    fn raster_levels_are_what_the_scanned_levels_reorder() {
++        // A target of gain * k quantises to exactly k: the f32 product with the
++        // reciprocal comes back within a couple of ulps of k, which is nowhere
++        // near the half-step that would change the rounded level. Every
++        // position gets its own k, several of them zero, so the whole block is
++        // pinned at once.
++        for qp in [0, 13, 26, 39, 51] {
++            let quant = Quantiser8x8::new(&DEFAULT_INTRA_QUANT);
++            let mut targets = [0.0f32; 64];
++            let mut expected = [0i32; 64];
++            for pos in 0..64 {
++                let k = ((pos as i32 * 17) % 23) - 11;
++                targets[pos] = quant.gain_at(qp, pos) * k as f32;
++                expected[pos] = k;
++            }
++
++            let mut raster = [i32::MIN; 64];
++            quant.raster_levels_for(&targets, qp, &mut raster);
++            assert_eq!(raster, expected, "qp {qp} quantises in place per position");
++
++            for (scan_name, scan) in [("zigzag", ZIGZAG_8X8), ("field", FIELD_SCAN_8X8)] {
++                let mut scanned = [i32::MIN; 64];
++                let active = quant.scanned_levels_for(&targets, qp, &scan, &mut scanned);
++                let reordered: Vec<i32> = scan.iter().map(|&pos| expected[pos]).collect();
++                assert_eq!(scanned.to_vec(), reordered, "qp {qp} {scan_name} order");
++                assert_eq!(
++                    active,
++                    expected.iter().any(|&level| level != 0),
++                    "qp {qp} {scan_name} reports the block the levels make"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn an_all_zero_block_reports_nothing_for_either_scan_and_writes_zeros() {
++        let quant = Quantiser8x8::new(&DEFAULT_NON_INTRA_QUANT);
++        for scan in [&ZIGZAG_8X8, &FIELD_SCAN_8X8] {
++            let mut out = [i32::MAX; 64];
++            assert!(!quant.scanned_levels_for(&[0.0; 64], 17, scan, &mut out));
++            assert_eq!(out, [0; 64], "every one of the 64 slots is overwritten");
++        }
++        let mut raster = [i32::MAX; 64];
++        quant.raster_levels_for(&[0.0; 64], 17, &mut raster);
++        assert_eq!(raster, [0; 64]);
++    }
++
++    #[test]
++    fn a_half_step_rounds_against_the_reciprocal_product_not_the_division() {
++        // `target * (1 / gain)` and `target / gain` agree almost everywhere,
++        // but the f32 rounding of the reciprocal can tip a level that sits on
++        // an exact half-step, which is why the hot path must keep multiplying.
++        // Find one position where the two differ and pin the multiplication.
++        let quant = Quantiser8x8::new(&DEFAULT_INTRA_QUANT);
++        let mut picked = None;
++        'positions: for qp in 0..52 {
++            for pos in 0..64 {
++                let gain = quant.gain_at(qp, pos);
++                let reciprocal = quant.reciprocal_gain[qp as usize * 64 + pos];
++                for n in -40..=40 {
++                    let target = gain * (n as f32 + 0.5);
++                    let product = round_half_up_i32(target * reciprocal);
++                    if product != round_half_up_i32(target / gain) {
++                        picked = Some((qp, pos, target, product));
++                        break 'positions;
++                    }
++                }
++            }
++        }
++        let (qp, pos, target, expected) =
++            picked.expect("no position distinguishes multiplication from division");
++        let mut block = [0.0f32; 64];
++        block[pos] = target;
++        let mut out = [0i32; 64];
++        let scanned_index = ZIGZAG_8X8
++            .iter()
++            .position(|&p| p == pos)
++            .expect("every position is scanned");
++        quant.scanned_levels_for(&block, qp, &ZIGZAG_8X8, &mut out);
++        let mut expected_block = [0i32; 64];
++        expected_block[scanned_index] = expected;
++        assert_eq!(
++            out, expected_block,
++            "the half-step at position {pos} follows the reciprocal product"
++        );
++    }
++
+     #[test]
+     fn the_field_and_frame_dct_bases_are_inverses_of_each_other() {
+         let first: [f32; 64] = std::array::from_fn(|i| ((i * 37) % 61) as f32 - 30.0);
+diff --git a/crates/mpeg2toh264/src/lib.rs b/crates/mpeg2toh264/src/lib.rs
+index e5b3380ffd221973117aba29dfb07f71ad19c0d8..d316dd7fbd15a26644f511d043fb741ebd3d47b1 100644
+--- a/crates/mpeg2toh264/src/lib.rs
++++ b/crates/mpeg2toh264/src/lib.rs
+@@ -57,10 +57,141 @@ pub(crate) fn round_half_up(value: f64) -> f64 {
+ 
+ /// [`round_half_up`] straight to an integer, for the quantiser hot paths.
+ ///
+-/// Single precision: the coefficient path works in f32, where a dequantised
+-/// MPEG-2 value -- at most about 3.7 million -- is still exact, and twice as
+-/// many of them fit in a vector register.
++/// Both targets must return the same level for the same input: the native
++/// build and the WASM build share the bitstream contract, and a rounding
++/// difference between them would break the output digests. The two
++/// implementations below are the same rounding -- exact halves go towards
++/// positive infinity, which is JavaScript's tie rule and not Rust's
++/// `f32::round` -- written two ways only because what was measured differed
++/// per target:
++///
++/// - wasm32 keeps the `(value + 0.5).floor()` expression. The shared
++///   truncation formulation measured consistently slower in the tested WASM
++///   setup, so it was kept for native only; why it is slower there was not
++///   established.
++/// - other targets compute the same floor as an integer expression that the
++///   compiler can vectorise: `x as i32` is a saturating truncation, and the
++///   comparison `x < truncated as f32` is false for NaN, so the `& mask` turns
++///   exactly the negative non-integer correction. The reachable codec inputs
++///   are far inside `|x| < 2^24` (the largest luma level input is bounded by
++///   about 1.31e6; see the chain from dequant ±2048 and `FLAT_PREDICTION_DC`
++///   through the ≤16 basis conversion and the largest reciprocal ≈25.97), but
++///   the case proof below covers every `f32` input, so no out-of-domain
++///   difference is accepted:
++///
++///   - `x` NaN: the saturating cast gives 0 and `NaN < 0.0` is false, so the
++///     result is 0, exactly what `NaN.floor() as i32` saturates to.
++///   - `x` `+inf` or a finite value `>= 2^31`: the cast saturates to
++///     `i32::MAX`; `x < 2^31` is false, the mask is 1, and the result is
++///     `i32::MAX`, the floor's saturated cast.
++///   - `x` `-inf` or a finite value `< -2^31`: the cast saturates to
++///     `i32::MIN`, and the `truncated != i32::MIN` mask suppresses the
++///     correction so the result stays `i32::MIN` instead of wrapping to
++///     `i32::MAX`. This is the case the mask exists for; the floor's saturated
++///     cast also gives `i32::MIN`.
++///   - `-2^31 <= x < 2^31` finite: `x as i32` is the exact truncation (every
++///     representable `f32` here is an integer, or its integer truncation
++///     round-trips exactly). For `x >= 0` and for negative integers,
++///     `x < trunc(x)` is false and the result is `trunc(x) = floor(x)`. For
++///     negative non-integers `x < trunc(x)` is true and the result is
++///     `trunc(x) - 1 = floor(x)`.
++///
++///   The result is `floor(x)` for every `f32` input, matching
++///   `(value + 0.5).floor() as i32`. No claim is made about future compiler
++///   versions producing the same vectorised code as the current one.
++#[inline]
++#[cfg(not(target_arch = "wasm32"))]
++pub(crate) fn round_half_up_i32(value: f32) -> i32 {
++    let x = value + 0.5;
++    let truncated = x as i32;
++    let correction = i32::from(x < truncated as f32) & i32::from(truncated != i32::MIN);
++    truncated - correction
++}
++
++/// WASM variant: the contract and the tie rule are those of the non-wasm32
++/// definition above; only the floor's implementation differs.
+ #[inline]
++#[cfg(target_arch = "wasm32")]
+ pub(crate) fn round_half_up_i32(value: f32) -> i32 {
+     (value + 0.5).floor() as i32
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn round_half_up_i32_breaks_f32_ties_toward_positive_infinity() {
++        assert_eq!(round_half_up_i32(0.5), 1);
++        assert_eq!(round_half_up_i32(1.5), 2);
++        assert_eq!(round_half_up_i32(2.5), 3);
++        assert_eq!(round_half_up_i32(-0.5), 0);
++        assert_eq!(round_half_up_i32(-1.5), -1);
++        assert_eq!(round_half_up_i32(-2.5), -2);
++    }
++
++    #[test]
++    fn round_half_up_i32_rounds_off_halves_to_the_nearest_integer() {
++        for (value, expected) in [
++            (0.4f32, 0),
++            (2.3, 2),
++            (2.7, 3),
++            (-2.3, -2),
++            (-2.7, -3),
++            (100.0, 100),
++            (-100.0, -100),
++        ] {
++            assert_eq!(round_half_up_i32(value), expected, "value {value}");
++        }
++    }
++
++    #[test]
++    fn round_half_up_i32_matches_the_floor_formulation_everywhere_in_range() {
++        // These tests run on the host and exercise only the non-wasm32
++        // implementation. The wasm32 branch is `(value + 0.5).floor() as i32`
++        // itself, so that expression is kept here as a test-local reference
++        // and the two are compared over the reachable domain plus the
++        // saturating boundary cases the randomized filter cannot reach. The
++        // randomized filter below skips infinities and large finite values
++        // (`v.abs() > 4e6` is true for both infinities), while NaN passes the
++        // comparison (`NaN > 4e6` is false) and so is exercised by the random
++        // loop; the explicit boundary list covers the excluded cases. The
++        // end-to-end WASM evidence is the compare-wasm digest comparison, not
++        // these tests.
++        let reference = |value: f32| (value + 0.5).floor() as i32;
++        for k in -2_000_000..2_000_000 {
++            let v = k as f32;
++            assert_eq!(round_half_up_i32(v), reference(v), "value {v}");
++            assert_eq!(round_half_up_i32(v + 0.5), reference(v + 0.5), "half {v}");
++        }
++        let mut seed = 0x1234_5678u32;
++        for _ in 0..1_000_000 {
++            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
++            let bits = seed & 0x7fff_ffff;
++            let v = f32::from_bits(bits);
++            if v.abs() > 4_000_000.0 {
++                continue;
++            }
++            assert_eq!(round_half_up_i32(v), reference(v), "bits {bits:08x}");
++            assert_eq!(round_half_up_i32(-v), reference(-v), "neg bits {bits:08x}");
++        }
++        for v in [
++            16_777_216.0f32,
++            33_554_432.0,
++            -16_777_216.0,
++            4_000_000.0,
++            -4_000_000.0,
++            0.5,
++            -0.5,
++            f32::NEG_INFINITY,
++            f32::INFINITY,
++            f32::NAN,
++            -2_147_483_648.0, // -2^31, exactly i32::MIN
++            -2_147_483_904.0, // -2^31 - 256, the first representable f32 below
++            2_147_483_648.0,  // 2^31, just past i32::MAX
++            2_147_483_904.0,  // 2^31 + 256, the next representable f32 above
++        ] {
++            assert_eq!(round_half_up_i32(v), reference(v), "boundary {v}");
++        }
++    }
++}
+diff --git a/crates/mpeg2toh264/src/mpeg2/gop_stream.rs b/crates/mpeg2toh264/src/mpeg2/gop_stream.rs
+index 2792f3b4298b6106a78e8e5e548691a208eaf2eb..1c6de06e1b93f8657a7c1a1f019b870abe3e5c72 100644
+--- a/crates/mpeg2toh264/src/mpeg2/gop_stream.rs
++++ b/crates/mpeg2toh264/src/mpeg2/gop_stream.rs
+@@ -133,6 +133,37 @@ impl Mpeg2GopStream {
+         self.extract(true)
+     }
+ 
++    /// Return complete pictures before a known byte gap, then forget the damaged tail.
++    ///
++    /// The caller must invoke this before pushing any bytes received after the
++    /// gap. The last picture start in the buffer then has no following start
++    /// code to prove that picture ended before the gap. Every earlier picture
++    /// does, so the prefix ending at that last start is byte-complete input for
++    /// the transcoder. Reference resolution, leading B pictures, and field-pair
++    /// validity remain the transcoder's responsibility, as for ordinary units.
++    pub(crate) fn take_complete_prefix_before_gap(&mut self) -> Vec<Mpeg2Gop> {
++        let unit = self.gops.front().copied().and_then(|first_gop| {
++            let boundary = self.pictures.back().copied()?;
++            if !self
++                .pictures
++                .iter()
++                .any(|&picture| picture >= first_gop && picture < boundary)
++            {
++                return None;
++            }
++            let boundary = self.description_boundary(first_gop, boundary);
++            let pts = Self::mark_at(&mut self.pts_marks, self.base);
++            let restart_offset = Self::mark_at(&mut self.restart_marks, self.base);
++            Some(Mpeg2Gop {
++                data: self.buffer[..boundary].to_vec(),
++                pts,
++                restart_offset,
++            })
++        });
++        self.discard_pending();
++        unit.into_iter().collect()
++    }
++
+     /// Drop the unfinished GOP at a transport discontinuity while retaining
+     /// the last sequence header needed to describe the next complete GOP.
+     pub fn discard_pending(&mut self) {
+diff --git a/crates/mpeg2toh264/src/mpeg2/macroblock.rs b/crates/mpeg2toh264/src/mpeg2/macroblock.rs
+index 338c24da6f429fe21f20f36ffc2750f7b96bca9a..58f841d5fcb4e2fba8840626b2a71848fbe1884b 100644
+--- a/crates/mpeg2toh264/src/mpeg2/macroblock.rs
++++ b/crates/mpeg2toh264/src/mpeg2/macroblock.rs
+@@ -363,7 +363,7 @@ fn decode_block(
+     } else {
+         &V_COEFF0
+     };
+-    let mut n: usize;
++    let n: usize;
+ 
+     if intra {
+         let is_luma = block_index < 4;
+@@ -389,21 +389,45 @@ fn decode_block(
+         }
+     }
+ 
++    decode_coefficient_run(r, table, scan, n, out)?;
++    Ok(())
++}
++
++/// The run/level loop shared by intra and inter blocks: decode symbols until
++/// EOB, writing each level to the position `scan` names. `n` is the first scan
++/// index to use (1 when the DC position is already set, 0 otherwise).
++///
++/// This is the block layer's hottest loop (one symbol per non-zero level), so
++/// the symbol lookup is inlined here and each run/level code is consumed
++/// together with its sign bit in a single reservoir operation.
++fn decode_coefficient_run(
++    r: &mut BitReader<'_>,
++    table: &VlcTable,
++    scan: &[usize; 64],
++    mut n: usize,
++    out: &mut [i16; 64],
++) -> Result<()> {
+     loop {
+-        let sym = table.decode(r)?;
++        let Some((sym, len)) = table.peek_symbol_and_len(r) else {
++            return Err(table.invalid_code(r));
++        };
+         if sym == EOB {
++            r.skip(len);
+             break;
+         }
+         let (run, level) = if sym == ESCAPE {
++            r.skip(len);
+             let run = r.u(6) as usize;
+             let raw = r.u(12) as i32;
+             (run, if raw >= 2048 { raw - 4096 } else { raw })
+         } else {
+             let run = (sym >> 8) as usize;
+-            let mut level = sym & 0xff;
+-            if r.flag() {
+-                level = -level;
+-            }
++            let level = sym & 0xff;
++            // The run/level code is immediately followed by its sign bit;
++            // reading both in one operation halves the reservoir traffic per
++            // coefficient.
++            let combined = r.u(len + 1);
++            let level = if combined & 1 != 0 { -level } else { level };
+             (run, level)
+         };
+         n += run;
+@@ -667,7 +691,9 @@ fn decode_macroblock(
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::mirror_single_vector_predictors;
++    use super::*;
++    use crate::mpeg2::constants::ZIGZAG_SCAN;
++    use crate::mpeg2::vlc_tables::{DCT_COEFF_TABLE0, DCT_COEFF_TABLE1};
+ 
+     #[test]
+     fn one_vector_motion_updates_both_r_predictors() {
+@@ -675,4 +701,206 @@ mod tests {
+         mirror_single_vector_predictors(&mut pmv, true, true);
+         assert_eq!(pmv, [11, -12, 21, -22, 11, -12, 21, -22]);
+     }
++
++    /// A run of [`usize::MAX`] marks a raw bit pattern to emit verbatim, which
++    /// is how an invalid code (one no table entry covers) reaches the loop.
++    const INVALID_BITS: usize = usize::MAX;
++
++    /// Encode `(run, level)` pairs plus an EOB into bytes using the real
++    /// coefficient table's codes, with a sign bit after every run/level code.
++    /// A pair whose value is not in the table uses the escape form, which is
++    /// how out-of-range runs and levels reach the loop. A pair whose run is
++    /// [`INVALID_BITS`] emits `level` zero bits verbatim instead.
++    fn encode_blocks(
++        table: &'static [(&'static str, i32)],
++        blocks: &[&[(usize, i32, bool)]],
++    ) -> Vec<u8> {
++        let eob = table.iter().find(|(_, v)| *v == EOB).unwrap().0;
++        let escape = table.iter().find(|(_, v)| *v == ESCAPE).unwrap().0;
++        let mut bits: Vec<u32> = Vec::new();
++        for pairs in blocks {
++            for &(run, level, negative) in *pairs {
++                if run == INVALID_BITS {
++                    bits.extend(std::iter::repeat_n(u32::from(negative), level as usize));
++                    continue;
++                }
++                let value = ((run as i32) << 8) | level;
++                match table.iter().find(|(_, v)| *v == value) {
++                    Some((code, _)) => {
++                        for ch in code.chars() {
++                            bits.push(ch.to_digit(2).unwrap());
++                        }
++                        bits.push(u32::from(negative));
++                    }
++                    None => {
++                        for ch in escape.chars() {
++                            bits.push(ch.to_digit(2).unwrap());
++                        }
++                        for b in (0..6).rev() {
++                            bits.push((run as u32 >> b) & 1);
++                        }
++                        let raw = if negative {
++                            4096 - level as u32
++                        } else {
++                            level as u32
++                        };
++                        for b in (0..12).rev() {
++                            bits.push((raw >> b) & 1);
++                        }
++                    }
++                }
++            }
++            for ch in eob.chars() {
++                bits.push(ch.to_digit(2).unwrap());
++            }
++        }
++        while bits.len() % 8 != 0 {
++            bits.push(0);
++        }
++        bits.chunks(8)
++            .map(|c| c.iter().fold(0u8, |b, bit| (b << 1) | *bit as u8))
++            .collect()
++    }
++
++    /// The previous block-layer loop, kept as the reference the inlined fast
++    /// path must match bit for bit: one `decode` call per symbol and the sign
++    /// read as its own bit.
++    fn reference_coefficient_run(
++        r: &mut BitReader<'_>,
++        table: &VlcTable,
++        scan: &[usize; 64],
++        mut n: usize,
++        out: &mut [i16; 64],
++    ) -> Result<()> {
++        loop {
++            let sym = table.decode(r)?;
++            if sym == EOB {
++                break;
++            }
++            let (run, level) = if sym == ESCAPE {
++                let run = r.u(6) as usize;
++                let raw = r.u(12) as i32;
++                (run, if raw >= 2048 { raw - 4096 } else { raw })
++            } else {
++                let run = (sym >> 8) as usize;
++                let mut level = sym & 0xff;
++                if r.flag() {
++                    level = -level;
++                }
++                (run, level)
++            };
++            n += run;
++            if n > 63 {
++                bail!("coefficient index {n} out of range at bit {}", r.bit_pos());
++            }
++            out[scan[n]] = level as i16;
++            n += 1;
++        }
++        Ok(())
++    }
++
++    /// Run both loops over one encoded stream and check they agree on the
++    /// decoded levels, the final bit position, and the error if there is one.
++    fn compare_loops(
++        entries: &'static [(&'static str, i32)],
++        name: &'static str,
++        blocks: &[&[(usize, i32, bool)]],
++    ) {
++        let table = VlcTable::new(name, entries);
++        let data = encode_blocks(entries, blocks);
++        let mut reference = BitReader::new(&data);
++        let mut candidate = BitReader::new(&data);
++        for block_index in 0..blocks.len() {
++            let mut reference_out = [0i16; 64];
++            let mut candidate_out = [0i16; 64];
++            let reference_result = reference_coefficient_run(
++                &mut reference,
++                &table,
++                &ZIGZAG_SCAN,
++                0,
++                &mut reference_out,
++            );
++            let candidate_result =
++                decode_coefficient_run(&mut candidate, &table, &ZIGZAG_SCAN, 0, &mut candidate_out);
++            match (&reference_result, &candidate_result) {
++                (Ok(()), Ok(())) => {
++                    assert_eq!(
++                        candidate_out, reference_out,
++                        "{name} block {block_index}: decoded levels differ"
++                    );
++                    assert_eq!(
++                        candidate.bit_pos(),
++                        reference.bit_pos(),
++                        "{name} block {block_index}: the two loops consumed different numbers of bits"
++                    );
++                }
++                (Err(reference_error), Err(candidate_error)) => {
++                    assert_eq!(
++                        candidate_error.message(),
++                        reference_error.message(),
++                        "{name} block {block_index}: the error strings differ"
++                    );
++                    assert_eq!(
++                        candidate.bit_pos(),
++                        reference.bit_pos(),
++                        "{name} block {block_index}: the two loops failed at different bit positions"
++                    );
++                    assert_eq!(
++                        candidate_out, reference_out,
++                        "{name} block {block_index}: levels before the error differ"
++                    );
++                    return;
++                }
++                (reference_result, candidate_result) => {
++                    panic!(
++                        "{name} block {block_index}: one loop decoded and the other failed: reference {reference_result:?}, candidate {candidate_result:?}"
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn the_inlined_coefficient_loop_matches_the_reference_run_level_decode() {
++        let blocks: &[&[(usize, i32, bool)]] = &[
++            // run 0 and 1, levels 1 and 2, both signs
++            &[
++                (0, 1, false),
++                (0, 1, true),
++                (0, 2, true),
++                (1, 1, false),
++                (0, 2, false),
++            ],
++            // a longer run and a larger level, still inside the table
++            &[(2, 1, true), (5, 1, false), (0, 8, true)],
++            // escape: positive and negative run/level pairs absent from the table
++            &[(0, 1, false), (5, 5, false), (5, 5, true), (0, 1, true)],
++        ];
++        for (name, entries) in [("B.14", DCT_COEFF_TABLE0), ("B.15", DCT_COEFF_TABLE1)] {
++            compare_loops(entries, name, blocks);
++        }
++    }
++
++    #[test]
++    fn an_out_of_range_run_is_reported_by_both_loops_with_the_same_error() {
++        // A run of 63 fills the block and the next symbol must then exceed it.
++        for (name, entries) in [("B.14", DCT_COEFF_TABLE0), ("B.15", DCT_COEFF_TABLE1)] {
++            compare_loops(entries, name, &[&[(63, 1, false), (1, 1, false)]]);
++        }
++    }
++
++    #[test]
++    fn an_invalid_code_is_reported_by_both_loops_with_the_same_error_and_position() {
++        // Sixteen zero bits before the appended EOB are not a code in either table: no
++        // B.14/B.15 entry starts with sixteen zeroes, so the primary lookup
++        // finds nothing and both loops must name the same invalid pattern at
++        // the same bit position.
++        for (name, entries) in [("B.14", DCT_COEFF_TABLE0), ("B.15", DCT_COEFF_TABLE1)] {
++            compare_loops(
++                entries,
++                name,
++                &[&[(0, 1, false), (INVALID_BITS, 16, false)]],
++            );
++        }
++    }
+ }
+diff --git a/crates/mpeg2toh264/src/mpeg2/vlc.rs b/crates/mpeg2toh264/src/mpeg2/vlc.rs
+index dd4839e3fe9da8f6a99022beac7309fc50645414..7760a232ce06fe9dfbbae4eba69e97da865f26a1 100644
+--- a/crates/mpeg2toh264/src/mpeg2/vlc.rs
++++ b/crates/mpeg2toh264/src/mpeg2/vlc.rs
+@@ -5,7 +5,7 @@
+ //! the table, then consume that many bits. Costs one memory read per symbol.
+ 
+ use crate::bitreader::BitReader;
+-use crate::error::{bail, Result};
++use crate::error::{bail, Error, Result};
+ 
+ pub struct VlcTable {
+     name: &'static str,
+@@ -88,7 +88,10 @@ impl VlcTable {
+         }
+     }
+ 
+-    #[inline]
++    /// Always-inlined because `decode_coefficient_run` is too
++    /// large for the regular inliner to expand this into, and a call per symbol
++    /// is most of what the combined-read path removes.
++    #[inline(always)]
+     fn lookup(&self, r: &mut BitReader<'_>) -> u32 {
+         let primary = r.peek(self.primary_bits) as usize;
+         let mut entry = self.entries[primary];
+@@ -147,18 +150,48 @@ impl VlcTable {
+ 
+     /// Peek at the symbol without consuming it; `None` if the code is invalid.
+     pub fn peek_symbol(&self, r: &mut BitReader<'_>) -> Option<i32> {
++        self.peek_symbol_and_len(r).map(|(symbol, _)| symbol)
++    }
++
++    /// Peek at the block-layer coefficient symbol and its code length without
++    /// consuming any bits; `None` marks an invalid code, which the caller
++    /// reports through [`Self::invalid_code`].
++    ///
++    /// Keeping the error machinery out of this method is what lets the
++    /// coefficient loop inline the whole table read and consume a run/level
++    /// code together with its sign bit in a single reservoir operation.
++    #[inline]
++    pub(crate) fn peek_symbol_and_len(&self, r: &mut BitReader<'_>) -> Option<(i32, u32)> {
+         let entry = self.lookup(r);
+-        if entry & 31 == 0 {
++        let len = entry & 31;
++        if len == 0 {
+             None
+         } else {
+-            Some((entry as i32) >> 5)
++            Some(((entry as i32) >> 5, len))
+         }
+     }
++
++    /// The error [`Self::peek_symbol_and_len`]'s `None` stands for. Cold path:
++    /// marked never-inline so the coefficient loop's inlined fast path does not
++    /// drag the formatting machinery in with it. The message and the bit
++    /// position are exactly what [`Self::decode`] reports for the same stream.
++    #[inline(never)]
++    pub(crate) fn invalid_code(&self, r: &mut BitReader<'_>) -> Error {
++        let index = r.peek(self.max_len) as usize;
++        Error::new(format!(
++            "{}: invalid code 0b{:0width$b} at bit {}",
++            self.name,
++            index,
++            r.bit_pos(),
++            width = self.max_len as usize
++        ))
++    }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::mpeg2::vlc_tables::{DCT_COEFF_TABLE0, DCT_COEFF_TABLE1};
+ 
+     #[test]
+     fn long_codes_share_a_compact_secondary_table() {
+@@ -190,4 +223,73 @@ mod tests {
+         let mut invalid = BitReader::new(&[0x20, 0, 0, 0]);
+         assert!(table.decode_or_zero_stuffing(&mut invalid).is_err());
+     }
++
++    #[test]
++    fn peek_symbol_and_len_consumes_identically_to_decode() {
++        // Every code of both real coefficient tables in a row, each followed by
++        // the sign bit that a run/level code carries: the fast path must name
++        // the same symbol, the same code length, and leave the reader at the
++        // same bit position as the reference decode.
++        for (name, entries) in [("B.14", DCT_COEFF_TABLE0), ("B.15", DCT_COEFF_TABLE1)] {
++            let table = VlcTable::new(name, entries);
++            let mut bits: Vec<u32> = Vec::new();
++            for (code, _) in entries {
++                for ch in code.chars() {
++                    bits.push(ch.to_digit(2).unwrap());
++                }
++                bits.push(0); // sign bit
++            }
++            while bits.len() % 8 != 0 {
++                bits.push(0);
++            }
++            let data: Vec<u8> = bits
++                .chunks(8)
++                .map(|c| c.iter().fold(0u8, |b, bit| (b << 1) | *bit as u8))
++                .collect();
++
++            let mut via_decode = BitReader::new(&data);
++            let mut via_fast = BitReader::new(&data);
++            for (code, value) in entries {
++                assert_eq!(
++                    table.decode(&mut via_decode).unwrap(),
++                    *value,
++                    "{name}: decode of {code}"
++                );
++                via_decode.skip(1); // the sign bit that follows a run/level code
++                let (sym, len) = table
++                    .peek_symbol_and_len(&mut via_fast)
++                    .expect("fast path decodes");
++                assert_eq!(sym, *value, "{name}: peek of {code}");
++                via_fast.skip(len);
++                via_fast.skip(1); // the sign bit the coefficient caller takes with u(len+1)
++                assert_eq!(
++                    via_fast.bit_pos(),
++                    via_decode.bit_pos(),
++                    "{name}: bit position after {code}"
++                );
++            }
++            assert_eq!(via_fast.bit_pos(), via_decode.bit_pos());
++        }
++    }
++
++    #[test]
++    fn invalid_code_reports_the_decode_error_verbatim() {
++        // Sixteen zero bits are not a code in either coefficient table, so the
++        // fast path's cold helper must reproduce exactly what decode reports.
++        for (name, entries) in [("B.14", DCT_COEFF_TABLE0), ("B.15", DCT_COEFF_TABLE1)] {
++            let table = VlcTable::new(name, entries);
++            let mut via_decode = BitReader::new(&[0, 0, 0, 0]);
++            let mut via_fast = BitReader::new(&[0, 0, 0, 0]);
++            let decode_error = table.decode(&mut via_decode).unwrap_err();
++            let fast_symbol = table.peek_symbol_and_len(&mut via_fast).map(|(s, _)| s);
++            assert_eq!(fast_symbol, None, "{name}: sixteen zeroes must be invalid");
++            let fast_error = table.invalid_code(&mut via_fast);
++            assert_eq!(
++                fast_error.message(),
++                decode_error.message(),
++                "{name}: the fast path's error differs from decode's"
++            );
++            assert_eq!(via_fast.bit_pos(), via_decode.bit_pos());
++        }
++    }
+ }
+diff --git a/crates/mpeg2toh264/src/session.rs b/crates/mpeg2toh264/src/session.rs
+index bd405295b469041fa2e9292a61e52cab6ec9b93c..b6282394e8f99b684c581d0c412345c9a3bbab50 100644
+--- a/crates/mpeg2toh264/src/session.rs
++++ b/crates/mpeg2toh264/src/session.rs
+@@ -668,7 +668,8 @@ impl Session {
+             match packet.kind {
+                 ElementaryKind::Video => {
+                     if packet.damaged_previous_pes {
+-                        self.gops.discard_pending();
++                        self.pending_gops
++                            .extend(self.gops.take_complete_prefix_before_gap());
+                     }
+                     let units = self.gops.push_with_restart(
+                         &packet.data,
+diff --git a/crates/mpeg2toh264/tests/fixtures.rs b/crates/mpeg2toh264/tests/fixtures.rs
+index 667f46007f4e4aa92c15d47e774caba37cf5b350..56ec189c948656bc82b1a26aa0463db93981e23a 100644
+--- a/crates/mpeg2toh264/tests/fixtures.rs
++++ b/crates/mpeg2toh264/tests/fixtures.rs
+@@ -21,6 +21,10 @@ use support::{fnv1a, read_fixture, split_annex_b, FIXTURES};
+ /// short-term reference list outright. Both only move the slice headers: each
+ /// fixture decodes to the same frames as before, checked frame by frame with
+ /// `ffmpeg -f framemd5`.
++#[cfg(not(all(
++    feature = "experimental-symmetric-field-basis",
++    feature = "experimental-symmetric-idct"
++)))]
+ const GOLDEN: [(&str, usize, usize, u64); 6] = [
+     ("altscan.m2v", 8, 224007, 0x4c98_4bed_dc31_53c5),
+     ("escape.m2v", 6, 122600, 0x273e_747d_a781_32cf),
+@@ -30,6 +34,22 @@ const GOLDEN: [(&str, usize, usize, u64); 6] = [
+     ("ip.m2v", 10, 132314, 0x7f35_4fc6_a64f_829c),
+ ];
+ 
++// KonomiTV の統合検証用 WASM は2つの演算試作を同時に有効化する。
++// 対称性を用いた丸め経路によって altscan と hd1080i の係数表現が意図的に変わるため、
++// 組み合わせ後のビットストリームも固定し、以後の意図しない変化を検出する。
++#[cfg(all(
++    feature = "experimental-symmetric-field-basis",
++    feature = "experimental-symmetric-idct"
++))]
++const GOLDEN: [(&str, usize, usize, u64); 6] = [
++    ("altscan.m2v", 8, 224007, 0xa813_8ed1_4e3d_0261),
++    ("escape.m2v", 6, 122600, 0x273e_747d_a781_32cf),
++    ("hd1080i.m2v", 15, 2106378, 0x2b2f_6483_a0b4_7704),
++    ("i_only.m2v", 3, 79513, 0x31f6_0c7f_fb6b_b97a),
++    ("ibbp.m2v", 15, 164459, 0x183e_7cc0_f7ca_1a86),
++    ("ip.m2v", 10, 132314, 0x7f35_4fc6_a64f_829c),
++];
++
+ #[test]
+ fn transcodes_every_fixture_to_the_expected_bitstream() {
+     let mut mismatches = Vec::new();
+diff --git a/crates/mpeg2toh264/tests/params.rs b/crates/mpeg2toh264/tests/params.rs
+index d9b20a538277da927ed30037aad8dd2079b5f817..af7ea84e083b6fcfe708046dd27940b0aa7d0935 100644
+--- a/crates/mpeg2toh264/tests/params.rs
++++ b/crates/mpeg2toh264/tests/params.rs
+@@ -3,7 +3,8 @@
+ 
+ use mpeg2toh264::h264::params::{write_pps, write_sps, PpsConfig, SpsConfig, ZIGZAG_8X8};
+ use mpeg2toh264::mpeg2::constants::DEFAULT_INTRA_QUANT;
+-use mpeg2toh264::mpeg2::headers::SampleAspectRatio;
++use mpeg2toh264::mpeg2::headers::{parse_elementary_stream, SampleAspectRatio};
++use mpeg2toh264::{transcode, TranscodeOptions};
+ 
+ /// Strip the Annex B start code, NAL header and emulation prevention bytes.
+ fn rbsp_of(nal: &[u8]) -> Vec<u8> {
+@@ -246,6 +247,56 @@ fn sps_carries_an_interlaced_source_as_mbaff_with_doubled_crop_units() {
+     );
+ }
+ 
++#[test]
++fn odd_interlaced_transcode_emits_a_complete_mbaff_pair_and_crop() {
++    // Reuse the checked-in interlaced fixture, changing only the sequence
++    // header's vertical_size from 1080 to 720.  Its coded macroblock data is
++    // deliberately allowed to run past the shortened grid: the MPEG-2
++    // decoder's outside cell absorbs those source rows, while this test
++    // observes the output geometry and the transcoder's no-panic contract.
++    let path = format!("{}/../../testdata/hd1080i.m2v", env!("CARGO_MANIFEST_DIR"));
++    let mut source = std::fs::read(path).expect("interlaced fixture is readable");
++    let header = source
++        .windows(4)
++        .position(|bytes| bytes == [0, 0, 1, 0xb3])
++        .expect("sequence header");
++    let payload = header + 4;
++    let width = ((source[payload] as u16) << 4) | ((source[payload + 1] as u16) >> 4);
++    assert_eq!(width, 1440);
++    let height = 720u16;
++    source[payload + 1] = (source[payload + 1] & 0xf0) | ((height >> 8) as u8);
++    source[payload + 2] = height as u8;
++
++    let pictures = parse_elementary_stream(&source).expect("mutated fixture parses");
++    assert!(!pictures.is_empty());
++    assert!(pictures
++        .iter()
++        .all(|picture| picture.sequence.vertical_size == 720));
++    assert_eq!(pictures[0].sequence.horizontal_size, 1440);
++    assert_eq!((pictures[0].sequence.vertical_size + 15) >> 4, 45);
++    assert!(!pictures[0].slices.is_empty());
++
++    // This is a malformed-input regression: only the sequence header was
++    // changed, not the existing 1440x1080 macroblock payload. Valid 1280x720
++    // runtime evidence is recorded separately in odd720-validation.json.
++    let result = transcode(&source, TranscodeOptions::default()).expect("odd source transcodes");
++    assert!(result.pictures_converted > 0);
++    let start = result
++        .bitstream
++        .windows(5)
++        .position(|bytes| bytes[..4] == [0, 0, 0, 1] && bytes[4] & 0x1f == 7)
++        .expect("transcoded SPS");
++    let end = result.bitstream[start + 4..]
++        .windows(4)
++        .position(|bytes| bytes == [0, 0, 0, 1])
++        .map_or(result.bitstream.len(), |offset| start + 4 + offset);
++    let sps = parse_sps(&result.bitstream[start..end]);
++    assert_eq!(sps.pic_height_in_map_units_minus1, 22, "23 MBAFF map units");
++    assert!(!sps.frame_mbs_only);
++    assert!(sps.mb_adaptive_frame_field);
++    assert_eq!(sps.crop, Some([0, 0, 0, 4]), "16 lines at CropUnitY 4");
++}
++
+ #[test]
+ fn sps_carries_a_pixel_aspect_ratio_as_extended_sar() {
+     let nal = write_sps(&sample_sps(Some(SampleAspectRatio {
+diff --git a/crates/mpeg2toh264/tests/streaming.rs b/crates/mpeg2toh264/tests/streaming.rs
+index 5b92662c83b6903d5aee85ab6f752233e26aced0..252adf9e8368e751facb8807a24831f8317bf6f5 100644
+--- a/crates/mpeg2toh264/tests/streaming.rs
++++ b/crates/mpeg2toh264/tests/streaming.rs
+@@ -745,7 +745,11 @@ fn drops_a_truncated_final_frame() {
+ // ------------------------------------------------------------------- Session
+ 
+ fn video_only_stream(copies: usize) -> Vec<u8> {
+-    let es = repeat_fixture("ibbp.m2v", copies);
++    video_stream_from_fixture("ibbp.m2v", copies)
++}
++
++fn video_stream_from_fixture(name: &str, copies: usize) -> Vec<u8> {
++    let es = repeat_fixture(name, copies);
+     let units: Vec<PesUnit<'_>> = es
+         .chunks(20_000)
+         .enumerate()
+@@ -1614,6 +1618,88 @@ fn a_hole_in_the_recording_does_not_move_what_follows_it() {
+     );
+ }
+ 
++#[test]
++fn a_transport_hole_keeps_pictures_completed_before_the_missing_packet() {
++    // Each 20 kB PES carries several complete picture starts. Losing its last
++    // transport packet leaves an unfinished final picture, but the pictures
++    // ending before that packet remain valid input to the transcoder.
++    let stream = video_only_stream(2);
++    let video_starts: Vec<usize> = stream
++        .chunks(188)
++        .enumerate()
++        .filter(|(_, packet)| {
++            let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
++            pid == VIDEO_PID && packet[1] & 0x40 != 0
++        })
++        .map(|(index, _)| index)
++        .collect();
++    assert!(video_starts.len() > 4);
++    let count_video_samples = |stream: &[u8]| {
++        run_session(stream, 64 * 1024)
++            .iter()
++            .map(|fragment| match fragment {
++                Fragment::Media { video_samples, .. } => *video_samples,
++                _ => 0,
++            })
++            .sum::<usize>()
++    };
++    let intact_samples = count_video_samples(&stream);
++    let final_packet_missing =
++        count_video_samples(&with_packets_dropped(&stream, video_starts[3] - 1, 1));
++    let earlier_packet_missing =
++        count_video_samples(&with_packets_dropped(&stream, video_starts[3] - 2, 1));
++
++    assert_eq!(intact_samples, 31, "the intact fixture is the control");
++    assert_eq!(
++        final_packet_missing, 24,
++        "pictures bounded before a loss at the PES tail remain available"
++    );
++    assert_eq!(
++        earlier_packet_missing, 20,
++        "an earlier loss retains only the shorter byte-complete prefix"
++    );
++}
++
++#[test]
++fn a_transport_hole_still_uses_the_field_and_open_gop_rules() {
++    // The prefix retained before a hole still goes through the ordinary
++    // field-pair and open-GOP filters. The 1080i fixture checks the interlaced
++    // timeline; the open-GOP fixture begins groups with complementary B fields.
++    // The sample counts are the externally visible decisions of those filters
++    // at two loss positions; the splitter does not duplicate their policy.
++    for (name, copies, expected_tail, expected_earlier) in [
++        ("hd1080i.m2v", 4, 48, 48),
++        ("open_gop_leading_bb.m2v", 2, 88, 84),
++    ] {
++        let stream = video_stream_from_fixture(name, copies);
++        let video_starts: Vec<usize> = stream
++            .chunks(188)
++            .enumerate()
++            .filter(|(_, packet)| {
++                let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
++                pid == VIDEO_PID && packet[1] & 0x40 != 0
++            })
++            .map(|(index, _)| index)
++            .collect();
++        let count = |stream: &[u8]| {
++            run_session(stream, 64 * 1024)
++                .iter()
++                .map(|fragment| match fragment {
++                    Fragment::Media { video_samples, .. } => *video_samples,
++                    _ => 0,
++                })
++                .sum::<usize>()
++        };
++        let tail = count(&with_packets_dropped(&stream, video_starts[3] - 1, 1));
++        let earlier = count(&with_packets_dropped(&stream, video_starts[3] - 2, 1));
++        assert_eq!(
++            (tail, earlier),
++            (expected_tail, expected_earlier),
++            "{name} retains only the structurally usable prefix at each loss position",
++        );
++    }
++}
++
+ #[test]
+ fn hidden_packet_loss_at_payload_discontinuities_recovers_both_tracks() {
+     // A payload-bearing discontinuity marker resets the counter baseline, so
+diff --git a/package.json b/package.json
+index 80082e9f20ad702333094e421281a6ed1f8bad90..43ffc17e066b00fc12a17c9d5b4894c39e71e46a 100644
+--- a/package.json
++++ b/package.json
+@@ -25,6 +25,7 @@
+     "packages:build": "npm run build --workspace @mpeg2toh264/player && npm run build --workspace @mpeg2toh264/yadif",
+     "test:ivtc": "node tools/test-ivtc.cjs",
+     "test:mse": "node tools/test-mse-reset.mjs",
++    "test:range-eof": "node tools/test-range-eof.mjs",
+     "web:dev": "npm run packages:build && npm run dev --workspace @mpeg2toh264/demo",
+     "web:build": "npm run packages:build && npm run build --workspace @mpeg2toh264/demo",
+     "typecheck": "npm run typecheck --workspaces --if-present",
+diff --git a/packages/player/src/source.ts b/packages/player/src/source.ts
+index da6708784f8b9fffbe4862cb796edb44d1f3c10a..204c7f2b98473331443f496bef8f0256eeaa5897 100644
+--- a/packages/player/src/source.ts
++++ b/packages/player/src/source.ts
+@@ -38,6 +38,70 @@ interface Range {
+   totalBytes: number;
+ }
+ 
++/**
++ * Whether this failure is the server refusing an unsatisfiable byte range.
++ *
++ * Only a numeric 416 on the error's structured `cause` counts. That cause
++ * is attached by `openSource` below from the response status, so no message
++ * text is ever parsed -- including messages that merely mention 416.
++ */
++export function isRangeNotSatisfiable(error: unknown): boolean {
++  if (!(error instanceof Error)) return false;
++  const cause: unknown = error.cause;
++  if (typeof cause !== "object" || cause === null) return false;
++  return (cause as { status?: unknown }).status === 416;
++}
++
++/**
++ * Whether a read-loop failure is the natural end of a finite recording.
++ *
++ * True only when the failed reopen asked at or past the total the server
++ * stated and the failure carries a structured 416. A null total -- a live
++ * input, or one whose length was never stated -- never drains, since there
++ * is no end to reach. A 416 below the known total means the file changed
++ * under the load and stays fatal, as does every other failure.
++ */
++export function isRangeExhaustion(
++  nextByte: number,
++  totalBytes: number | null,
++  error: unknown,
++): boolean {
++  return (
++    totalBytes !== null &&
++    nextByte >= totalBytes &&
++    isRangeNotSatisfiable(error)
++  );
++}
++
++/** The failure text with where reading stood, for the error surface. */
++function describeRangeError(
++  error: unknown,
++  offset: number,
++  totalBytes: number | null,
++): string {
++  const base = error instanceof Error ? error.message : String(error);
++  const total = totalBytes === null ? "unknown" : String(totalBytes);
++  return `${base} (range bytes=${offset}-, totalBytes=${total})`;
++}
++
++/**
++ * Annotate a range-request failure with where reading stood, for the error
++ * surface. Applied only at the two boundaries that own a range request --
++ * the leg open and the read-loop reopen; failures from WASM, the pool, the
++ * transcoder, or the sink reach the leg catch unmodified. Carries no
++ * headers, URLs, or credentials.
++ */
++export function withRangeContext(
++  error: unknown,
++  nextByte: number,
++  totalBytes: number | null,
++): Error {
++  const out = new Error(describeRangeError(error, nextByte, totalBytes));
++  if (error instanceof Error && error.cause !== undefined)
++    out.cause = error.cause;
++  return out;
++}
++
+ export async function openSource(
+   url: string,
+   signal: AbortSignal,
+@@ -77,8 +141,11 @@ export async function openSource(
+   }
+   if (!response.ok) {
+     close();
++    // The numeric status travels on `cause` so the worker can classify a
++    // 416 without parsing the message, which DPlayer surfaces verbatim.
+     throw new Error(
+       `could not fetch the input: HTTP ${response.status} ${response.statusText}`,
++      { cause: { status: response.status } },
+     );
+   }
+   if (!response.body) {
+diff --git a/packages/player/src/worker.ts b/packages/player/src/worker.ts
+index d6463a0e63b9e52154c2bef76f49d2bf05075951..2f75489fe78ac07bd75a31e9a225fa14c7a541e1 100644
+--- a/packages/player/src/worker.ts
++++ b/packages/player/src/worker.ts
+@@ -27,7 +27,14 @@ import {
+   type TimingMark,
+ } from "./protocol.js";
+ import { defaultPoolSize, PicturePool } from "./pool.js";
+-import { openSource, readSlice, readTail, type Source } from "./source.js";
++import {
++  isRangeExhaustion,
++  openSource,
++  readSlice,
++  readTail,
++  withRangeContext,
++  type Source,
++} from "./source.js";
+ import {
+   detach,
+   firstTimestamp,
+@@ -556,7 +563,15 @@ class Playback {
+       mark(id, "wasm");
+       await this.#openPool(module);
+       if (!this.#running(leg)) return;
+-      const source = await openSource(this.#command.url, signal, offset);
++      let source: Source;
++      try {
++        source = await openSource(this.#command.url, signal, offset);
++      } catch (error) {
++        // The range open owns this failure, so it carries where reading
++        // stood. Everything below -- WASM, pool, transcoder, and sink --
++        // reaches the leg catch unmodified.
++        throw withRangeContext(error, offset, this.#totalBytes);
++      }
+       if (!this.#running(leg)) return;
+       mark(id, "response");
+       this.#totalBytes ??= source.totalBytes;
+@@ -696,7 +711,17 @@ class Playback {
+           if (!reopen) continue;
+         }
+       } catch (error) {
+-        if (this.#running(leg) && !this.#leg!.signal.aborted) readError = error;
++        if (this.#running(leg) && !this.#leg!.signal.aborted) {
++          // A reopen refused at or past the known total is the natural end
++          // of a finite recording: drop the error so the queued tail still
++          // converts and the load completes. Anything else stays fatal,
++          // with where reading stood attached for the error surface.
++          if (isRangeExhaustion(nextByte, this.#totalBytes, error)) {
++            readError = null;
++          } else {
++            readError = withRangeContext(error, nextByte, this.#totalBytes);
++          }
++        }
+       } finally {
+         ended = true;
+         available.abandon();
+diff --git a/packages/yadif/src/ivtc.ts b/packages/yadif/src/ivtc.ts
+index 443e85801902f79c5dcbe6d04fe4410740f1073a..3e82f50fb943d26271624a8556377663ac44841c 100644
+--- a/packages/yadif/src/ivtc.ts
++++ b/packages/yadif/src/ivtc.ts
+@@ -439,21 +439,38 @@ export class FFmpegIVTC {
+   /** Calculate fieldmatch's vertical comb mask and overlapping 16x16 score. */
+   static #combedScore(luma: Uint8Array, width: number, height: number): number {
+     const mask = new Uint8Array(width * height);
+-    const sample = (x: number, y: number): number =>
+-      luma[Math.max(0, Math.min(height - 1, y)) * width + x] ?? 0;
+     // The five-tap vertical filter marks pixels whose alternating-line energy
+     // exceeds FFmpeg's default cthresh on both adjacent lines
+     for (let y = 0; y < height; y++) {
++      const currentRow = y * width;
++      const previousRow =
++        Math.max(0, Math.min(height - 1, y === 0 ? 1 : y - 1)) * width;
++      const nextRow =
++        Math.max(
++          0,
++          Math.min(height - 1, y === height - 1 ? height - 2 : y + 1),
++        ) * width;
++      const farPreviousRow =
++        Math.max(0, Math.min(height - 1, y < 2 ? (y === 0 ? 2 : 3) : y - 2)) *
++        width;
++      const farNextRow =
++        Math.max(
++          0,
++          Math.min(
++            height - 1,
++            y + 2 >= height
++              ? y === height - 1
++                ? height - 3
++                : height - 4
++              : y + 2,
++          ),
++        ) * width;
+       for (let x = 0; x < width; x++) {
+-        const current = sample(x, y);
+-        const previous = sample(x, y === 0 ? 1 : y - 1);
+-        const next = sample(x, y === height - 1 ? height - 2 : y + 1);
+-        const farPrevious =
+-          y < 2 ? sample(x, y === 0 ? 2 : 3) : sample(x, y - 2);
+-        const farNext =
+-          y + 2 >= height
+-            ? sample(x, y === height - 1 ? height - 3 : height - 4)
+-            : sample(x, y + 2);
++        const current = luma[currentRow + x] ?? 0;
++        const previous = luma[previousRow + x] ?? 0;
++        const next = luma[nextRow + x] ?? 0;
++        const farPrevious = luma[farPreviousRow + x] ?? 0;
++        const farNext = luma[farNextRow + x] ?? 0;
+         const hasAdjacentDifference =
+           y === 0
+             ? Math.abs(current - next) > FFmpegIVTC.COMB_THRESHOLD
+diff --git a/tools/test-range-eof.mjs b/tools/test-range-eof.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f4071b8cff8c40d53daf927973e773e52854bfc
+--- /dev/null
++++ b/tools/test-range-eof.mjs
+@@ -0,0 +1,203 @@
++import assert from "node:assert/strict";
++import { unlink } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { pathToFileURL } from "node:url";
++
++import { build } from "esbuild";
++
++// Focused regression test for the iPad Original steady-playback HTTP 416
++// stop (reproduced by the range contract below): a high-water reopen answered 416
++// at the natural end of the file used to fail the whole load.
++//
++// The test bundles the real `packages/player/src/source.ts` and executes
++// its exported decision against real `openSource` refusals. It never
++// reimplements the predicate: every drain/fatal verdict below comes from
++// `isRangeExhaustion` itself.
++//
++// Run from the repository root (node with the workspace dependencies):
++//   npm run test:range-eof
++
++function makeFile(totalBytes) {
++  const file = new Uint8Array(totalBytes);
++  for (let index = 0; index < totalBytes; index++) file[index] = index % 251;
++  return file;
++}
++
++function headerValue(headers, name) {
++  if (!headers) return null;
++  if (typeof headers.get === "function") return headers.get(name);
++  const key = Object.keys(headers).find(
++    (candidate) => candidate.toLowerCase() === name.toLowerCase(),
++  );
++  return key === undefined ? null : headers[key];
++}
++
++// Minimal Starlette-like fixture: 206 with Content-Range for satisfiable
++// open ranges, 416 once the start reaches the end. The file is read
++// through `ref` on every call so tests can shrink or grow it mid-load.
++function mockFetch(ref) {
++  return async (_url, options = {}) => {
++    const file = ref.data;
++    const total = file.byteLength;
++    const range = headerValue(options.headers, "Range");
++    const open =
++      range === null || range === undefined
++        ? null
++        : range.match(/^bytes=(\d+)-$/);
++    if (!open) {
++      return new Response(file.slice().buffer, {
++        status: 200,
++        headers: { "Content-Length": String(total) },
++      });
++    }
++    const start = Number(open[1]);
++    if (start >= total) {
++      return new Response(null, {
++        status: 416,
++        statusText: "Range Not Satisfiable",
++        headers: { "Content-Range": `bytes */${total}` },
++      });
++    }
++    const body = file.slice(start);
++    return new Response(body.buffer, {
++      status: 206,
++      headers: {
++        "Content-Range": `bytes ${start}-${total - 1}/${total}`,
++        "Content-Length": String(body.byteLength),
++      },
++    });
++  };
++}
++
++const output = join(tmpdir(), `mpeg2toh264-range-test-${process.pid}.mjs`);
++const realFetch = globalThis.fetch;
++const INPUT_URL = "https://example.invalid/v/3/download";
++
++const refuses = (promise) =>
++  promise.then(
++    () => assert.fail("expected a refusal"),
++    (error) => error,
++  );
++
++try {
++  await build({
++    entryPoints: ["packages/player/src/source.ts"],
++    outfile: output,
++    bundle: true,
++    format: "esm",
++    platform: "browser",
++  });
++  const {
++    openSource,
++    isRangeNotSatisfiable,
++    isRangeExhaustion,
++    withRangeContext,
++  } = await import(pathToFileURL(output));
++  const signal = new AbortController().signal;
++
++  // 1. EOF 416 at the known total drains instead of failing the load.
++  {
++    globalThis.fetch = mockFetch({ data: makeFile(4096) });
++    const first = await openSource(INPUT_URL, signal, 0);
++    assert.equal(first.totalBytes, 4096);
++    assert.equal(first.resumable, true);
++    first.close();
++    const error = await refuses(openSource(INPUT_URL, signal, 4096));
++    assert.equal(error.cause?.status, 416);
++    assert.equal(isRangeExhaustion(4096, 4096, error), true);
++  }
++
++  // 2. A 416 below the known total (shrank file) stays fatal, carrying
++  // where reading stood.
++  {
++    const ref = { data: makeFile(4096) };
++    globalThis.fetch = mockFetch(ref);
++    ref.data = makeFile(2048);
++    const error = await refuses(openSource(INPUT_URL, signal, 3000));
++    assert.equal(isRangeNotSatisfiable(error), true);
++    assert.equal(isRangeExhaustion(3000, 4096, error), false);
++    const fatal = withRangeContext(error, 3000, 4096);
++    assert.match(fatal.message, /\(range bytes=3000-, totalBytes=4096\)$/);
++    assert.equal(isRangeNotSatisfiable(fatal), true);
++  }
++
++  // 3. A 416 with no known total never drains: a live input, or one whose
++  // length was never stated, has no end to prove.
++  {
++    globalThis.fetch = mockFetch({ data: makeFile(4096) });
++    const error = await refuses(openSource(INPUT_URL, signal, 4096));
++    assert.equal(isRangeExhaustion(5000, null, error), false);
++  }
++
++  // 4. Non-range failures never drain, even at an exhausted offset.
++  {
++    assert.equal(
++      isRangeExhaustion(4096, 4096, new TypeError("fetch failed")),
++      false,
++    );
++    assert.equal(isRangeExhaustion(4096, 4096, new Error("boom")), false);
++  }
++
++  // 5. Impostors are rejected: message-only 416 (including a longer
++  // status like 4160 sharing the prefix), numeric 4160, and
++  // foreign/non-Error values never classify as range refusals.
++  {
++    assert.equal(isRangeNotSatisfiable(new Error("boom HTTP 416 boom")), false);
++    assert.equal(
++      isRangeNotSatisfiable(
++        new Error("could not fetch the input: HTTP 4160 Bad"),
++      ),
++      false,
++    );
++    assert.equal(
++      isRangeNotSatisfiable(
++        new Error("could not fetch the input: HTTP 416 Gone"),
++      ),
++      false,
++    );
++    assert.equal(
++      isRangeNotSatisfiable(
++        Object.assign(new Error("odd"), { cause: { status: 4160 } }),
++      ),
++      false,
++    );
++    assert.equal(isRangeNotSatisfiable("HTTP 416"), false);
++    assert.equal(isRangeNotSatisfiable(null), false);
++    assert.equal(isRangeNotSatisfiable(undefined), false);
++    assert.equal(isRangeNotSatisfiable(416), false);
++    assert.equal(isRangeNotSatisfiable({}), false);
++  }
++
++  // 6. A growing source answers the stale offset with 206 stating the new
++  // total, so the worker keeps reading instead of draining.
++  {
++    const ref = { data: makeFile(4096) };
++    globalThis.fetch = mockFetch(ref);
++    const first = await openSource(INPUT_URL, signal, 0);
++    assert.equal(first.totalBytes, 4096);
++    first.close();
++    ref.data = makeFile(8192);
++    const grown = await openSource(INPUT_URL, signal, 4096);
++    assert.equal(grown.offset, 4096);
++    assert.equal(grown.totalBytes, 8192);
++    assert.equal(grown.resumable, true);
++    grown.close();
++  }
++
++  // 7. A zero-length initial source stays fail-closed: its open fails,
++  // and with no known total the refusal cannot drain.
++  {
++    globalThis.fetch = mockFetch({ data: makeFile(0) });
++    const error = await refuses(openSource(INPUT_URL, signal, 0));
++    assert.equal(isRangeNotSatisfiable(error), true);
++    assert.equal(isRangeExhaustion(0, null, error), false);
++    const fatal = withRangeContext(error, 0, null);
++    assert.match(fatal.message, /\(range bytes=0-, totalBytes=unknown\)$/);
++  }
++
++  console.log("test-range-eof: ok");
++} finally {
++  globalThis.fetch = realFetch;
++  await unlink(output).catch(() => {});
++}

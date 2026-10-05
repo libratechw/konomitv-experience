@@ -72,7 +72,7 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 
 旧mpeg2toh264候補の実装内容・A/B/C比較表・アーカイブ理由は、[更新前のREADME](https://github.com/libratechw/konomitv-experience/blob/e238e1f84ab4c5708024e865dfc05214b64c8454/README.md)に保存しています。現在の独立修正候補には含めていません。
 
-過去のDPlayer film表示案と字幕v2の旧2案については、現役版と異なる変更も含め、固定commitと再適用可能なソース差分を[旧候補の保存先と適用手順](results/retired-public-candidates-20261005.json)に保存しています。本記録は取り込み推奨ではなく、当時の実装を確認するための履歴参照用です。
+過去のDPlayer film表示案1本や字幕v2の旧2案に加え、mpeg2toh264の旧性能実験・統合3案についても、現役版にない独自変更を含め、固定commitと再適用可能なソース差分を[旧候補の保存先と適用手順](results/retired-public-candidates-20261005.json)に保存しています。本記録は取り込み推奨ではなく、当時の実装を確認するための履歴参照用です。
 
 ---
 

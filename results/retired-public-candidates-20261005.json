@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "date": "2026-10-05",
-  "purpose": "Historical candidate source preservation; not an adoption recommendation or a claim that all changes were merged.",
+  "purpose": "Historical candidate and experiment source preservation; not an adoption recommendation or a claim that all changes were merged.",
   "source_license": "MIT; original repositories' licenses and attribution remain applicable to the archived source patches.",
   "patch_format": "git diff --binary --full-index",
   "excluded_paths": [
@@ -54,6 +54,42 @@
       "source_patch_sha256": "61dc344e34b98b259055756774691cd7fb0e11ad945c63777d8ec137d38e4930",
       "current_reference_url": "https://github.com/libratechw/aribb24.js/commit/f2752a9353a5e2e5372f0c543f0273547bb41cd7",
       "historical_note": "An alternative caption-v2 implementation split into topic commits. It is not an ancestor of the active worker-resilience option; the complete source delta is preserved rather than treated as an already-merged duplicate."
+    },
+    {
+      "repository": "https://github.com/libratechw/mpeg2toh264",
+      "retired_branch": "experiment/quant-raster-autovec",
+      "base_commit": "faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "base_url": "https://github.com/libratechw/mpeg2toh264/commit/faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "recorded_tip": "58d6146d1ba2369fe0d978ab762ed41c528eb748",
+      "tip_url": "https://github.com/libratechw/mpeg2toh264/commit/58d6146d1ba2369fe0d978ab762ed41c528eb748",
+      "source_patch": "mpeg2toh264-quant-raster-autovec-retired.patch",
+      "source_patch_sha256": "8a61d04f05246fa523942c5dd4c8dffec5c6fedcbe3f1dc7251bd0c66f5985a3",
+      "current_reference_url": "https://github.com/tsukumijima/mpeg2toh264/commit/23d270cd29beb8cd6ce8f00947fe84934219b8c9",
+      "historical_note": "An old quantization/raster/autovectorization experiment. Its complete source delta and design notes are preserved, including changes absent from the current reference. This is not an adoption recommendation or a claim of validated performance improvement."
+    },
+    {
+      "repository": "https://github.com/libratechw/mpeg2toh264",
+      "retired_branch": "integration/promising-transcode",
+      "base_commit": "faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "base_url": "https://github.com/libratechw/mpeg2toh264/commit/faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "recorded_tip": "92b2177ccd3c3acc4ae4d2948e47ac7d3ebcee5a",
+      "tip_url": "https://github.com/libratechw/mpeg2toh264/commit/92b2177ccd3c3acc4ae4d2948e47ac7d3ebcee5a",
+      "source_patch": "mpeg2toh264-promising-transcode-retired.patch",
+      "source_patch_sha256": "933a06520dca7a825c845706069645ab52451e00a4197c02ec5f6bf41101b882",
+      "current_reference_url": "https://github.com/tsukumijima/mpeg2toh264/commit/23d270cd29beb8cd6ce8f00947fe84934219b8c9",
+      "historical_note": "An old integration of transcode optimization experiments. The complete source delta is preserved; the integrated experiments are not treated as fully merged into the current reference or as current production optimizations."
+    },
+    {
+      "repository": "https://github.com/libratechw/mpeg2toh264",
+      "retired_branch": "dogfood/product-candidates-hotpaths",
+      "base_commit": "faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "base_url": "https://github.com/libratechw/mpeg2toh264/commit/faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "recorded_tip": "832ffcb2d1ecf9c85511fba0883414ecb8e82e37",
+      "tip_url": "https://github.com/libratechw/mpeg2toh264/commit/832ffcb2d1ecf9c85511fba0883414ecb8e82e37",
+      "source_patch": "mpeg2toh264-product-candidates-hotpaths-retired.patch",
+      "source_patch_sha256": "8ef70e8ce1b618f8ab976750f4076b426a7ab4fdf3a808e7d5220dd284ea75a9",
+      "current_reference_url": "https://github.com/tsukumijima/mpeg2toh264/commit/23d270cd29beb8cd6ce8f00947fe84934219b8c9",
+      "historical_note": "An old dogfood integration of product candidates and hot-path experiments. The complete source delta is preserved, including changes absent from the current reference; retirement does not imply that every change was merged or validated for adoption."
     }
   ]
 }
