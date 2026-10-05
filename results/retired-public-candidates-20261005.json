@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-05",
+  "purpose": "Historical candidate source preservation; not an adoption recommendation or a claim that all changes were merged.",
+  "source_license": "MIT; original repositories' licenses and attribution remain applicable to the archived source patches.",
+  "patch_format": "git diff --binary --full-index",
+  "excluded_paths": [
+    "dist/**",
+    "**/dist/**"
+  ],
+  "replay": {
+    "workspace": "Clean checkout of each entry's repository at base_commit.",
+    "check": "git apply --check <patch>",
+    "apply": "git apply <patch>",
+    "scope": "Source, tests, manifests and documentation only; generated distributions are excluded. Rebuild distributions separately if needed."
+  },
+  "verification": {
+    "source_identity": "Each patch was applied to its exact base in an isolated Git index and compared with recorded_tip; all tracked paths outside excluded_paths matched.",
+    "product_validation": "No new product build, deployment or device validation was performed for this archival cleanup."
+  },
+  "entries": [
+    {
+      "repository": "https://github.com/libratechw/DPlayer",
+      "retired_branch": "candidate/film-status",
+      "base_commit": "cf9a83f549cd4c7cb2631c3c88b5d10b6a63366a",
+      "base_url": "https://github.com/libratechw/DPlayer/commit/cf9a83f549cd4c7cb2631c3c88b5d10b6a63366a",
+      "recorded_tip": "70d0cefd98ea1cbae01e5229dcca8b7ae14b2db3",
+      "tip_url": "https://github.com/libratechw/DPlayer/commit/70d0cefd98ea1cbae01e5229dcca8b7ae14b2db3",
+      "source_patch": "dplayer-film-status-retired.patch",
+      "source_patch_sha256": "b3751c5c524d680967f89e7a4de0b0a20a7cd0f0f8a85d5960d0d0f54f848216",
+      "current_reference_url": "https://github.com/tsukumijima/DPlayer/commit/cdf2222ec007372910367c23ee81428893623585",
+      "historical_note": "Official DPlayer provides film state display. This old option also displayed filmError degradation for the former dual autoFilm/film API; that unique behavior is preserved here, not claimed to be merged into the official implementation."
+    },
+    {
+      "repository": "https://github.com/libratechw/aribb24.js",
+      "retired_branch": "fix/caption-v2-upstream-20260929",
+      "base_commit": "188741850ecdadbf2c6db635eaee1313ee0a2a84",
+      "base_url": "https://github.com/libratechw/aribb24.js/commit/188741850ecdadbf2c6db635eaee1313ee0a2a84",
+      "recorded_tip": "d401e4c6dd69ac967ae0182c4933818a694cbe30",
+      "tip_url": "https://github.com/libratechw/aribb24.js/commit/d401e4c6dd69ac967ae0182c4933818a694cbe30",
+      "source_patch": "aribb24-caption-v2-upstream-retired.patch",
+      "source_patch_sha256": "28315800c8fed61b43d77f208f094cc8d2517779629da74adc137de5935928c1",
+      "current_reference_url": "https://github.com/libratechw/aribb24.js/commit/f2752a9353a5e2e5372f0c543f0273547bb41cd7",
+      "historical_note": "An older caption-v2 option with seek, cue-replay and packaging changes. It is not an ancestor of the active worker-resilience option; the complete source delta is preserved, including differences not present in that option."
+    },
+    {
+      "repository": "https://github.com/libratechw/aribb24.js",
+      "retired_branch": "candidate/caption-v2-upstream-split-20260929",
+      "base_commit": "188741850ecdadbf2c6db635eaee1313ee0a2a84",
+      "base_url": "https://github.com/libratechw/aribb24.js/commit/188741850ecdadbf2c6db635eaee1313ee0a2a84",
+      "recorded_tip": "38db2f0b07da3310241dab94fb254cc125b95349",
+      "tip_url": "https://github.com/libratechw/aribb24.js/commit/38db2f0b07da3310241dab94fb254cc125b95349",
+      "source_patch": "aribb24-caption-v2-upstream-split-retired.patch",
+      "source_patch_sha256": "61dc344e34b98b259055756774691cd7fb0e11ad945c63777d8ec137d38e4930",
+      "current_reference_url": "https://github.com/libratechw/aribb24.js/commit/f2752a9353a5e2e5372f0c543f0273547bb41cd7",
+      "historical_note": "An alternative caption-v2 implementation split into topic commits. It is not an ancestor of the active worker-resilience option; the complete source delta is preserved rather than treated as an already-merged duplicate."
+    }
+  ]
+}

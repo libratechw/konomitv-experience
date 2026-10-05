@@ -1,0 +1,3753 @@
+diff --git a/src/lib/tokenizer/b24/tokenizer.ts b/src/lib/tokenizer/b24/tokenizer.ts
+index a54d9d2612036b6569df28d0bce43b57edcd4fea..4d75d953d083f26c4afb8fc0e93eb537f338a36a 100644
+--- a/src/lib/tokenizer/b24/tokenizer.ts
++++ b/src/lib/tokenizer/b24/tokenizer.ts
+@@ -385,9 +385,10 @@ export const replaceDRCS = (tokens: ARIBB24Token[], replace: Map<string, string>
+   return tokens.map((token) => {
+     if (token.tag !== 'DRCS') { return token; }
+     const hash = md5(token.binary);
++    const replacement = replace.get(hash) ?? replace.get(hash.toUpperCase());
+ 
+-    if (replace.has(hash.toLowerCase()) || replace.has(hash.toUpperCase())) {
+-      return ARIBB24CharacterToken.from(replace.get(hash)! + token.combining);
++    if (replacement !== undefined) {
++      return ARIBB24CharacterToken.from(replacement + token.combining);
+     } else {
+       return token;
+     }
+diff --git a/src/runtime/browser/controller/controller.ts b/src/runtime/browser/controller/controller.ts
+index 8c098f45724300bf6b6cf2ce49cae1346d144251..718e685eab9fd3810e642f698e20dc32a5897f1c 100644
+--- a/src/runtime/browser/controller/controller.ts
++++ b/src/runtime/browser/controller/controller.ts
+@@ -4,12 +4,40 @@ import { ControllerOption } from "./controller-option";
+ import EventEmitter from "./eventemitter";
+ import { Event, EventType, BuiltinSound } from "./events";
+ 
++type Presentation = NonNullable<ReturnType<ARIBB24Feeder['content']>>;
++type PaintedCue = { source: Presentation; snapshot: Presentation; ownsSnapshot: boolean };
++
++const rememberCue = (source: Presentation): PaintedCue => {
++  // Text tokens are immutable after decoding. Copy only bitmap presentations:
++  // the feeder closes their ImageBitmaps when a same-PTS cue is replaced.
++  const ownsSnapshot = source.data.some((token) => token.tag === 'Bitmap');
++  return { source, snapshot: ownsSnapshot ? structuredClone(source) : source, ownsSnapshot };
++};
++
++const closeSnapshot = (cue: Presentation): void => {
++  for (const token of cue.data) {
++    if (token.tag !== 'Bitmap') { continue; }
++    token.normal_bitmap.close();
++    token.flashing_bitmap?.close();
++  }
++};
++
++const hasImmediateClear = (cue: Presentation): boolean => {
++  let elapsed = cue.state.elapsed_time;
++  for (const token of cue.data) {
++    if (token.tag === 'TimeControlWait') { elapsed += token.seconds; }
++    if (token.tag === 'ClearScreen' && elapsed === 0) { return true; }
++  }
++  return false;
++};
++
+ export default class Controller {
+   // Option
+   private option: ControllerOption;
+   // Video
+   private media: HTMLVideoElement | null = null;
+   private container: HTMLElement | null = null;
++  private containerSize: { width: number; height: number } | null = null;
+   // Container Resize Handler
+   private readonly onContainerResizeHandler = this.onContainerResize.bind(this);
+   private resize_observer: ResizeObserver | null = null;
+@@ -20,12 +48,21 @@ export default class Controller {
+   private timer: number | null = null;
+   // Seeking Handler
+   private readonly onSeekingHandler = this.onSeeking.bind(this);
++  private readonly onSeekedHandler = this.onSeeked.bind(this);
++  private readonly onPresentationChangedHandler = this.onPresentationChanged.bind(this);
++  private readonly onBufferedProgressHandler = this.onBufferedProgress.bind(this);
+   // Play/Pause Handler
+   private readonly onPlayHandler = this.onPlay.bind(this);
+   private readonly onPauseHandler = this.onPause.bind(this);
+   // Renderer
+   private renderers: ARIBB24Renderer[] = [];
+   private privious_pts: number | null = null;
++  private lastPaintedCue: ReturnType<ARIBB24Feeder['content']> = null;
++  // Repaint copies belong to the controller: a feeder may close the bitmap of
++  // a replaced presentation before a renderer is resized.
++  private paintedCues: PaintedCue[] = [];
++  private pendingSoundCuePts: number | null = null;
++  private needsRepaint: Set<ARIBB24Renderer> = new Set();
+   // Feeder
+   private feeder: ARIBB24Feeder | null = null;
+   // Control
+@@ -45,10 +82,13 @@ export default class Controller {
+     }
+     this.media = media;
+     this.container = container ?? media.parentElement!;
++    this.containerSize = null;
+     if (this.container) {
+       this.renderers.forEach((renderer) => renderer.onAttach(this.container!));
+     }
+-    this.feeder?.prepare(this.media.currentTime);
++    this.feeder?.prepare(this.media.currentTime, this.bufferedStart(this.media.currentTime));
++    // Reconcile captions replaced while no media element was attached.
++    this.refreshPaintedCues(this.paintedCues.map(({ source }) => source.pts));
+     this.setupHandlers();
+   }
+ 
+@@ -58,6 +98,7 @@ export default class Controller {
+     }
+     this.cleanupHandlers()
+     this.media = this.container = null
++    this.containerSize = null;
+   }
+ 
+   private setupHandlers() {
+@@ -65,6 +106,9 @@ export default class Controller {
+ 
+     // setup media handler
+     this.media.addEventListener('seeking', this.onSeekingHandler);
++    this.media.addEventListener('seeked', this.onSeekedHandler);
++    this.media.addEventListener('progress', this.onBufferedProgressHandler);
++    this.media.addEventListener('canplay', this.onBufferedProgressHandler);
+     this.media.addEventListener('resize', this.onVideoResizeHandler);
+     this.media.addEventListener('play', this.onPlayHandler);
+     this.media.addEventListener('pause', this.onPauseHandler);
+@@ -77,6 +121,9 @@ export default class Controller {
+   private cleanupHandlers() {
+     // cleanup media seeking handler
+     this.media?.removeEventListener('seeking', this.onSeekingHandler);
++    this.media?.removeEventListener('seeked', this.onSeekedHandler);
++    this.media?.removeEventListener('progress', this.onBufferedProgressHandler);
++    this.media?.removeEventListener('canplay', this.onBufferedProgressHandler);
+     this.media?.removeEventListener('resize', this.onVideoResizeHandler);
+     this.media?.removeEventListener('play', this.onPlayHandler);
+     this.media?.removeEventListener('pause', this.onPauseHandler);
+@@ -92,16 +139,19 @@ export default class Controller {
+   public attachFeeder(feeder: ARIBB24Feeder) {
+     this.detachFeeder();
+     this.feeder = feeder;
++    this.feeder.setPresentationChangeHandler?.(this.onPresentationChangedHandler);
+     this.feeder.onAttach();
+ 
+     if (this.media != null) {
+-      this.feeder.prepare(this.media.currentTime);
++      this.feeder.prepare(this.media.currentTime, this.bufferedStart(this.media.currentTime));
+     }
+   }
+ 
+   public detachFeeder() {
++    this.feeder?.setPresentationChangeHandler?.(null);
+     this.feeder?.onDetach();
+     this.feeder = null;
++    this.clear();
+   }
+ 
+   public attachRenderer(renderer: ARIBB24Renderer) {
+@@ -110,10 +160,25 @@ export default class Controller {
+     if (this.container) {
+       renderer.onAttach(this.container);
+     }
++    if (this.media) {
++      if (this.containerSize) {
++        renderer.onContainerResize(this.containerSize.width, this.containerSize.height);
++      }
++      if (this.media.videoWidth > 0 && this.media.videoHeight > 0) {
++        renderer.onVideoResize(this.media.videoWidth, this.media.videoHeight);
++      }
++      if (this.isShowing) {
++        this.paint(true, [renderer]);
++      }
++    }
++    // A renderer replacing one invalidated while hidden must receive the
++    // current presentation when captions are shown again.
++    if (this.media && !this.isShowing) { this.needsRepaint.add(renderer); }
+   }
+ 
+   public detachRenderer(renderer: ARIBB24Renderer) {
+     renderer.onDetach();
++    this.needsRepaint.delete(renderer);
+     this.renderers = this.renderers.filter((elem) => elem !== renderer);
+   }
+ 
+@@ -130,6 +195,76 @@ export default class Controller {
+     this.clear();
+   }
+ 
++  private bufferedStart(time: number): number | null {
++    if (this.media == null) { return null; }
++    const ranges = this.media.buffered;
++    for (let index = 0; index < ranges.length; index++) {
++      if (ranges.start(index) <= time && time <= ranges.end(index)) {
++        return ranges.start(index);
++      }
++    }
++    return null;
++  }
++
++  private onSeeked() {
++    if (!this.media?.paused) { return; }
++    this.feeder?.onSeeked?.();
++    if (this.isShowing) {
++      this.paint(true);
++    } else {
++      this.renderers.forEach((renderer) => this.needsRepaint.add(renderer));
++    }
++  }
++
++  private onBufferedProgress() {
++    // A paused seek may become buffered only after seeked fired. MPEG-TS has
++    // no metadata-track rescan to wake the decoder at that point.
++    if (this.media?.paused) { this.onPresentationChanged(); }
++  }
++
++  private onPresentationChanged(changedPts?: readonly number[]) {
++    if (!this.media || this.media.seeking) { return; }
++    const currentTime = this.media.currentTime;
++    const current = this.feeder?.content(currentTime, this.bufferedStart(currentTime)) ?? null;
++    if (changedPts != null && this.refreshPaintedCues(changedPts.filter((pts) => current == null || pts < current.pts)) &&
++        current === this.lastPaintedCue) {
++      if (this.isShowing) { this.paint(true); }
++      else { this.renderers.forEach((renderer) => this.needsRepaint.add(renderer)); }
++      return;
++    }
++    // The decoder may notify us about an older cue or repeat a feeder scan.
++    // Repainting the same presentation appends its glyphs a second time.
++    if (current != null && currentTime < current.pts + current.duration &&
++        current === this.lastPaintedCue && this.privious_pts === current.pts) { return; }
++    if (!this.media.paused) {
++      if (!this.isShowing) {
++        this.pendingSoundCuePts = null;
++        this.renderers.forEach((renderer) => this.needsRepaint.add(renderer));
++        return;
++      }
++      // A statement can finish decoding after its same-time management cue
++      // has already been painted. The regular loop skips unchanged PTS.
++      if (current != null && currentTime < current.pts + current.duration &&
++          this.privious_pts === current.pts) {
++        this.paint(true);
++        this.pendingSoundCuePts = null;
++        this.emitBuiltinSounds(current);
++      }
++      return;
++    }
++    // A newly arrived statement can extend the picture already on screen.
++    // Replacing the same presentation instead needs a fresh image.
++    const append = current != null && currentTime < current.pts + current.duration &&
++      this.privious_pts != null && current.pts > this.privious_pts;
++    if (this.isShowing || this.needsRepaint.size === 0) {
++      // Hidden renderers keep their backing image; update it before show()
++      // unless a seek or resize has already invalidated it.
++      this.paint(!append);
++    } else {
++      this.renderers.forEach((renderer) => this.needsRepaint.add(renderer));
++    }
++  }
++
+   private onContainerResize(entries: ResizeObserverEntry[]) {
+     if (!this.media || !this.container) { return; }
+ 
+@@ -138,23 +273,39 @@ export default class Controller {
+ 
+     const width = target.devicePixelContentBoxSize != null ? target.devicePixelContentBoxSize[0].inlineSize : Math.floor(target.contentBoxSize[0].inlineSize * devicePixelRatio);
+     const height = target.devicePixelContentBoxSize != null ? target.devicePixelContentBoxSize[0].blockSize : Math.floor(target.contentBoxSize[0].blockSize * devicePixelRatio);
++    if (width <= 0 || height <= 0) { return; }
++    this.containerSize = { width, height };
+ 
++    const resized: ARIBB24Renderer[] = [];
+     this.renderers.forEach((renderer) => {
+-      if (!renderer.onContainerResize(width, height)) { return; }
+-      this.paint(true);
++      if (renderer.onContainerResize(width, height)) { resized.push(renderer); }
+     });
++    if (resized.length === 0) { return; }
++    if (this.isShowing) {
++      this.paint(true, resized);
++    } else {
++      resized.forEach((renderer) => this.needsRepaint.add(renderer));
++    }
+   }
+ 
+   private onVideoResize() {
+     if (!this.media || !this.container) { return; }
++    if (this.media.videoWidth <= 0 || this.media.videoHeight <= 0) { return; }
+ 
++    const resized: ARIBB24Renderer[] = [];
+     this.renderers.forEach((renderer) => {
+-      if (!renderer.onVideoResize(this.media!.videoWidth, this.media!.videoHeight)) { return; }
+-      this.paint(true);
++      if (renderer.onVideoResize(this.media!.videoWidth, this.media!.videoHeight)) { resized.push(renderer); }
+     });
++    if (resized.length === 0) { return; }
++    if (this.isShowing) {
++      this.paint(true, resized);
++    } else {
++      resized.forEach((renderer) => this.needsRepaint.add(renderer));
++    }
+   }
+ 
+   private onTimeupdate() {
++    this.timer = null;
+     // not showing, do not show
+     if (!this.isShowing) { return; }
+ 
+@@ -174,14 +325,14 @@ export default class Controller {
+ 
+   private onPlay(): void {
+     if (this.media != null) {
+-      this.feeder?.prepare(this.media.currentTime);
++      this.feeder?.prepare(this.media.currentTime, this.bufferedStart(this.media.currentTime));
+     }
+ 
+     this.renderers.forEach((renderer) => {
+       renderer.onPlay();
+     });
+ 
+-    if (this.timer != null) { return }
++    if (!this.isShowing || this.timer != null) { return }
+     this.registerRenderingLoop();
+   }
+ 
+@@ -193,18 +344,99 @@ export default class Controller {
+     this.unregisterRenderingLoop();
+   }
+ 
+-  private paint(repaint: boolean) {
++  private releasePaintedCues(): void {
++    this.paintedCues.forEach(({ snapshot, ownsSnapshot }) => {
++      if (ownsSnapshot) { closeSnapshot(snapshot); }
++    });
++    this.paintedCues = [];
++  }
++
++  private refreshPaintedCues(changedPts: readonly number[]): boolean {
++    if (this.feeder == null || this.paintedCues.length === 0 || changedPts.length === 0) { return false; }
++    let changed = false;
++    const refreshed: PaintedCue[] = [];
++    for (const painted of this.paintedCues) {
++      if (!changedPts.includes(painted.source.pts)) {
++        refreshed.push(painted);
++        continue;
++      }
++      const source = this.feeder.content(painted.source.pts);
++      if (source === painted.source) {
++        refreshed.push(painted);
++        continue;
++      }
++      changed = true;
++      if (painted.ownsSnapshot) { closeSnapshot(painted.snapshot); }
++      if (source != null && source.pts === painted.source.pts) {
++        refreshed.push(rememberCue(source));
++      }
++    }
++    if (changed) {
++      const lastClear = refreshed.findLastIndex(({ source }) => hasImmediateClear(source));
++      if (lastClear > 0) {
++        refreshed.slice(0, lastClear).forEach(({ snapshot, ownsSnapshot }) => {
++          if (ownsSnapshot) { closeSnapshot(snapshot); }
++        });
++      }
++      this.paintedCues = refreshed.slice(Math.max(0, lastClear));
++    }
++    return changed;
++  }
++
++  private paint(repaint: boolean, renderers: ARIBB24Renderer[] = this.renderers) {
+     // precondition
+     if (!this.media) { return; }
++    if (this.media.seeking) { return; }
+ 
+     const currentTime = this.media.currentTime;
+-    const current = this.feeder?.content(currentTime) ?? null;
++    const current = this.feeder?.content(currentTime, this.bufferedStart(currentTime)) ?? null;
+     if (repaint) {
+       // paint
+       if (current == null || currentTime >= current.pts + current.duration) {
+-        this.renderers.forEach((renderer) => renderer.clear());
++        renderers.forEach((renderer) => renderer.clear());
++        if (renderers === this.renderers) { this.releasePaintedCues(); }
+       } else {
+-        this.renderers.forEach((renderer) => renderer.render(current.state, structuredClone(current.data), current.info));
++        // A renderer may consume and close bitmap tokens. Each renderer must
++        // own its copy, including during a resize repaint.
++        const existingPicture = current === this.lastPaintedCue &&
++          this.privious_pts === current.pts && this.paintedCues.length > 0;
++        const replacedLastCue = !existingPicture && current !== this.lastPaintedCue &&
++          this.privious_pts === current.pts &&
++          this.paintedCues.at(-1)?.source === this.lastPaintedCue;
++        const precedingCues = replacedLastCue && !hasImmediateClear(current)
++          ? this.paintedCues.slice(0, -1) : [];
++        const picture = existingPicture ? this.paintedCues.map(({ snapshot }) => snapshot)
++          : [...precedingCues.map(({ snapshot }) => snapshot), current];
++        renderers.forEach((renderer) => {
++          renderer.clear();
++          for (const cue of picture) {
++            renderer.render(structuredClone(cue.state), structuredClone(cue.data), structuredClone(cue.info));
++          }
++        });
++        if (renderers === this.renderers && !existingPicture) {
++          if (precedingCues.length > 0) {
++            const replaced = this.paintedCues.at(-1)!;
++            if (replaced.ownsSnapshot) { closeSnapshot(replaced.snapshot); }
++            this.paintedCues = [...precedingCues, rememberCue(current)];
++          } else {
++            this.releasePaintedCues();
++            this.paintedCues = [rememberCue(current)];
++          }
++        }
++      }
++
++      if (renderers === this.renderers) {
++        // A complete paused repaint has already drawn this cue. Do not append
++        // it again on the first play frame; defer its sound until play instead.
++        const shown = current != null && currentTime < current.pts + current.duration;
++        if (shown && this.privious_pts !== current.pts) {
++          this.pendingSoundCuePts = current.pts;
++        } else if (!shown) {
++          this.pendingSoundCuePts = null;
++        }
++        this.privious_pts = shown ? current.pts
++          : current != null ? current.pts + current.duration : null;
++        this.lastPaintedCue = shown ? current : null;
+       }
+ 
+       return;
+@@ -215,36 +447,77 @@ export default class Controller {
+       if (this.privious_pts == null) { return; }
+       this.renderers.forEach((renderer) => renderer.clear());
+       this.privious_pts = null;
++      this.lastPaintedCue = null;
++      this.releasePaintedCues();
++      this.pendingSoundCuePts = null;
+     } else if (currentTime >= current.pts + current.duration) { // cue duration expired, clear
+       const end = current.pts + current.duration;
+       if (this.privious_pts === end) { return; }
+       this.renderers.forEach((renderer) => renderer.clear());
+       this.privious_pts = end; // end is finite
++      this.lastPaintedCue = null;
++      this.releasePaintedCues();
++      this.pendingSoundCuePts = null;
+     } else { // render
+-      if (this.privious_pts === current.pts) { return; }
++      if (this.privious_pts === current.pts) {
++        if (!this.media.paused && this.pendingSoundCuePts === current.pts) {
++          this.emitBuiltinSounds(current);
++          this.pendingSoundCuePts = null;
++        }
++        return;
++      }
+       this.renderers.forEach((renderer) => renderer.render(structuredClone(current.state), structuredClone(current.data), structuredClone(current.info)));
+       this.privious_pts = current.pts
+-
+-      // Builtin Sound Callback
+-      for (const token of current.data.filter((data) => data.tag === 'BuiltinSoundReplay')) {
+-        this.emitter.emit(EventType.BuiltinSound, BuiltinSound.from(token.sound));
++      this.lastPaintedCue = current;
++      if (hasImmediateClear(current)) { this.releasePaintedCues(); }
++      this.paintedCues.push(rememberCue(current));
++      if (this.media.paused) {
++        this.pendingSoundCuePts = current.pts;
++      } else {
++        this.pendingSoundCuePts = null;
++        this.emitBuiltinSounds(current);
+       }
+     }
+   }
+ 
++  private emitBuiltinSounds(current: NonNullable<ReturnType<ARIBB24Feeder['content']>>): void {
++    for (const token of current.data.filter((data) => data.tag === 'BuiltinSoundReplay')) {
++      this.emitter.emit(EventType.BuiltinSound, BuiltinSound.from(token.sound));
++    }
++  }
++
+   private clear() {
+     // clearRect for viewer
+     this.renderers.forEach((renderer) => renderer.clear());
+     // clear privious information
+     this.privious_pts = null;
++    this.lastPaintedCue = null;
++    this.releasePaintedCues();
++    this.pendingSoundCuePts = null;
+   }
+ 
+   public show(): void {
+     this.isShowing = true;
++    this.renderers.forEach((renderer) => renderer.show());
++    if (this.needsRepaint.size > 0) {
++      // A seek invalidates every renderer. A cue can also change while hidden
++      // without a feeder notification, so a resize-only subset is insufficient
++      // when the current presentation differs from the last painted one.
++      const time = this.media?.currentTime;
++      const current = time != null && !this.media?.seeking
++        ? this.feeder?.content(time, this.bufferedStart(time)) ?? null : null;
++      const marker = current == null || time == null ? null
++        : time < current.pts + current.duration ? current.pts : current.pts + current.duration;
++      if (this.needsRepaint.size === this.renderers.length || marker !== this.privious_pts) {
++        this.paint(true);
++      } else {
++        this.paint(true, [...this.needsRepaint]);
++      }
++      this.needsRepaint.clear();
++    }
+     if (this.timer == null) {
+       this.registerRenderingLoop();
+     }
+-    this.renderers.forEach((renderer) => renderer.show());
+   }
+ 
+   public hide(): void {
+diff --git a/src/runtime/browser/feeder/decoding-feeder.ts b/src/runtime/browser/feeder/decoding-feeder.ts
+index 4428e1efe7361580dc0c7c1dab3d917c785b65b3..8459c86ae80c480431da77f23c0b2ecb7d7d65a4 100644
+--- a/src/runtime/browser/feeder/decoding-feeder.ts
++++ b/src/runtime/browser/feeder/decoding-feeder.ts
+@@ -13,6 +13,15 @@ type DecodingOrderedKey = {
+   lang?: number;
+ };
+ 
++type QueuedDecodingData = FeederDecodingData & { key: string; packet: Uint8Array };
++
++const samePacket = (a: Uint8Array, b: Uint8Array): boolean =>
++  a.length === b.length && a.every((byte, index) => byte === b[index]);
++
++// Caption packets can precede the first buffered video frame of a seek by a
++// small amount. Keep that pre-roll without replaying a distant old range.
++export const SEEK_BUFFER_PREROLL_SECONDS = 0.5;
++
+ const calcDecodingOrder = ({ dts }: DecodingOrderedKey): number => {
+   return dts;
+ }
+@@ -42,13 +51,41 @@ export default abstract class DecodingFeeder implements Feeder {
+   private priviousTime: number | null = null;
+   private priviousManagementData: ARIBB24CaptionManagement | null = null;
+   private desiredLang: number | null = null;
+-  private decoder: AVLTree<DecodingOrderedKey, FeederDecodingData, number> = new AVLTree<DecodingOrderedKey, FeederDecodingData, number>(compareKey, compareNumber, calcDecodingOrder);
+-  private decoderBuffer: FeederDecodingData[] = [];
++  private decoder: AVLTree<DecodingOrderedKey, QueuedDecodingData, number> = new AVLTree<DecodingOrderedKey, QueuedDecodingData, number>(compareKey, compareNumber, calcDecodingOrder);
++  private managementTimes: AVLTree<number, number> = new AVLTree<number, number>(compareNumber, compareNumber, (time) => time);
++  private replayAfterSeek = false;
++  private pendingReplayWindow = false;
++  private decoderBuffer: QueuedDecodingData[] = [];
++  private awaitingManagement: QueuedDecodingData[] = [];
++  private notified: Map<string, QueuedDecodingData> = new Map();
+   private decodingPromise: Promise<void>;
+   private decodingNotify: (() => void) = Promise.resolve;
+   private abortController: AbortController = new AbortController();
+   private present: AVLTree<number, FeederPresentationData> = new AVLTree<number, FeederPresentationData>(compareNumber, compareNumber, (pts) => pts);
+   private isDestroyed: boolean = false;
++  private generation: number = 0;
++  private presentationChangeHandler: ((changedPts?: readonly number[]) => void) | null = null;
++  private presentationChangeQueued = false;
++  private changedPresentationPts: Set<number> = new Set();
++
++  public setPresentationChangeHandler(handler: ((changedPts?: readonly number[]) => void) | null): void {
++    this.presentationChangeHandler = handler;
++    if (handler == null) { this.changedPresentationPts.clear(); }
++  }
++
++  protected notifyPresentationChange(pts?: number): void {
++    if (this.presentationChangeHandler == null) { return; }
++    if (pts !== undefined) { this.changedPresentationPts.add(pts); }
++    if (this.presentationChangeQueued) { return; }
++    this.presentationChangeQueued = true;
++    // A renderer failure must surface without terminating the decoder pump.
++    queueMicrotask(() => {
++      this.presentationChangeQueued = false;
++      const changed = [...this.changedPresentationPts];
++      this.changedPresentationPts.clear();
++      this.presentationChangeHandler?.(changed);
++    });
++  }
+ 
+   public constructor(option?: PartialFeederOption) {
+     this.option = FeederOption.from(option);
+@@ -58,10 +95,13 @@ export default abstract class DecodingFeeder implements Feeder {
+     this.pump();
+   }
+ 
+-  private notify(segment: FeederDecodingData | null): void {
++  private notify(segment: QueuedDecodingData | null): void {
+     if (segment != null) {
++      this.notified.set(segment.key, segment);
+       this.decoderBuffer.push(segment);
+     } else {
++      // Clear the old generation before a post-seek cue can enter the buffer.
++      this.decoderBuffer = [];
+       this.abortController.abort();
+       this.abortController = new AbortController();
+     }
+@@ -71,25 +111,29 @@ export default abstract class DecodingFeeder implements Feeder {
+ 
+   private async *generator(signal: AbortSignal) {
+     while (true) {
+-      await this.decodingPromise;
+-      this.decodingPromise = new Promise<void>((resolve) => {
+-        this.decodingNotify = resolve;
+-      });
+-      if (signal.aborted) {
+-        this.decoderBuffer = [];
+-        return;
++      // A new cue may arrive while the previous generator is being aborted.
++      if (this.decoderBuffer.length === 0) {
++        await this.decodingPromise;
++        this.decodingPromise = new Promise<void>((resolve) => {
++          this.decodingNotify = resolve;
++        });
+       }
++      if (signal.aborted) { return; }
+ 
+       const recieved = [... this.decoderBuffer];
+       this.decoderBuffer = [];
+ 
+-      yield* recieved;
++      for (const segment of recieved) {
++        if (signal.aborted) { return; }
++        yield segment;
++      }
+     }
+   }
+ 
+   private async pump() {
+     while (!this.isDestroyed) {
+-      for await (const { pts, caption } of this.generator(this.abortController.signal)) {
++      for await (const segment of this.generator(this.abortController.signal)) {
++        const { pts, caption } = segment;
+         if (caption.tag === 'CaptionManagement') {
+           if (this.priviousManagementData?.group === caption.group) { continue; }
+ 
+@@ -103,7 +147,7 @@ export default abstract class DecodingFeeder implements Feeder {
+           }
+           this.priviousManagementData = caption;
+ 
+-          this.present.insert(pts, {
++          this.insertPresentation(pts, {
+             pts,
+             duration: Number.POSITIVE_INFINITY,
+             state: initialState,
+@@ -113,11 +157,26 @@ export default abstract class DecodingFeeder implements Feeder {
+             },
+             data: [ARIBB24ClearScreenToken.from()]
+           });
++          // HLS metadata with the same timestamp can arrive out of order.
++          // Retry a statement only after its management packet is installed.
++          const stillAwaiting: QueuedDecodingData[] = [];
++          for (const pending of this.awaitingManagement) {
++            if (pending.caption.tag === 'CaptionStatement' &&
++                pending.caption.group === caption.group && pending.pts >= pts) {
++              this.notify(pending);
++            } else if (pending.caption.group !== caption.group) {
++              stillAwaiting.push(pending);
++            }
++          }
++          this.awaitingManagement = stillAwaiting;
+           continue;
+         }
+ 
+         // Caption
+-        if (this.priviousManagementData == null) { continue; }
++        if (this.priviousManagementData == null || this.priviousManagementData.group !== caption.group) {
++          this.awaitingManagement.push(segment);
++          continue;
++        }
+ 
+         const entry = this.priviousManagementData.languages.find((entry) => entry.lang === caption.lang);
+         if (entry == null) { continue; }
+@@ -127,7 +186,12 @@ export default abstract class DecodingFeeder implements Feeder {
+         if (specification == null) { continue; }
+ 
+         const [association, tokenizer, state] = specification;
++        const generation = this.generation;
+         const tokenized = await toBrowserTokenWithBitmap(tokenizer.tokenize(caption), colortable);
++        if (generation !== this.generation || this.isDestroyed) {
++          closeValueImageBitmap({ pts, duration: 0, state, info: { association, language: entry.iso_639_language_code }, data: tokenized });
++          continue;
++        }
+ 
+         let duration = Number.POSITIVE_INFINITY;
+         let elapse = 0;
+@@ -140,7 +204,7 @@ export default abstract class DecodingFeeder implements Feeder {
+           }
+         }
+ 
+-        this.present.insert(pts, {
++        this.insertPresentation(pts, {
+           pts,
+           duration,
+           state,
+@@ -154,6 +218,13 @@ export default abstract class DecodingFeeder implements Feeder {
+     }
+   }
+ 
++  private insertPresentation(pts: number, value: FeederPresentationData): void {
++    const previous = this.present.get(pts);
++    if (previous != null) { closeValueImageBitmap(previous); }
++    this.present.insert(pts, value);
++    this.notifyPresentationChange(pts);
++  }
++
+   protected feed(data: Uint8Array, pts: number, dts: number) {
+     const datagroup = demuxPES(data);
+     if (datagroup == null) { return; }
+@@ -166,34 +237,93 @@ export default abstract class DecodingFeeder implements Feeder {
+ 
+     pts += this.option.offset.time;
+     dts += this.option.offset.time;
+-    this.decoder.insert({ dts, lang }, { pts, caption });
++    const keyString = `${dts}:${lang}`;
++    const segment = { pts, caption, key: keyString, packet: data.slice() };
++    const key = { dts, lang };
++    const previous = this.decoder.get(key);
++    if (previous?.pts === pts && samePacket(previous.packet, data)) {
++      if (this.notified.get(keyString) !== previous && this.priviousTime !== null && dts <= this.priviousTime) {
++        this.notify(previous);
++      }
++      return;
++    }
++    this.decoder.insert(key, segment);
++    if (caption.tag === 'CaptionManagement') {
++      this.managementTimes.insert(dts, dts);
++    }
++    // A native HLS metadata cue can arrive after content() has advanced past
++    // its DTS. Keep it in the tree for later seeks, but decode it now as well.
++    // A paused media clock may not call content() again after an equal-DTS cue arrives.
++    if (this.notified.get(keyString) !== segment && this.priviousTime !== null && dts <= this.priviousTime) {
++      this.notify(segment);
++    }
+   }
+ 
+-  public prepare(time: number): void {
+-    this.priviousTime = time;
++  public prepare(time: number, bufferedStart?: number | null): void {
++    if (this.pendingReplayWindow) { return; }
++    // Direct feeder callers may not know the buffered range. In that case,
++    // replay only near the requested time rather than from a distant range.
++    const replayBufferedStart = bufferedStart === undefined ? time : bufferedStart;
++    // The seek reset discards decoded state, not the packets already received.
++    // Replay from the latest management packet so statements within the
++    // buffered media can be decoded with their language and DRCS state.
++    if (this.replayAfterSeek && replayBufferedStart === null) {
++      // Wait until the seek target is buffered. Replaying an old range now
++      // would put its last caption over the new position.
++      this.priviousTime = null;
++      return;
++    }
++    if (this.replayAfterSeek && replayBufferedStart != null) {
++      const managementTime = this.managementTimes.floor(time);
++      const replayStart = managementTime === undefined ? replayBufferedStart
++        : Math.max(managementTime, replayBufferedStart - SEEK_BUFFER_PREROLL_SECONDS);
++      if (managementTime !== undefined && managementTime < replayStart) {
++        // Restore language/DRCS state, but not statements from a distant range.
++        const management = this.decoder.get({ dts: managementTime, lang: 0 });
++        if (management != null) { this.notify(management); }
++      }
++      this.priviousTime = replayStart;
++    } else {
++      this.priviousTime = this.replayAfterSeek ? (this.managementTimes.floor(time) ?? time) : time;
++    }
++    this.pendingReplayWindow = this.replayAfterSeek;
++    this.replayAfterSeek = false;
+   }
+ 
+-  public content(time: number): FeederPresentationData | null {
++  public content(time: number, bufferedStart?: number | null): FeederPresentationData | null {
++    if (this.replayAfterSeek) {
++      this.prepare(time, bufferedStart);
++      if (this.replayAfterSeek) { return null; }
++    }
+     if (this.priviousTime != null) {
+       for (const segment of this.decoder.range(this.priviousTime, time)) {
+-        this.notify(segment);
++        if (this.notified.get(segment.key) !== segment) { this.notify(segment); }
+       }
+     }
++    this.pendingReplayWindow = false;
+     this.priviousTime = time;
+     return this.present.floor(time) ?? null;
+   }
+ 
+   public clear(): void {
+     this.decoder.clear();
++    this.managementTimes.clear();
++    this.replayAfterSeek = false;
++    this.pendingReplayWindow = false;
+     this.disappearance();
+   }
+ 
+   private disappearance(): void {
++    this.generation++;
++    this.pendingReplayWindow = false;
++    this.notified.clear();
++    this.awaitingManagement = [];
+     this.present.forEach(closeValueImageBitmap);
+     this.present.clear();
+     this.priviousTime = null;
+     this.priviousManagementData = null;
+     this.notify(null);
++    this.notifyPresentationChange();
+   }
+ 
+   public onAttach(): void {
+@@ -206,10 +336,12 @@ export default abstract class DecodingFeeder implements Feeder {
+ 
+   public onSeeking(): void {
+     this.disappearance();
++    this.replayAfterSeek = true;
+   }
+ 
+   public destroy(): void {
+     this.isDestroyed = true;
++    this.presentationChangeHandler = null;
+     this.disappearance();
+   }
+ }
+diff --git a/src/runtime/browser/feeder/feeder.ts b/src/runtime/browser/feeder/feeder.ts
+index f2a8ddb91735016da9889916325170a692b53532..c0bf7d31b17491053785e2c307b35c776a0f6f5e 100644
+--- a/src/runtime/browser/feeder/feeder.ts
++++ b/src/runtime/browser/feeder/feeder.ts
+@@ -94,11 +94,16 @@ export type FeederPresentationData = {
+ };
+ 
+ export default interface Feeder {
+-  prepare(time: number): void;
+-  content(time: number): FeederPresentationData | null;
++  /** Buffered range start for a seek target; null waits for media, omission replays only near time. */
++  prepare(time: number, bufferedStart?: number | null): void;
++  content(time: number, bufferedStart?: number | null): FeederPresentationData | null;
+   clear(): void;
+   destroy(): void;
+   onAttach(): void;
+   onDetach(): void;
+   onSeeking(): void;
++  /** Refresh buffered metadata before a paused seek is repainted. */
++  onSeeked?(): void;
++  /** Notify the controller when asynchronous decoding changes the visible cue. */
++  setPresentationChangeHandler?(handler: ((changedPts?: readonly number[]) => void) | null): void;
+ }
+diff --git a/src/runtime/browser/feeder/hls-feeder.ts b/src/runtime/browser/feeder/hls-feeder.ts
+index 7e2b1d34a5cfdfd678eb6bf9844b8fa33b46822a..3fd45f4da5b2d754e7609ebbae8fc811a96a2e04 100644
+--- a/src/runtime/browser/feeder/hls-feeder.ts
++++ b/src/runtime/browser/feeder/hls-feeder.ts
+@@ -1,17 +1,23 @@
+ import { PartialFeederOption } from './feeder';
+ import { parseID3v2 } from '../../../util/id3';
+ import { base64ToUint8Array } from '../../../util/binary';
+-import DecodingFeeder from './decoding-feeder';
++import DecodingFeeder, { SEEK_BUFFER_PREROLL_SECONDS } from './decoding-feeder';
+ 
+ export default class HLSFeeder extends DecodingFeeder {
++  // Shared by feeders from this module instance, not by separately loaded bundles.
++  private static readonly trackModeOwners = new WeakMap<TextTrack, { holders: number; previousMode: TextTrackMode }>();
+   private media: HTMLMediaElement | null = null;
+   private timer: number | null = null;
+   private privious_time: number | null = null;
+   private id3Tracks: TextTrack[] = [];
++  private fedCues: WeakSet<TextTrackCue> = new WeakSet();
++  private ownedTrackModes: Set<TextTrack> = new Set();
++  private cueSnapshots: Map<TextTrack, { length: number; first: TextTrackCue | null; last: TextTrackCue | null }> = new Map();
+   private readonly onAddTrackHandler: ((event: TrackEvent) => void) = this.onAddTrack.bind(this);
+   private readonly onRemoveTrackHandler: ((event: TrackEvent) => void) = this.onRemoveTrack.bind(this);
+   private readonly onPlayHandler = this.onPlay.bind(this);
+   private readonly onPauseHandler = this.onPause.bind(this);
++  private readonly onBufferProgressHandler = this.onBufferProgress.bind(this);
+   private readonly introspectHandler = this.introspect.bind(this);
+ 
+   public constructor(option?: PartialFeederOption) {
+@@ -24,14 +30,18 @@ export default class HLSFeeder extends DecodingFeeder {
+ 
+     this.setupHandlers();
+     this.registerID3Track();
++    if (media.paused === false) { this.registerRenderingLoop(); }
+   }
+ 
+   public detachMedia(): void {
++    this.unregisterRenderingLoop();
+     this.unregisterID3Track();
+     this.cleanupHandlers();
+ 
+     this.media = null
+     this.privious_time = null;
++    this.fedCues = new WeakSet();
++    this.cueSnapshots.clear();
+   }
+ 
+   private static isID3Track(track: TextTrack): boolean {
+@@ -55,6 +65,9 @@ export default class HLSFeeder extends DecodingFeeder {
+     this.media.textTracks.addEventListener('removetrack', this.onRemoveTrackHandler);
+     this.media.addEventListener('play', this.onPlayHandler);
+     this.media.addEventListener('pause', this.onPauseHandler);
++    this.media.addEventListener('progress', this.onBufferProgressHandler);
++    this.media.addEventListener('loadeddata', this.onBufferProgressHandler);
++    this.media.addEventListener('canplay', this.onBufferProgressHandler);
+   }
+ 
+   private cleanupHandlers(): void {
+@@ -64,10 +77,14 @@ export default class HLSFeeder extends DecodingFeeder {
+     this.media.textTracks.removeEventListener('removetrack', this.onRemoveTrackHandler);
+     this.media.removeEventListener('play', this.onPlayHandler);
+     this.media.removeEventListener('pause', this.onPauseHandler);
++    this.media.removeEventListener('progress', this.onBufferProgressHandler);
++    this.media.removeEventListener('loadeddata', this.onBufferProgressHandler);
++    this.media.removeEventListener('canplay', this.onBufferProgressHandler);
+   }
+ 
+   public destroy(): void {
+     this.detachMedia();
++    super.destroy();
+   }
+ 
+   private registerID3Track(): void {
+@@ -75,52 +92,119 @@ export default class HLSFeeder extends DecodingFeeder {
+ 
+     for (const track of Array.from(this.media.textTracks)) {
+       if (!HLSFeeder.isID3Track(track)) { continue; }
++      this.enableID3Track(track);
+       this.id3Tracks.push(track);
+     }
+   }
+ 
+   private unregisterID3Track(): void {
++    for (const track of this.ownedTrackModes) {
++      this.restoreID3TrackMode(track);
++    }
+     this.id3Tracks = [];
++    this.cueSnapshots.clear();
++  }
++
++  private enableID3Track(track: TextTrack): void {
++    // Safari does not expose in-band metadata cues while the track is disabled.
++    // Hidden keeps the cues available without painting them as browser subtitles.
++    if (track.inBandMetadataTrackDispatchType !== 'com.apple.streaming' || this.ownedTrackModes.has(track)) { return; }
++    const existingOwner = HLSFeeder.trackModeOwners.get(track);
++    if (existingOwner != null) {
++      existingOwner.holders++;
++      this.ownedTrackModes.add(track);
++      if (track.mode === 'disabled') { track.mode = 'hidden'; }
++      return;
++    }
++    if (track.mode !== 'disabled') { return; }
++    track.mode = 'hidden';
++    HLSFeeder.trackModeOwners.set(track, { holders: 1, previousMode: 'disabled' });
++    this.ownedTrackModes.add(track);
++  }
++
++  private restoreID3TrackMode(track: TextTrack): void {
++    if (!this.ownedTrackModes.delete(track)) { return; }
++    const owner = HLSFeeder.trackModeOwners.get(track)!;
++    owner.holders--;
++    if (owner.holders > 0) { return; }
++    HLSFeeder.trackModeOwners.delete(track);
++    // An external writer that also selects hidden cannot be distinguished here.
++    if (track.mode === 'hidden') { track.mode = owner.previousMode; }
+   }
+ 
+   private onAddTrack(event: TrackEvent): void {
+     const track = event.track!;
+     if (!HLSFeeder.isID3Track(track)) { return; }
+ 
++    this.enableID3Track(track);
+     this.id3Tracks.push(track);
++    this.privious_time = null;
++    this.cueSnapshots.delete(track);
+   }
+ 
+   private onRemoveTrack(event: TrackEvent): void {
+     const track = event.track!;
+     if (!HLSFeeder.isID3Track(track)) { return; }
+ 
++    this.restoreID3TrackMode(track);
+     this.id3Tracks = this.id3Tracks.filter((t) => t !== track);
++    this.cueSnapshots.delete(track);
++  }
++
++  private bufferedStart(time: number): number | null {
++    if (this.media == null || this.media.seeking) { return null; }
++    const ranges = this.media.buffered;
++    for (let index = 0; index < ranges.length; index++) {
++      if (ranges.start(index) <= time && time <= ranges.end(index)) {
++        return ranges.start(index);
++      }
++    }
++    return null;
+   }
+ 
+   private introspect(): void {
+     this.registerRenderingLoop();
++    this.scanCurrentBuffer();
++  }
++
++  private scanCurrentBuffer(): void {
+     if (this.media == null) { return; }
+     const current_time = this.media.currentTime;
+-
+-    if (this.privious_time == null) {
+-      this.privious_time = current_time;
++    const buffered_start = this.bufferedStart(current_time);
++    if (buffered_start == null) {
+       return;
+     }
++    if (this.privious_time != null && current_time < this.privious_time) {
++      super.onSeeking();
++      this.fedCues = new WeakSet();
++    }
++    const replay = this.privious_time == null || current_time < this.privious_time;
+ 
+     for (const track of this.id3Tracks) {
+-      const cues = Array.from(track.cues ?? []);
+-      if (cues.length === 0) { continue; }
++      const cues = track.cues;
++      if (cues == null || cues.length === 0) { continue; }
++      const previous = this.cueSnapshots.get(track);
++      const changed = previous == null || previous.length !== cues.length
++        || previous.first !== cues[0] || previous.last !== cues[cues.length - 1];
++      this.cueSnapshots.set(track, { length: cues.length, first: cues[0], last: cues[cues.length - 1] });
++      // On attach, seek, or cue-list updates, include the current buffer's
++      // short decoding pre-roll. Track cue identity prevents re-feeding an
++      // earlier cue when the list grows during uninterrupted playback.
++      const scanBufferedRange = replay || changed;
++      const bufferScanStart = buffered_start - SEEK_BUFFER_PREROLL_SECONDS;
++      const scan_start = replay ? bufferScanStart
++        : changed ? Math.min(bufferScanStart, this.privious_time!) : this.privious_time!;
+ 
+       let prev_index: number | null = null;
+       let curr_index: number | null = null;
+ 
+       {
+-        let begin = 0, end = cues.length;
++        let begin = -1, end = cues.length;
+         while (begin + 1 < end) {
+           const middle = Math.floor((begin + end) / 2);
+           const start_time = cues[middle].startTime;
+ 
+-          if (this.privious_time < start_time) {
++          if (scanBufferedRange ? scan_start <= start_time : scan_start < start_time) {
+             end = middle;
+           } else {
+             begin = middle;
+@@ -129,7 +213,7 @@ export default class HLSFeeder extends DecodingFeeder {
+         prev_index = begin;
+       }
+       {
+-        let begin = 0, end = cues.length;
++        let begin = -1, end = cues.length;
+         while (begin + 1 < end) {
+           const middle = Math.floor((begin + end) / 2);
+           const start_time = cues[middle].startTime;
+@@ -148,17 +232,23 @@ export default class HLSFeeder extends DecodingFeeder {
+       }
+ 
+       if (prev_index < curr_index) {
+-        for (let index = curr_index; index > prev_index; index--) {
+-          this.feedID3v2Cue(cues[index]);
+-        }
+-      } else {
+-        for (let index = prev_index; index < curr_index; index++) {
+-          this.feedID3v2Cue(cues[index]);
++        // The decoder needs management data before subsequent statements.
++        for (let index = prev_index + 1; index <= curr_index; index++) {
++          const cue = cues[index];
++          if (this.fedCues.has(cue)) { continue; }
++          this.feedID3v2Cue(cue);
++          this.fedCues.add(cue);
+         }
+       }
+     }
+ 
+     this.privious_time = current_time;
++    if (replay) {
++      // Scan first so prepare() anchors to the management cue in the new
++      // buffered range, not one retained from before the seek.
++      this.prepare(current_time, buffered_start);
++      if (this.media.paused) { this.notifyPresentationChange(); }
++    }
+   }
+ 
+   private registerRenderingLoop(): void {
+@@ -180,6 +270,25 @@ export default class HLSFeeder extends DecodingFeeder {
+     this.unregisterRenderingLoop();
+   }
+ 
++  private onBufferProgress(): void {
++    // No animation loop runs while paused. A seek can finish before its new
++    // range and ID3 cues arrive, so scan once when media is loaded later.
++    if (this.media?.paused) { this.scanCurrentBuffer(); }
++  }
++
++  public onSeeking(): void {
++    super.onSeeking();
++    this.privious_time = null;
++    this.fedCues = new WeakSet();
++    this.cueSnapshots.clear();
++  }
++
++  public onSeeked(): void {
++    // The regular scan loop is stopped while paused, but the seek target can
++    // have a different set of buffered ID3 cues that must be read once.
++    this.scanCurrentBuffer();
++  }
++
+   private feedID3v2Cue(cue: TextTrackCue): void {
+     if (cue.track == null) { return; }
+ 
+diff --git a/src/runtime/browser/renderer/canvas/canvas-renderer-strategy.ts b/src/runtime/browser/renderer/canvas/canvas-renderer-strategy.ts
+index 099682e1f9a4c450dbdb936d8f838dbb44b8cb52..9bff797e55edd2fa9b19c4a05ee639c4a2c3f522 100644
+--- a/src/runtime/browser/renderer/canvas/canvas-renderer-strategy.ts
++++ b/src/runtime/browser/renderer/canvas/canvas-renderer-strategy.ts
+@@ -6,6 +6,20 @@ import { ARIBB24BrowserBitmapParsedToken, ARIBB24BrowserParser, ARIBB24BrowserTo
+ import { renderCharacter, renderDRCS } from "../../../common/renderer/canvas/renderer-strategy";
+ 
+ export default (target: HTMLCanvasElement | OffscreenCanvas | null, buffer: HTMLCanvasElement | OffscreenCanvas, state: ARIBB24ParserState, tokens: ARIBB24BrowserToken[], info: CaptionAssociationInformation, rendererOption: CanvasRendererOption): void => {
++  try {
++    renderCanvas(target, buffer, state, tokens, info, rendererOption);
++  } finally {
++    // The renderer owns the token copies it received, even when a context is
++    // unavailable or drawing throws before the Bitmap token is reached.
++    for (const token of tokens) {
++      if (token.tag !== 'Bitmap') { continue; }
++      token.normal_bitmap.close();
++      token.flashing_bitmap?.close();
++    }
++  }
++};
++
++const renderCanvas = (target: HTMLCanvasElement | OffscreenCanvas | null, buffer: HTMLCanvasElement | OffscreenCanvas, state: ARIBB24ParserState, tokens: ARIBB24BrowserToken[], info: CaptionAssociationInformation, rendererOption: CanvasRendererOption): void => {
+   // render background
+   let magnification: [number, number] = [1, 1];
+   {
+@@ -84,6 +98,4 @@ const renderBitmap = (context: CanvasRenderingContext2D | OffscreenCanvasRenderi
+   const { x_position, y_position, width, height } = token;
+ 
+   context.drawImage(token.normal_bitmap, x_position * magnification[0], y_position * magnification[1], width* magnification[0], height * magnification[1]);
+-  token.normal_bitmap.close();
+-  token.flashing_bitmap?.close();
+ }
+diff --git a/src/runtime/browser/renderer/canvas/canvas-renderer-worker.event.ts b/src/runtime/browser/renderer/canvas/canvas-renderer-worker.event.ts
+index 026365671b93dc6d7ed03123e4e110b1d1dd2d97..69ac21d1ceefe84d4460fa9ce488d0184722a680 100644
+--- a/src/runtime/browser/renderer/canvas/canvas-renderer-worker.event.ts
++++ b/src/runtime/browser/renderer/canvas/canvas-renderer-worker.event.ts
+@@ -96,4 +96,30 @@ export const FromWorkerToMainEventImageBitmap = {
+   }
+ }
+ 
+-export type FromWorkerToMainEvent = FromWorkerToMainEventImageBitmap;
++export type FromWorkerToMainEventError = {
++  type: 'error';
++  message: string;
++};
++export const FromWorkerToMainEventError = {
++  from(error: unknown): FromWorkerToMainEventError {
++    return {
++      type: 'error',
++      message: error instanceof Error ? error.message : String(error),
++    };
++  },
++};
++
++export type FromWorkerToMainEventRenderError = {
++  type: 'render-error';
++  message: string;
++};
++export const FromWorkerToMainEventRenderError = {
++  from(error: unknown): FromWorkerToMainEventRenderError {
++    return {
++      type: 'render-error',
++      message: error instanceof Error ? error.message : String(error),
++    };
++  },
++};
++
++export type FromWorkerToMainEvent = FromWorkerToMainEventImageBitmap | FromWorkerToMainEventError | FromWorkerToMainEventRenderError;
+diff --git a/src/runtime/browser/renderer/canvas/canvas-renderer-worker.ts b/src/runtime/browser/renderer/canvas/canvas-renderer-worker.ts
+index ceede43e02d27227ed11bb254a220e730482d411..7115aa1dc20e21c8c5173a610dc42f914ea1ba29 100644
+--- a/src/runtime/browser/renderer/canvas/canvas-renderer-worker.ts
++++ b/src/runtime/browser/renderer/canvas/canvas-renderer-worker.ts
+@@ -11,38 +11,130 @@ export default class CanvasWebWorkerRenderer extends CanvasRenderer {
+   private buffer: OffscreenCanvas;
+   private present: OffscreenCanvas;
+   private worker: Worker;
++  private failed = false;
++  private destroyed = false;
+   private waitPromise: Promise<void> | null = null;
+   private waitResolve: () => void = () => {};
++  private bitmapResolve: ((bitmap: ImageBitmap | null) => void) | null = null;
+ 
+-  public constructor(option?: PartialCanvasRendererOption) {
++  public constructor(option?: PartialCanvasRendererOption, private readonly onFailure?: (error: Error) => void) {
+     super(option);
+     this.present = this.canvas.transferControlToOffscreen();
+     this.buffer = new OffscreenCanvas(0, 0);
+     this.worker = new RenderingWorker();
+-    this.worker.postMessage(FromMainToWorkerEventInitialize.from(this.present, this.buffer), [this.present, this.buffer]);
++    this.worker.addEventListener('message', this.onWorkerMessage);
++    this.worker.addEventListener('error', this.onWorkerError);
++    this.worker.addEventListener('messageerror', this.onWorkerMessageError);
++    try {
++      this.worker.postMessage(FromMainToWorkerEventInitialize.from(this.present, this.buffer), [this.present, this.buffer]);
++    } catch (error) {
++      this.destroy();
++      throw error;
++    }
++  }
++
++  private readonly onWorkerMessage = (event: MessageEvent<FromWorkerToMainEvent>): void => {
++    switch (event.data.type) {
++      case 'imagebitmap': {
++        if (this.bitmapResolve == null) {
++          event.data.bitmap?.close();
++        } else {
++          this.settleBitmap(event.data.bitmap);
++        }
++        break;
++      }
++      case 'error': {
++        this.fail(new Error(event.data.message));
++        break;
++      }
++      case 'render-error': {
++        console.error('[aribb24.js] Caption rendering failed:', event.data.message);
++        break;
++      }
++    }
++  };
++
++  private readonly onWorkerError = (event: ErrorEvent): void => {
++    this.fail(event.error instanceof Error ? event.error : new Error(event.message || 'ARIB caption Worker failed.'));
++  };
++
++  private readonly onWorkerMessageError = (): void => {
++    this.fail(new Error('ARIB caption Worker message could not be decoded.'));
++  };
++
++  private settleBitmap(bitmap: ImageBitmap | null): void {
++    const resolve = this.bitmapResolve;
++    this.bitmapResolve = null;
++    resolve?.(bitmap);
++    this.waitResolve();
++  }
++
++  private fail(error: Error): void {
++    if (this.failed || this.destroyed) { return; }
++    this.failed = true;
++    this.worker.terminate();
++    this.settleBitmap(null);
++    // A postMessage failure can occur inside a Controller render or resize
++    // pass. Let that pass finish before a consumer replaces this renderer.
++    queueMicrotask(() => {
++      if (this.destroyed) { return; }
++      if (this.onFailure) {
++        this.onFailure(error);
++      } else {
++        console.error('[aribb24.js] Caption Worker failed:', error);
++      }
++    });
+   }
+ 
+   public resize(width: number, height: number): void {
+-    this.worker.postMessage(FromMainToWorkerEventResize.from(width, height));
++    if (this.failed || this.destroyed) { return; }
++    try {
++      this.worker.postMessage(FromMainToWorkerEventResize.from(width, height));
++    } catch (error) {
++      this.fail(error instanceof Error ? error : new Error(String(error)));
++    }
+   }
+ 
+   public destroy(): void {
+-    this.worker.postMessage(FromMainToWorkerEventResize.from(0, 0));
++    if (this.destroyed) { return; }
++    this.destroyed = true;
+     this.worker.terminate();
++    this.settleBitmap(null);
+   }
+ 
+   public clear(): void {
+-    this.worker.postMessage(FromMainToWorkerEventClear.from());
++    if (this.failed || this.destroyed) { return; }
++    try {
++      this.worker.postMessage(FromMainToWorkerEventClear.from());
++    } catch (error) {
++      this.fail(error instanceof Error ? error : new Error(String(error)));
++    }
+   }
+ 
+   public render(initialState: ARIBB24ParserState, tokens: ARIBB24BrowserToken[], info: CaptionAssociationInformation): void {
+-    this.worker.postMessage(FromMainToWorkerEventRender.from(initialState, replaceDRCS(tokens, this.option.replace.drcs), info, this.option));
++    const bitmaps = [...new Set(tokens.flatMap((token) => token.tag === 'Bitmap'
++      ? [token.normal_bitmap, token.flashing_bitmap].filter((bitmap): bitmap is ImageBitmap => bitmap != null)
++      : []))];
++    if (this.failed || this.destroyed) {
++      bitmaps.forEach((bitmap) => bitmap.close());
++      return;
++    }
++    try {
++      const data = replaceDRCS(tokens, this.option.replace.drcs);
++      // The Controller gives every renderer its own ImageBitmap copies. Transfer
++      // this renderer's copies rather than leaving them alive on the main thread.
++      this.worker.postMessage(FromMainToWorkerEventRender.from(initialState, data, info, this.option), bitmaps);
++    } catch (error) {
++      bitmaps.forEach((bitmap) => bitmap.close());
++      this.fail(error instanceof Error ? error : new Error(String(error)));
++    }
+   }
+ 
+   public async getPresentationImageBitmap(): Promise<ImageBitmap | null> {
++    if (this.failed || this.destroyed) { return null; }
+     while (this.waitPromise != null) {
+       await this.waitPromise;
+-      if (this.waitPromise == null) { break; }
++      if (this.failed || this.destroyed) { return null; }
+     }
+ 
+     // Waiter
+@@ -54,19 +146,14 @@ export default class CanvasWebWorkerRenderer extends CanvasRenderer {
+       };
+     });
+ 
+-    this.worker.postMessage(FromWorkerToMainEventImageBitmap.from());
+     const promise: Promise<ImageBitmap | null> = new Promise((resolve) => {
+-      this.worker.addEventListener('message', (event: MessageEvent<FromWorkerToMainEvent>) => {
+-        switch (event.data.type) {
+-          case 'imagebitmap': {
+-            resolve(event.data.bitmap);
+-            this.waitResolve();
+-            return;
+-          }
+-        }
+-      }, { once: true });
++      this.bitmapResolve = resolve;
+     });
+-
++    try {
++      this.worker.postMessage(FromWorkerToMainEventImageBitmap.from());
++    } catch (error) {
++      this.fail(error instanceof Error ? error : new Error(String(error)));
++    }
+     return promise;
+   }
+ }
+diff --git a/src/runtime/browser/renderer/canvas/canvas-renderer-worker.worker.ts b/src/runtime/browser/renderer/canvas/canvas-renderer-worker.worker.ts
+index dbe4114694564c30cf20540141b18b7202cbceb3..9a5586b8d4bc82f5b0b52f54eb628b7c210e7d7c 100644
+--- a/src/runtime/browser/renderer/canvas/canvas-renderer-worker.worker.ts
++++ b/src/runtime/browser/renderer/canvas/canvas-renderer-worker.worker.ts
+@@ -1,12 +1,14 @@
+ import { ExhaustivenessError } from "../../../../util/error";
+-import render from "./canvas-renderer-strategy"
+-import { FromMainToWorkerEvent, FromWorkerToMainEventImageBitmap } from "./canvas-renderer-worker.event";
++import render from "./canvas-renderer-strategy";
++import { FromMainToWorkerEvent, FromWorkerToMainEventError, FromWorkerToMainEventImageBitmap, FromWorkerToMainEventRenderError } from "./canvas-renderer-worker.event";
+ 
+ let present: OffscreenCanvas | null = null;
+ let buffer: OffscreenCanvas | null = null;
++const workerScope = self as unknown as { postMessage(message: unknown, transfer?: Transferable[]): void };
+ 
+ self.addEventListener('message', (event: MessageEvent<FromMainToWorkerEvent>) => {
+-  switch (event.data.type) {
++  try {
++    switch (event.data.type) {
+     case 'initialize': {
+       present = event.data.present;
+       buffer = event.data.buffer;
+@@ -46,26 +48,46 @@ self.addEventListener('message', (event: MessageEvent<FromMainToWorkerEvent>) =>
+       break;
+     }
+     case 'render': {
+-      if (present == null) { break; }
+-      if (buffer == null) { break; }
+-
+       const { state, tokens, info, option } = event.data;
+-      render(present, buffer, state, tokens, info, option);
++      if (present == null || buffer == null) {
++        for (const token of tokens) {
++          if (token.tag !== 'Bitmap') { continue; }
++          token.normal_bitmap.close();
++          token.flashing_bitmap?.close();
++        }
++        break;
++      }
++      try {
++        render(present, buffer, state, tokens, info, option);
++      } catch (error) {
++        // A malformed cue must not permanently disable later captions.
++        self.postMessage(FromWorkerToMainEventRenderError.from(error));
++      }
+ 
+       break;
+     }
+     case 'imagebitmap': {
+-      if (present == null) { break; }
++      if (present == null) {
++        self.postMessage(FromWorkerToMainEventImageBitmap.from());
++        break;
++      }
+ 
+       createImageBitmap(present).then((bitmap) => {
+-        self.postMessage(FromWorkerToMainEventImageBitmap.from(bitmap));
+-      });
++        try {
++          workerScope.postMessage(FromWorkerToMainEventImageBitmap.from(bitmap), [bitmap]);
++        } catch (error) {
++          bitmap.close();
++          self.postMessage(FromWorkerToMainEventImageBitmap.from());
++        }
++      }).catch(() => self.postMessage(FromWorkerToMainEventImageBitmap.from()));
+ 
+       break;
+     }
+     default: {
+       throw new ExhaustivenessError(event.data, `Exhaustive check failed in CanvasRenderingWorker`);
+     }
++    }
++  } catch (error) {
++    self.postMessage(FromWorkerToMainEventError.from(error));
+   }
+ });
+-
+diff --git a/src/runtime/browser/renderer/svg/svg-dom-renderer.ts b/src/runtime/browser/renderer/svg/svg-dom-renderer.ts
+index 531b80cbf6dc2629d2121a08515dd1de90657e45..631837d62c3542bf1ab6947ae63a717c54eea9c4 100644
+--- a/src/runtime/browser/renderer/svg/svg-dom-renderer.ts
++++ b/src/runtime/browser/renderer/svg/svg-dom-renderer.ts
+@@ -38,9 +38,17 @@ export default class SVGDOMRenderer implements Renderer {
+     this.svg.style.visibility = 'visible';
+   }
+   public render(initialState: ARIBB24ParserState, tokens: ARIBB24BrowserToken[], info: CaptionAssociationInformation): void {
+-    if (shouldNotAssumeUseClearScreen(info)) { this.clear(); }
+-
+-    render(this.svg, initialState, replaceDRCS(tokens, this.option.replace.drcs), info, this.option);
++    try {
++      if (shouldNotAssumeUseClearScreen(info)) { this.clear(); }
++      render(this.svg, initialState, replaceDRCS(tokens, this.option.replace.drcs), info, this.option);
++    } finally {
++      // SVG embeds the data URLs and does not retain the ImageBitmap copies.
++      for (const token of tokens) {
++        if (token.tag !== 'Bitmap') { continue; }
++        token.normal_bitmap.close();
++        token.flashing_bitmap?.close();
++      }
++    }
+   }
+ 
+   public onAttach(element: HTMLElement): void {
+diff --git a/src/runtime/browser/renderer/text/text-renderer.ts b/src/runtime/browser/renderer/text/text-renderer.ts
+index 51bdfae5595a852ba6016b0992b5af76fa67cc40..28bce39dfae353516243d73db3a92b11019c545d 100644
+--- a/src/runtime/browser/renderer/text/text-renderer.ts
++++ b/src/runtime/browser/renderer/text/text-renderer.ts
+@@ -15,6 +15,10 @@ export default class TextRenderer implements Renderer {
+     this.option = TextRendererOption.from(option);
+   }
+ 
++  public getText(): string | null {
++    return this.text;
++  }
++
+   public resize(width: number, height: number): void {}
+   public destroy(): void {
+     this.text = null;
+@@ -29,6 +33,9 @@ export default class TextRenderer implements Renderer {
+     // if SBTVD, it is overwritten screen and insert space to erase, so CS Insert
+     if (shouldNotAssumeUseClearScreen(info)) {
+       this.text = '';
++    } else if (this.text == null && tokens.some((token) => token.tag === 'Character' || token.tag === 'DRCS')) {
++      // A fresh renderer may start from a statement without an explicit ClearScreen.
++      this.text = '';
+     }
+ 
+     let privious_y = null;
+diff --git a/src/util/avl.ts b/src/util/avl.ts
+index bce511499ffa533549536218dc84e2217cb173fc..3b724dea0ca7e085254919cbbbf6ad7c1772130a 100644
+--- a/src/util/avl.ts
++++ b/src/util/avl.ts
+@@ -194,6 +194,7 @@ class AVLTreeNode<K, V, O = K> implements AVLTreeNodeInterface<K, V, O> {
+ 
+   private find(key: K, algorithm: 'exact' | 'floor' | 'ceil' = 'exact'): AVLTreeNode<K, V, O> | null {
+     let node: AVLTreeNode<K, V, O> = this;
++    let candidate: AVLTreeNode<K, V, O> | null = null;
+ 
+     FIND:
+     while (true) {
+@@ -202,21 +203,19 @@ class AVLTreeNode<K, V, O = K> implements AVLTreeNodeInterface<K, V, O> {
+         case 0:
+           return node;
+         case -1:
++          if (algorithm === 'ceil') { candidate = node; }
+           if (node.left != null) {
+             node = node.left;
+             continue FIND;
+-          } else if (algorithm === 'ceil') {
+-            return node;
+           }
+-          return null;
++          return candidate;
+         case 1:
++          if (algorithm === 'floor') { candidate = node; }
+           if (node.right != null) {
+             node = node.right;
+             continue FIND;
+-          } else if (algorithm === 'floor') {
+-            return node;
+           }
+-          return null;
++          return candidate;
+         default:
+           throw new ExhaustivenessError(compare, `Exhaustive check reached!`);
+       }
+@@ -337,8 +336,8 @@ class AVLTreeNode<K, V, O = K> implements AVLTreeNodeInterface<K, V, O> {
+     const t = this.compareOrder(to, this.order);
+ 
+     if (f <= 0) { yield* (this.left?.range(from, to) ?? []); }
+-    if (f <= 0 && t > 0){ yield this.value; }
+-    if (t > 0) { yield* (this.right?.range(from, to) ?? []); }
++    if (f <= 0 && t >= 0){ yield this.value; }
++    if (t >= 0) { yield* (this.right?.range(from, to) ?? []); }
+   }
+ }
+ 
+diff --git a/test/e2e/controller/replaced-bitmap.test.ts b/test/e2e/controller/replaced-bitmap.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..5443378ff70b8c77ac58c288c7f1de43064e8d03
+--- /dev/null
++++ b/test/e2e/controller/replaced-bitmap.test.ts
+@@ -0,0 +1,75 @@
++import { expect, test } from 'vitest';
++
++import Controller from '@/runtime/browser/controller/controller';
++import type Feeder from '@/runtime/browser/feeder/feeder';
++import type Renderer from '@/runtime/browser/renderer/renderer';
++import aribInitialState from '@/lib/parser/state/ARIB';
++import { ARIBB24CharacterToken } from '@/lib/tokenizer/token';
++
++test('a replaced earlier bitmap is not replayed after a resize', async () => {
++  const makeBitmap = () => createImageBitmap(document.createElement('canvas'));
++  const makeCue = (pts: number, character: string, bitmap?: ImageBitmap) => ({
++    pts, duration: 10, state: aribInitialState,
++    data: bitmap == null ? [ARIBB24CharacterToken.from(character)] : [
++      { tag: 'Bitmap', normal_bitmap: bitmap }, ARIBB24CharacterToken.from(character),
++    ],
++    info: { association: 'ARIB' as const, language: 'jpn' },
++  });
++  let first = makeCue(1, '旧', await makeBitmap());
++  const second = makeCue(2, '後');
++  let changed: ((pts?: readonly number[]) => void) | null = null;
++  const feeder = {
++    prepare() {}, content: (time: number) => time >= 2 ? second : first,
++    clear() {}, destroy() {}, onAttach() {}, onDetach() {}, onSeeking() {},
++    setPresentationChangeHandler: (handler: typeof changed) => { changed = handler; },
++  } as unknown as Feeder;
++  const drawn: string[] = [];
++  const renderer = {
++    render: (_state: unknown, data: typeof first.data) => {
++      drawn.push(data.filter((token) => token.tag === 'Character')
++        .map((token) => 'character' in token ? token.character : '').join(''));
++      for (const token of data) {
++        if (token.tag === 'Bitmap') { token.normal_bitmap.close(); }
++      }
++    },
++    clear: () => { drawn.length = 0; },
++    hide() {}, show() {}, destroy() {}, onAttach() {}, onDetach() {},
++    onContainerResize: () => false, onVideoResize: () => false,
++    onPlay() {}, onPause() {}, onSeeking() {},
++  } as unknown as Renderer;
++  const container = document.createElement('div');
++  document.body.append(container);
++  const media = Object.assign(new EventTarget(), {
++    currentTime: 1, paused: true, seeking: false, parentElement: container,
++    buffered: { length: 1, start: () => 0, end: () => 12 } as TimeRanges,
++  }) as HTMLVideoElement;
++  const controller = new Controller();
++  try {
++    controller.attachRenderer(renderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    (controller as any).paint(true);
++    media.currentTime = 2;
++    (controller as any).paint(false);
++    expect(drawn).toEqual(['旧', '後']);
++
++    first.data[0].tag === 'Bitmap' && first.data[0].normal_bitmap.close();
++    first = makeCue(1, '新', await makeBitmap());
++    changed?.([1]);
++    expect(drawn).toEqual(['新', '後']);
++    (controller as any).paint(true); // container resize / replacement renderer
++    expect(drawn).toEqual(['新', '後']);
++
++    controller.detachMedia();
++    if (first.data[0].tag === 'Bitmap') { first.data[0].normal_bitmap.close(); }
++    first = makeCue(1, '再', await makeBitmap());
++    controller.attachMedia(media);
++    (controller as any).paint(true);
++    expect(drawn).toEqual(['再', '後']);
++  } finally {
++    controller.detachMedia();
++    controller.detachFeeder();
++    if (first.data[0].tag === 'Bitmap') { first.data[0].normal_bitmap.close(); }
++    container.remove();
++  }
++});
+diff --git a/test/e2e/renderer/canvas-worker.test.ts b/test/e2e/renderer/canvas-worker.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fe4639d1694f2409544f6698b41d540ffda865f
+--- /dev/null
++++ b/test/e2e/renderer/canvas-worker.test.ts
+@@ -0,0 +1,89 @@
++import { describe, expect, test, vi } from 'vitest';
++
++import { CanvasWebWorkerRenderer } from '@/index';
++import aribInitialState from '@/lib/parser/state/ARIB';
++import { CaptionAssociationInformation } from '@/lib/demuxer/b24/datagroup';
++import { ARIBB24CharacterToken } from '@/lib/tokenizer/token';
++import { DecodedBitmap } from '@/runtime/browser/types';
++
++const info: CaptionAssociationInformation = { association: 'ARIB', language: 'und' };
++
++describe('ARIB B24 Worker Canvas Renderer', () => {
++  test('transfers its Bitmap copy and resolves image requests after rendering', async () => {
++    const source = document.createElement('canvas');
++    source.width = source.height = 2;
++    source.getContext('2d')!.fillRect(0, 0, 2, 2);
++    const bitmap = await createImageBitmap(source);
++    const token: DecodedBitmap = {
++      tag: 'Bitmap', x_position: 0, y_position: 0, width: 2, height: 2,
++      normal_dataurl: '', normal_bitmap: bitmap,
++    };
++    const renderer = new CanvasWebWorkerRenderer();
++    try {
++      renderer.onAttach(document.body);
++      renderer.onContainerResize(64, 64);
++      renderer.render(aribInitialState, [token], info);
++      expect(bitmap.width).toBe(0);
++      const presented = await renderer.getPresentationImageBitmap();
++      expect(presented?.width).toBe(64);
++      presented?.close();
++    } finally {
++      renderer.onDetach();
++      renderer.destroy();
++      bitmap.close();
++    }
++  });
++
++  test('keeps rendering after one malformed cue', async () => {
++    const report = vi.fn();
++    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
++    const renderer = new CanvasWebWorkerRenderer(undefined, report);
++    try {
++      renderer.onAttach(document.body);
++      renderer.onContainerResize(64, 64);
++      renderer.render(aribInitialState, [ARIBB24CharacterToken.from('A')], null as never);
++      await vi.waitFor(() => expect(logged).toHaveBeenCalledWith(
++        '[aribb24.js] Caption rendering failed:', expect.any(String)));
++      renderer.render(aribInitialState, [ARIBB24CharacterToken.from('B')], info);
++      const presented = await renderer.getPresentationImageBitmap();
++      expect(presented?.width).toBe(64);
++      presented?.close();
++      expect(report).not.toHaveBeenCalled();
++    } finally {
++      renderer.onDetach();
++      renderer.destroy();
++      logged.mockRestore();
++    }
++  });
++
++  test('reports a synchronous resize-send failure after the Controller pass', async () => {
++    const postMessage = Worker.prototype.postMessage;
++    const intercepted = vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function(this: Worker, message: any, transfer?: Transferable[]) {
++      if (message?.type === 'resize') { throw new Error('resize message rejected'); }
++      postMessage.call(this, message, transfer ?? []);
++    });
++    let inResize = false;
++    let reportedInsideResize: boolean | null = null;
++    let resolveFailure!: () => void;
++    const failure = new Promise<void>((resolve) => { resolveFailure = resolve; });
++    try {
++      const renderer = new CanvasWebWorkerRenderer(undefined, () => {
++        reportedInsideResize = inResize;
++        resolveFailure();
++      });
++      try {
++        renderer.onAttach(document.body);
++        inResize = true;
++        renderer.onContainerResize(64, 64);
++        inResize = false;
++        await failure;
++        expect(reportedInsideResize).toBe(false);
++      } finally {
++        renderer.onDetach();
++        renderer.destroy();
++      }
++    } finally {
++      intercepted.mockRestore();
++    }
++  });
++});
+diff --git a/test/e2e/renderer/svg.test.ts b/test/e2e/renderer/svg.test.ts
+index 0dd14e6fb975b42827faebdbd9549ec16a7a227d..e39ff7f8b3dd62ae3e037bb57ddda16ab85ab31a 100644
+--- a/test/e2e/renderer/svg.test.ts
++++ b/test/e2e/renderer/svg.test.ts
+@@ -4,6 +4,7 @@ import { page } from '@vitest/browser/context'
+ import { SVGDOMRenderer } from '@/index';
+ import aribInitialState from '@/lib/parser/state/ARIB';
+ import { CaptionAssociationInformation } from '@/lib/demuxer/b24/datagroup';
++import type { DecodedBitmap } from '@/runtime/browser/types';
+ import {ARIBB24ActivePositionForwardToken, ARIBB24ActivePositionSetToken, ARIBB24CharacterCompositionDotDesignationToken, ARIBB24CharacterToken, ARIBB24ClearScreenToken, ARIBB24ColorControlBackgroundToken, ARIBB24FlashingControlToken, ARIBB24FlashingControlType, ARIBB24HilightingCharacterBlockToken, ARIBB24MiddleSizeToken, ARIBB24NormalSizeToken, ARIBB24PalletControlToken, ARIBB24SetDisplayFormatToken, ARIBB24SetDisplayPositionToken, ARIBB24SetHorizontalSpacingToken, ARIBB24SetVerticalSpacingToken, ARIBB24SetWritingFormatToken, ARIBB24WhiteForegroundToken } from '@/lib/tokenizer/token';
+ 
+ const generateCharacter = (str: string) => {
+@@ -12,6 +13,26 @@ const generateCharacter = (str: string) => {
+ }
+ 
+ describe('ARIB B24 Canvas Renderer', () => {
++  test('releases its Bitmap copy after rendering', async () => {
++    const source = document.createElement('canvas');
++    source.width = source.height = 2;
++    const bitmap = await createImageBitmap(source);
++    const token: DecodedBitmap = {
++      tag: 'Bitmap', x_position: 0, y_position: 0, width: 2, height: 2,
++      normal_dataurl: source.toDataURL(), normal_bitmap: bitmap,
++    };
++    const renderer = new SVGDOMRenderer();
++    renderer.onAttach(document.body);
++    try {
++      renderer.render(aribInitialState, [token], { association: 'ARIB', language: 'und' });
++      expect(bitmap.width).toBe(0);
++    } finally {
++      renderer.onDetach();
++      renderer.destroy();
++      bitmap.close();
++    }
++  });
++
+   test('Flashing Rendering', async () => {
+     const width = 960, height = 540;
+     const info: CaptionAssociationInformation = {
+diff --git a/test/unit/controller/controller.test.ts b/test/unit/controller/controller.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c88997557a38f45d6c1b58b9ffd46839310e7e9a
+--- /dev/null
++++ b/test/unit/controller/controller.test.ts
+@@ -0,0 +1,724 @@
++import { afterEach, describe, expect, test, vi } from 'vitest';
++
++import Controller from '@/runtime/browser/controller/controller';
++import { EventType } from '@/runtime/browser/controller/events';
++import type Feeder from '@/runtime/browser/feeder/feeder';
++import type Renderer from '@/runtime/browser/renderer/renderer';
++import { ARIBB24BuiltinSoundReplayToken, ARIBB24CharacterToken, ARIBB24ClearScreenToken } from '@/lib/tokenizer/token';
++import aribInitialState from '@/lib/parser/state/ARIB';
++import TextRenderer from '@/runtime/browser/renderer/text/text-renderer';
++
++afterEach(() => vi.unstubAllGlobals());
++
++describe('Controller visibility and rendering loop', () => {
++  test('sizes and repaints a replacement renderer attached while captions are visible', () => {
++    let resize!: ResizeObserverCallback;
++    vi.stubGlobal('requestAnimationFrame', () => 1);
++    vi.stubGlobal('cancelAnimationFrame', () => {});
++    vi.stubGlobal('ResizeObserver', class {
++      constructor(callback: ResizeObserverCallback) { resize = callback; }
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++    const container = {} as HTMLElement;
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1, paused: true, seeking: false, parentElement: container,
++      videoWidth: 1920, videoHeight: 1080,
++      buffered: { length: 1, start: () => 0, end: () => 2 } as TimeRanges,
++    }) as HTMLVideoElement;
++    const cue = { pts: 1, duration: 1, state: aribInitialState,
++      data: [ARIBB24CharacterToken.from('あ')], info: { association: 'ARIB' as const, language: 'jpn' } };
++    const feeder = {
++      prepare() {}, content: () => cue, clear() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onSeeking() {}, onSeeked() {},
++    } as unknown as Feeder;
++    const makeRenderer = () => ({
++      render: vi.fn(), clear: vi.fn(), hide: vi.fn(), show: vi.fn(), destroy: vi.fn(),
++      onAttach: vi.fn(), onDetach: vi.fn(), onContainerResize: vi.fn(() => true),
++      onVideoResize: vi.fn(() => false), onPlay: vi.fn(), onPause: vi.fn(), onSeeking: vi.fn(),
++    } satisfies Renderer);
++    const original = makeRenderer();
++    const replacement = makeRenderer();
++    const controller = new Controller();
++    controller.attachRenderer(original);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    resize([{ target: container, devicePixelContentBoxSize: [{ inlineSize: 100, blockSize: 50 }] } as unknown as ResizeObserverEntry], {} as ResizeObserver);
++    controller.detachRenderer(original);
++    controller.attachRenderer(replacement);
++    expect(replacement.onContainerResize).toHaveBeenCalledWith(100, 50);
++    expect(replacement.onVideoResize).toHaveBeenCalledWith(1920, 1080);
++    expect(replacement.render).toHaveBeenCalledTimes(1);
++    controller.detachMedia();
++    controller.detachFeeder();
++  });
++
++  test('repaints a replacement renderer attached while captions are hidden after resize', () => {
++    let resize!: ResizeObserverCallback;
++    vi.stubGlobal('requestAnimationFrame', () => 1);
++    vi.stubGlobal('cancelAnimationFrame', () => {});
++    vi.stubGlobal('ResizeObserver', class {
++      constructor(callback: ResizeObserverCallback) { resize = callback; }
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++    const container = {} as HTMLElement;
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1, paused: true, seeking: false, parentElement: container,
++      buffered: { length: 1, start: () => 0, end: () => 2 } as TimeRanges,
++    }) as HTMLVideoElement;
++    const cue = { pts: 1, duration: 1, state: aribInitialState,
++      data: [ARIBB24CharacterToken.from('あ')], info: { association: 'ARIB' as const, language: 'jpn' } };
++    const feeder = {
++      prepare() {}, content: () => cue, clear() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onSeeking() {}, onSeeked() {},
++    } as unknown as Feeder;
++    const makeRenderer = () => ({
++      render: vi.fn(), clear: vi.fn(), hide: vi.fn(), show: vi.fn(), destroy: vi.fn(),
++      onAttach: vi.fn(), onDetach: vi.fn(), onContainerResize: vi.fn(() => true),
++      onVideoResize: vi.fn(() => false), onPlay: vi.fn(), onPause: vi.fn(), onSeeking: vi.fn(),
++    } satisfies Renderer);
++    const observer = makeRenderer();
++    const oldWorker = makeRenderer();
++    const replacement = makeRenderer();
++    const controller = new Controller();
++    controller.attachRenderer(observer);
++    controller.attachRenderer(oldWorker);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    media.dispatchEvent(new Event('seeked'));
++    controller.hide();
++    resize([{target: container, devicePixelContentBoxSize: [{inlineSize: 100, blockSize: 50}]} as unknown as ResizeObserverEntry], {} as ResizeObserver);
++    controller.detachRenderer(oldWorker);
++    controller.attachRenderer(replacement);
++    controller.show();
++    expect(replacement.render).toHaveBeenCalledTimes(1);
++    controller.hide();
++    controller.detachMedia();
++    controller.detachFeeder();
++  });
++
++  test.each([false, true])('does not replay sound after a same-time update (hidden=%s)', (hidden) => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    vi.stubGlobal('ResizeObserver', class {
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1, paused: true, seeking: false, parentElement: {} as HTMLElement,
++      buffered: { length: 1, start: () => 0, end: () => 2 } as TimeRanges,
++    }) as HTMLVideoElement;
++    let cue = { pts: 1, duration: 1, state: aribInitialState,
++      data: [ARIBB24BuiltinSoundReplayToken.from(1)], info: { association: 'ARIB' as const, language: 'jpn' } };
++    let changed: (() => void) | null = null;
++    const feeder = {
++      prepare() {}, content: () => cue, clear() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onSeeking() {}, onSeeked() {},
++      setPresentationChangeHandler: (handler: (() => void) | null) => { changed = handler; },
++    } as unknown as Feeder;
++    const renderer = new TextRenderer();
++    const sound = vi.fn();
++    const controller = new Controller();
++    controller.on(EventType.BuiltinSound, sound);
++    controller.attachRenderer(renderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    media.dispatchEvent(new Event('seeking'));
++    media.dispatchEvent(new Event('seeked'));
++    if (hidden) controller.hide();
++    media.paused = false;
++    media.dispatchEvent(new Event('play'));
++    cue = { ...cue, data: [ARIBB24BuiltinSoundReplayToken.from(2)] };
++    changed?.();
++    expect(sound).toHaveBeenCalledTimes(hidden ? 0 : 1);
++    if (hidden) controller.show();
++    const [id, callback] = pending.entries().next().value!;
++    pending.delete(id);
++    callback(0);
++    expect(sound).toHaveBeenCalledTimes(hidden ? 0 : 1);
++    controller.hide();
++    controller.detachMedia();
++    controller.detachFeeder();
++  });
++
++  test('repaints a statement decoded after a same-time cue during playback', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    vi.stubGlobal('ResizeObserver', class {
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1, paused: false, seeking: false, parentElement: {} as HTMLElement,
++      buffered: { length: 1, start: () => 0, end: () => 2 } as TimeRanges,
++    }) as HTMLVideoElement;
++    let cue = { pts: 1, duration: 1, state: aribInitialState,
++      data: [ARIBB24CharacterToken.from('あ')], info: { association: 'ARIB' as const, language: 'jpn' } };
++    let changed: (() => void) | null = null;
++    const feeder = {
++      prepare() {}, content: () => cue, clear() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onSeeking() {}, setPresentationChangeHandler: (handler: (() => void) | null) => { changed = handler; },
++    } as unknown as Feeder;
++    const renderer = new TextRenderer();
++    const controller = new Controller();
++    controller.attachRenderer(renderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    media.dispatchEvent(new Event('play'));
++    const [id, callback] = pending.entries().next().value!;
++    pending.delete(id);
++    callback(0);
++    expect(renderer.getText()).toBe('あ');
++    cue = { ...cue, data: [ARIBB24CharacterToken.from('い')] };
++    changed?.();
++    expect(renderer.getText()).toBe('い');
++    changed?.();
++    expect(renderer.getText()).toBe('い');
++    controller.hide();
++    controller.detachMedia();
++    controller.detachFeeder();
++  });
++
++  test('replaces same-time text instead of appending to the retained image', () => {
++    vi.stubGlobal('ResizeObserver', class {
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1, paused: true, seeking: false, parentElement: {} as HTMLElement,
++      buffered: { length: 1, start: () => 0, end: () => 2 } as TimeRanges,
++    }) as HTMLVideoElement;
++    let cue = { pts: 1, duration: 1, state: aribInitialState,
++      data: [ARIBB24CharacterToken.from('あ')], info: { association: 'ARIB' as const, language: 'jpn' } };
++    let changed: (() => void) | null = null;
++    const feeder = {
++      prepare() {}, content: () => cue, clear() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onSeeking() {}, onSeeked() {},
++      setPresentationChangeHandler: (handler: (() => void) | null) => { changed = handler; },
++    } as unknown as Feeder;
++    const renderer = new TextRenderer();
++    const controller = new Controller();
++    controller.attachRenderer(renderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    media.dispatchEvent(new Event('seeked'));
++    expect(renderer.getText()).toBe('あ');
++    cue = { ...cue, data: [ARIBB24CharacterToken.from('い')] };
++    changed?.();
++    expect(renderer.getText()).toBe('い');
++    controller.detachMedia();
++    controller.detachFeeder();
++    feeder.destroy();
++  });
++
++  test('appends a late new line while paused without erasing the earlier line', () => {
++    vi.stubGlobal('ResizeObserver', class {
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1, paused: true, seeking: false, parentElement: {} as HTMLElement,
++      buffered: { length: 1, start: () => 0, end: () => 3 } as TimeRanges,
++    }) as HTMLVideoElement;
++    let cue = { pts: 1, duration: 2, state: aribInitialState,
++      data: [ARIBB24CharacterToken.from('あ')], info: { association: 'ARIB' as const, language: 'jpn' } };
++    let changed: (() => void) | null = null;
++    const feeder = {
++      prepare() {}, content: () => cue, clear() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onSeeking() {}, onSeeked() {},
++      setPresentationChangeHandler: (handler: (() => void) | null) => { changed = handler; },
++    } as unknown as Feeder;
++    const renderer = new TextRenderer();
++    const controller = new Controller();
++    controller.attachRenderer(renderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    media.dispatchEvent(new Event('seeked'));
++    expect(renderer.getText()).toBe('あ');
++    media.currentTime = 2;
++    cue = { ...cue, pts: 2, data: [ARIBB24CharacterToken.from('い')] };
++    changed?.();
++    expect(renderer.getText()).toBe('あい');
++    controller.detachMedia();
++    controller.detachFeeder();
++    feeder.destroy();
++  });
++
++  test('retains built-up lines when the caption container changes size', () => {
++    let resize!: ResizeObserverCallback;
++    vi.stubGlobal('devicePixelRatio', 1);
++    vi.stubGlobal('ResizeObserver', class {
++      constructor(callback: ResizeObserverCallback) { resize = callback; }
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++    const container = {} as HTMLElement;
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1, paused: true, seeking: false, parentElement: container,
++      buffered: { length: 1, start: () => 0, end: () => 3 } as TimeRanges,
++    }) as HTMLVideoElement;
++    let cue: NonNullable<ReturnType<Feeder['content']>> = { pts: 1, duration: 2, state: aribInitialState,
++      data: [ARIBB24CharacterToken.from('あ')], info: { association: 'ARIB' as const, language: 'jpn' } };
++    const firstCue = cue;
++    let changed: (() => void) | null = null;
++    const feeder = {
++      prepare() {}, content: (time: number) => time < 2 ? firstCue : cue,
++      clear() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onSeeking() {}, onSeeked() {},
++      setPresentationChangeHandler: (handler: (() => void) | null) => { changed = handler; },
++    } as unknown as Feeder;
++    const text = new TextRenderer();
++    const renderer = {
++      render: text.render.bind(text), clear: text.clear.bind(text),
++      hide() {}, show() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onContainerResize: () => { text.clear(); return true; },
++      onVideoResize: () => false, onPlay() {}, onPause() {}, onSeeking() {},
++    } satisfies Renderer;
++    const controller = new Controller();
++    controller.attachRenderer(renderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    media.dispatchEvent(new Event('seeked'));
++    media.currentTime = 2;
++    cue = { ...cue, pts: 2, data: [ARIBB24CharacterToken.from('い')] };
++    changed?.();
++    expect(text.getText()).toBe('あい');
++
++    resize([{ target: container, devicePixelContentBoxSize: [{ inlineSize: 640, blockSize: 360 }] } as unknown as ResizeObserverEntry], {} as ResizeObserver);
++    expect(text.getText()).toBe('あい');
++    controller.detachMedia();
++    controller.attachMedia(media);
++    resize([{ target: container, devicePixelContentBoxSize: [{ inlineSize: 640, blockSize: 360 }] } as unknown as ResizeObserverEntry], {} as ResizeObserver);
++    expect(text.getText()).toBe('あい');
++
++    cue = { ...cue, data: [ARIBB24CharacterToken.from('う')] };
++    changed?.();
++    expect(text.getText()).toBe('あう');
++    resize([{ target: container, devicePixelContentBoxSize: [{ inlineSize: 800, blockSize: 450 }] } as unknown as ResizeObserverEntry], {} as ResizeObserver);
++    expect(text.getText()).toBe('あう');
++
++    media.currentTime = 2.5;
++    cue = { ...cue, pts: 2.5, data: [ARIBB24ClearScreenToken.from(), ARIBB24CharacterToken.from('え')] };
++    changed?.();
++    expect(text.getText()).toBe('え');
++    resize([{ target: container, devicePixelContentBoxSize: [{ inlineSize: 960, blockSize: 540 }] } as unknown as ResizeObserverEntry], {} as ResizeObserver);
++    expect(text.getText()).toBe('え');
++    controller.detachMedia();
++    controller.detachFeeder();
++  });
++
++  test('retains built-up lines when a cue arrives during a hidden pause', () => {
++    vi.stubGlobal('requestAnimationFrame', () => 1);
++    vi.stubGlobal('cancelAnimationFrame', () => {});
++    vi.stubGlobal('ResizeObserver', class {
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1, paused: true, seeking: false, parentElement: {} as HTMLElement,
++      buffered: { length: 1, start: () => 0, end: () => 3 } as TimeRanges,
++    }) as HTMLVideoElement;
++    let cue = { pts: 1, duration: 2, state: aribInitialState,
++      data: [ARIBB24CharacterToken.from('あ')], info: { association: 'ARIB' as const, language: 'jpn' } };
++    let changed: (() => void) | null = null;
++    const feeder = {
++      prepare() {}, content: () => cue, clear() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onSeeking() {}, onSeeked() {},
++      setPresentationChangeHandler: (handler: (() => void) | null) => { changed = handler; },
++    } as unknown as Feeder;
++    const renderer = new TextRenderer();
++    const controller = new Controller();
++    controller.attachRenderer(renderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    media.dispatchEvent(new Event('seeked'));
++    controller.hide();
++    media.currentTime = 2;
++    cue = { ...cue, pts: 2, data: [ARIBB24CharacterToken.from('い')] };
++    changed?.();
++    controller.show();
++    expect(renderer.getText()).toBe('あい');
++    controller.hide();
++    controller.detachMedia();
++    controller.detachFeeder();
++    feeder.destroy();
++  });
++
++  test('passes an unbuffered attach position to a feeder awaiting seek replay', () => {
++    const feeder = {
++      prepare: vi.fn(), content: vi.fn(() => null),
++      clear: vi.fn(), destroy: vi.fn(), onAttach: vi.fn(), onDetach: vi.fn(),
++      onSeeking: vi.fn(),
++    } as unknown as Feeder;
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1000, parentElement: null,
++      buffered: { length: 0 } as TimeRanges,
++    }) as HTMLVideoElement;
++    const controller = new Controller();
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    expect(feeder.prepare).toHaveBeenLastCalledWith(1000, null);
++    controller.detachMedia();
++    controller.detachFeeder();
++  });
++
++  test('does not render a hidden paused seek twice when shown again', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    vi.stubGlobal('ResizeObserver', class {
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++
++    const mediaElement = Object.assign(new EventTarget(), {
++      currentTime: 0, paused: true, seeking: false, parentElement: {} as HTMLElement,
++      buffered: { length: 1, start: () => 0, end: () => 20 } as TimeRanges,
++    });
++    const render = vi.fn();
++    const renderer = {
++      render, clear: vi.fn(), hide: vi.fn(), show: vi.fn(), destroy: vi.fn(),
++      onAttach: vi.fn(), onDetach: vi.fn(), onContainerResize: vi.fn(() => false),
++      onVideoResize: vi.fn(() => false), onPlay: vi.fn(), onPause: vi.fn(), onSeeking: vi.fn(),
++    } satisfies Renderer;
++    const feeder = {
++      prepare: vi.fn(), content: vi.fn(() => ({ pts: 5, duration: 10, state: {}, data: [], info: {} })),
++      clear: vi.fn(), destroy: vi.fn(), onAttach: vi.fn(), onDetach: vi.fn(),
++      onSeeking: vi.fn(), onSeeked: vi.fn(),
++    } as unknown as Feeder;
++    const controller = new Controller();
++    controller.attachRenderer(renderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(mediaElement as HTMLVideoElement);
++
++    controller.hide();
++    mediaElement.currentTime = 7;
++    mediaElement.dispatchEvent(new Event('seeking'));
++    mediaElement.dispatchEvent(new Event('seeked'));
++    expect(render).not.toHaveBeenCalled();
++
++    controller.show();
++    expect(render).toHaveBeenCalledTimes(1);
++    const [id, callback] = [...pending.entries()][0];
++    pending.delete(id);
++    callback(0);
++    expect(render).toHaveBeenCalledTimes(1);
++    controller.hide();
++    controller.detachMedia();
++  });
++
++  test('repaints a paused seek without restarting the rendering loop', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    vi.stubGlobal('ResizeObserver', class {
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++
++    const mediaElement = Object.assign(new EventTarget(), {
++      currentTime: 0, paused: true, parentElement: {} as HTMLElement,
++      buffered: { length: 1, start: () => 0, end: () => 20 } as TimeRanges,
++    });
++    const media = mediaElement as unknown as HTMLVideoElement;
++    const render = vi.fn();
++    const renderer = {
++      render, clear: vi.fn(), hide: vi.fn(), show: vi.fn(), destroy: vi.fn(),
++      onAttach: vi.fn(), onDetach: vi.fn(), onContainerResize: vi.fn(() => false),
++      onVideoResize: vi.fn(() => false), onPlay: vi.fn(), onPause: vi.fn(), onSeeking: vi.fn(),
++    } satisfies Renderer;
++    let cueAvailable = true;
++    let cue = {pts: 5, duration: 10, state: {}, data: [ARIBB24BuiltinSoundReplayToken.from(1)], info: {}};
++    const sound = vi.fn();
++    let presentationChangeHandler: (() => void) | null = null;
++    const feeder = {
++      prepare: vi.fn(), content: vi.fn((time: number) => time >= 5 && cueAvailable ? cue : null),
++      clear: vi.fn(), destroy: vi.fn(), onAttach: vi.fn(), onDetach: vi.fn(),
++      onSeeking: vi.fn(), onSeeked: vi.fn(),
++      setPresentationChangeHandler: vi.fn((handler: (() => void) | null) => {
++        presentationChangeHandler = handler;
++      }),
++    } as unknown as Feeder;
++    const controller = new Controller();
++    controller.on(EventType.BuiltinSound, sound);
++    controller.attachRenderer(renderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++
++    mediaElement.paused = false;
++    media.dispatchEvent(new Event('play'));
++    expect(pending.size).toBe(1);
++    mediaElement.paused = true;
++    media.dispatchEvent(new Event('pause'));
++    expect(pending.size).toBe(0);
++    mediaElement.currentTime = 7;
++    media.dispatchEvent(new Event('seeking'));
++    media.dispatchEvent(new Event('seeked'));
++    expect(feeder.onSeeked).toHaveBeenCalledOnce();
++    expect(render).toHaveBeenCalledOnce();
++    expect(pending.size).toBe(0);
++
++    mediaElement.paused = false;
++    media.dispatchEvent(new Event('play'));
++    const [id, callback] = pending.entries().next().value!;
++    pending.delete(id);
++    callback(0);
++    expect(render).toHaveBeenCalledOnce();
++    expect(sound).toHaveBeenCalledOnce();
++    mediaElement.paused = true;
++    media.dispatchEvent(new Event('pause'));
++
++    // A metadata cue may finish decoding after seeked, while rAF remains stopped.
++    cueAvailable = false;
++    mediaElement.currentTime = 12;
++    media.dispatchEvent(new Event('seeking'));
++    media.dispatchEvent(new Event('seeked'));
++    expect(render).toHaveBeenCalledOnce();
++    cueAvailable = true;
++    presentationChangeHandler?.();
++    expect(render).toHaveBeenCalledTimes(2);
++    // Repeated feeder notifications for the same visible cue must not append
++    // its semi-transparent glyphs and background a second time.
++    presentationChangeHandler?.();
++    expect(render).toHaveBeenCalledTimes(2);
++    // Replacing the presentation at the same PTS is a real update, not a
++    // duplicate notification.
++    const clearsBeforeReplacement = renderer.clear.mock.calls.length;
++    cue = {...cue, data: [ARIBB24BuiltinSoundReplayToken.from(2)]};
++    presentationChangeHandler?.();
++    expect(render).toHaveBeenCalledTimes(3);
++    expect(renderer.clear).toHaveBeenCalledTimes(clearsBeforeReplacement + 1);
++    controller.hide();
++    presentationChangeHandler?.();
++    controller.show();
++    expect(render).toHaveBeenCalledTimes(3);
++    controller.hide();
++    expect(pending.size).toBe(0);
++    controller.detachMedia();
++  });
++
++  test('gives every renderer its own cue tokens during a resize repaint', () => {
++    const clone = structuredClone;
++    vi.stubGlobal('structuredClone', (value: unknown) => {
++      const copy = clone(value);
++      const tokensToClose = Array.isArray(copy) ? copy : (copy as { data?: unknown[] })?.data;
++      if (Array.isArray(tokensToClose)) {
++        for (const token of tokensToClose) {
++          if (token.tag === 'Bitmap') {
++            Object.defineProperty(token.normal_bitmap, 'close', {
++              value: () => { token.normal_bitmap.closed = true; },
++            });
++          }
++        }
++      }
++      return copy;
++    });
++    const tokens = [{ tag: 'Bitmap', normal_bitmap: { closed: false } }];
++    const observed: boolean[] = [];
++    const renderer = (consume: boolean) => ({
++      render: (_state: unknown, data: typeof tokens) => {
++        observed.push(data[0].normal_bitmap.closed);
++        if (consume) data[0].normal_bitmap.closed = true;
++      },
++      clear() {}, hide() {}, show() {}, destroy() {}, onAttach() {}, onDetach() {},
++      onContainerResize: () => false, onVideoResize: () => false,
++      onPlay() {}, onPause() {}, onSeeking() {},
++    }) as unknown as Renderer;
++    const feeder = {
++      prepare() {}, content: () => ({ pts: 1, duration: 10, state: {}, data: tokens, info: {} }),
++      clear() {}, destroy() {}, onAttach() {}, onDetach() {}, onSeeking() {},
++    } as unknown as Feeder;
++    const controller = new Controller();
++    controller.attachRenderer(renderer(true));
++    controller.attachRenderer(renderer(false));
++    controller.attachFeeder(feeder);
++    controller.attachMedia(Object.assign(new EventTarget(), {
++      currentTime: 1, parentElement: null,
++      buffered: { length: 1, start: () => 0, end: () => 20 } as TimeRanges,
++    }) as HTMLVideoElement);
++    (controller as any).paint(true);
++    expect(observed).toEqual([false, false]);
++    expect(tokens[0].normal_bitmap.closed).toBe(false);
++    controller.detachMedia();
++  });
++
++  test('starts the loop when captions are shown after playback began while hidden', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    vi.stubGlobal('ResizeObserver', class {
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++
++    const container = {} as HTMLElement;
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0,
++      parentElement: container,
++    }) as unknown as HTMLVideoElement;
++    const controller = new Controller();
++    controller.attachMedia(media);
++
++    controller.hide();
++    media.dispatchEvent(new Event('play'));
++    expect(pending.size).toBe(0);
++
++    controller.show();
++    expect(pending.size).toBe(1);
++    const [id, callback] = [...pending.entries()][0];
++    pending.delete(id);
++    callback(0);
++    expect(pending.size).toBe(1);
++
++    controller.hide();
++    expect(pending.size).toBe(0);
++    controller.detachMedia();
++  });
++
++  test('skips zero-size repaint and redraws the current cue after a hidden resize', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    vi.stubGlobal('devicePixelRatio', 1);
++
++    let onResize: ResizeObserverCallback | null = null;
++    vi.stubGlobal('ResizeObserver', class {
++      constructor(callback: ResizeObserverCallback) { onResize = callback; }
++      observe() {}
++      unobserve() {}
++      disconnect() {}
++    });
++
++    const container = {} as HTMLElement;
++    const mediaElement = Object.assign(new EventTarget(), {
++      currentTime: 1,
++      videoWidth: 1920,
++      videoHeight: 1080,
++      parentElement: container,
++      buffered: { length: 1, start: () => 0, end: () => 20 } as TimeRanges,
++    });
++    const media = mediaElement as unknown as HTMLVideoElement;
++    const render = vi.fn();
++    const onContainerResize = vi.fn(() => true);
++    const onVideoResize = vi.fn(() => true);
++    const renderer = {
++      render,
++      clear: vi.fn(), hide: vi.fn(), show: vi.fn(), destroy: vi.fn(),
++      onAttach: vi.fn(), onDetach: vi.fn(), onContainerResize, onVideoResize,
++      onPlay: vi.fn(), onPause: vi.fn(), onSeeking: vi.fn(),
++    } satisfies Renderer;
++    const textRender = vi.fn();
++    const textRenderer = {
++      ...renderer,
++      render: textRender,
++      onContainerResize: vi.fn(() => false),
++      onVideoResize: vi.fn(() => false),
++    } satisfies Renderer;
++    let cuePts = 1;
++    const feeder = {
++      prepare: vi.fn(), content: vi.fn(() => ({pts: cuePts, duration: 10, state: {}, data: [ARIBB24BuiltinSoundReplayToken.from(1)], info: {}})),
++      clear: vi.fn(), destroy: vi.fn(), onAttach: vi.fn(), onDetach: vi.fn(), onSeeking: vi.fn(),
++    } as unknown as Feeder;
++
++    const controller = new Controller();
++    const sound = vi.fn();
++    controller.on(EventType.BuiltinSound, sound);
++    controller.attachRenderer(renderer);
++    controller.attachRenderer(textRenderer);
++    controller.attachFeeder(feeder);
++    controller.attachMedia(media);
++    media.dispatchEvent(new Event('play'));
++    const tick = () => {
++      const [id, callback] = [...pending.entries()][0];
++      pending.delete(id);
++      callback(0);
++    };
++    tick();
++    expect(render).toHaveBeenCalledTimes(1);
++    expect(textRender).toHaveBeenCalledTimes(1);
++    expect(sound).toHaveBeenCalledTimes(1);
++
++    controller.hide();
++    const resize = (width: number, height: number) => {
++      const entry = {target: container, contentBoxSize: [{inlineSize: width, blockSize: height}]} as unknown as ResizeObserverEntry;
++      onResize!([entry], {} as ResizeObserver);
++    };
++    resize(0, 0);
++    expect(onContainerResize).not.toHaveBeenCalled();
++    resize(640, 360);
++    expect(onContainerResize).toHaveBeenCalledOnce();
++    expect(render).toHaveBeenCalledTimes(1);
++    expect(textRender).toHaveBeenCalledTimes(1);
++
++    mediaElement.videoWidth = 0;
++    media.dispatchEvent(new Event('resize'));
++    expect(onVideoResize).not.toHaveBeenCalled();
++    mediaElement.videoWidth = 1920;
++    media.dispatchEvent(new Event('resize'));
++    expect(onVideoResize).toHaveBeenCalledOnce();
++    expect(render).toHaveBeenCalledTimes(1);
++    expect(textRender).toHaveBeenCalledTimes(1);
++
++    controller.show();
++    tick();
++    expect(render).toHaveBeenCalledTimes(2);
++    expect(textRender).toHaveBeenCalledTimes(1);
++    expect(sound).toHaveBeenCalledTimes(1);
++
++    // A cue change while hidden requires both renderers to receive the new
++    // cue, even if only one renderer reported a resize.
++    controller.hide();
++    cuePts = 2;
++    mediaElement.currentTime = 2;
++    resize(800, 450);
++    controller.show();
++    tick();
++    expect(render).toHaveBeenCalledTimes(3);
++    expect(textRender).toHaveBeenCalledTimes(2);
++    controller.detachMedia();
++  });
++});
+diff --git a/test/unit/controller/paused-hls-seek.test.ts b/test/unit/controller/paused-hls-seek.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4e8fd778359b4192956318a5d98f99830e2903bb
+--- /dev/null
++++ b/test/unit/controller/paused-hls-seek.test.ts
+@@ -0,0 +1,215 @@
++import { afterEach, expect, test, vi } from 'vitest';
++
++import Controller from '@/runtime/browser/controller/controller';
++import HLSFeeder from '@/runtime/browser/feeder/hls-feeder';
++import MPEGTSFeeder from '@/runtime/browser/feeder/mpegts-feeder';
++import type Renderer from '@/runtime/browser/renderer/renderer';
++import mux from '@/lib/muxer/b24/datagroup';
++import { ARIBB24CaptionData, RollupModeType, TimeControlModeType } from '@/lib/demuxer/b24/datagroup';
++
++afterEach(() => vi.unstubAllGlobals());
++
++test('repaints a paused MPEG-TS seek when the target becomes buffered later', async () => {
++  vi.stubGlobal('requestAnimationFrame', () => 1);
++  vi.stubGlobal('cancelAnimationFrame', () => {});
++  vi.stubGlobal('ResizeObserver', class {
++    observe() {}
++    unobserve() {}
++    disconnect() {}
++  });
++  const management = {
++    tag: 'CaptionManagement', group: 0, timeControlMode: TimeControlModeType.FREE,
++    languages: [{ lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++      format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00 }], units: [],
++  } as const satisfies ARIBB24CaptionData;
++  const statement = {
++    tag: 'CaptionStatement', group: 0, lang: 0,
++    timeControlMode: TimeControlModeType.FREE, units: [],
++  } as const satisfies ARIBB24CaptionData;
++  const packet = (caption: ARIBB24CaptionData) => new Uint8Array([
++    0x80, 0, 0, ...new Uint8Array(mux(caption)),
++  ]);
++  let ranges = [[0, 4]];
++  const mediaElement = Object.assign(new EventTarget(), {
++    currentTime: 1000, paused: true, seeking: false, parentElement: {} as HTMLElement,
++    buffered: {
++      get length() { return ranges.length; },
++      start: (index: number) => ranges[index][0],
++      end: (index: number) => ranges[index][1],
++    } as TimeRanges,
++  });
++  const media = mediaElement as HTMLVideoElement;
++  const render = vi.fn();
++  const renderer = {
++    render, clear: vi.fn(), hide: vi.fn(), show: vi.fn(), destroy: vi.fn(),
++    onAttach: vi.fn(), onDetach: vi.fn(), onContainerResize: vi.fn(() => false),
++    onVideoResize: vi.fn(() => false), onPlay: vi.fn(), onPause: vi.fn(), onSeeking: vi.fn(),
++  } satisfies Renderer;
++  const feeder = new MPEGTSFeeder();
++  const controller = new Controller();
++  try {
++    controller.attachFeeder(feeder);
++    controller.attachRenderer(renderer);
++    controller.attachMedia(media);
++    media.dispatchEvent(new Event('seeking'));
++    media.dispatchEvent(new Event('seeked'));
++    feeder.feedB24(packet(management), 998.8);
++    feeder.feedB24(packet(statement), 999.5);
++    await new Promise<void>((resolve) => setImmediate(resolve));
++    expect(render).not.toHaveBeenCalled();
++    ranges = [[0, 4], [999, 1002]];
++    media.dispatchEvent(new Event('progress'));
++    await vi.waitFor(() => expect(render).toHaveBeenCalled());
++    expect(feeder.content(1000, 999)?.pts).toBe(999.5);
++  } finally {
++    controller.detachMedia();
++    controller.detachFeeder();
++    feeder.destroy();
++  }
++});
++
++test.each([1, 1.5])('decodes and repaints a buffered HLS cue after play, pause and seek to %s', async (seekTime) => {
++  const pending = new Map<number, FrameRequestCallback>();
++  let nextId = 1;
++  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++    const id = nextId++;
++    pending.set(id, callback);
++    return id;
++  });
++  vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++  vi.stubGlobal('ResizeObserver', class {
++    observe() {}
++    unobserve() {}
++    disconnect() {}
++  });
++
++  const management = {
++    tag: 'CaptionManagement', group: 0, timeControlMode: TimeControlModeType.FREE,
++    languages: [{lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++      format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00}], units: [],
++  } as const satisfies ARIBB24CaptionData;
++  const statement = {
++    tag: 'CaptionStatement', group: 0, lang: 0,
++    timeControlMode: TimeControlModeType.FREE, units: [],
++  } as const satisfies ARIBB24CaptionData;
++  const track = {
++    kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++    cues: [] as TextTrackCue[],
++  };
++  track.cues.push(...[[0, management], [1, statement]].map(([startTime, caption]) => ({
++    startTime, track: track as unknown as TextTrack,
++    value: {key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([
++      0x80, 0, 0, ...new Uint8Array(mux(caption as ARIBB24CaptionData)),
++    ])},
++  })) as unknown as TextTrackCue[]);
++  const mediaElement = Object.assign(new EventTarget(), {
++    currentTime: 0, paused: true, seeking: false, parentElement: {} as HTMLElement,
++    buffered: {length: 1, start: () => 0, end: () => 4} as TimeRanges,
++    textTracks: Object.assign(new EventTarget(), {0: track, length: 1}),
++  });
++  const media = mediaElement as unknown as HTMLVideoElement;
++  const render = vi.fn();
++  const renderer = {
++    render, clear: vi.fn(), hide: vi.fn(), show: vi.fn(), destroy: vi.fn(),
++    onAttach: vi.fn(), onDetach: vi.fn(), onContainerResize: vi.fn(() => false),
++    onVideoResize: vi.fn(() => false), onPlay: vi.fn(), onPause: vi.fn(), onSeeking: vi.fn(),
++  } satisfies Renderer;
++  const feeder = new HLSFeeder();
++  const controller = new Controller();
++  try {
++    controller.attachFeeder(feeder);
++    controller.attachRenderer(renderer);
++    controller.attachMedia(media);
++    feeder.attachMedia(media);
++    mediaElement.paused = false;
++    media.dispatchEvent(new Event('play'));
++    mediaElement.paused = true;
++    media.dispatchEvent(new Event('pause'));
++    expect(pending.size).toBe(0);
++
++    mediaElement.seeking = true;
++    media.dispatchEvent(new Event('seeking'));
++    mediaElement.currentTime = seekTime;
++    mediaElement.seeking = false;
++    media.dispatchEvent(new Event('seeked'));
++    await vi.waitFor(() => expect(feeder.content(seekTime)?.pts).toBe(1));
++    await vi.waitFor(() => expect(render.mock.lastCall?.[1]).toEqual([]));
++    expect(pending.size).toBe(0);
++  } finally {
++    controller.detachMedia();
++    controller.detachFeeder();
++    feeder.destroy();
++  }
++});
++
++test('repaints a paused HLS seek when management starts just before the target buffer', async () => {
++  vi.stubGlobal('requestAnimationFrame', () => 1);
++  vi.stubGlobal('cancelAnimationFrame', () => {});
++  vi.stubGlobal('ResizeObserver', class {
++    observe() {}
++    unobserve() {}
++    disconnect() {}
++  });
++
++  const management = {
++    tag: 'CaptionManagement', group: 0, timeControlMode: TimeControlModeType.FREE,
++    languages: [{lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++      format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00}], units: [],
++  } as const satisfies ARIBB24CaptionData;
++  const statement = {
++    tag: 'CaptionStatement', group: 0, lang: 0,
++    timeControlMode: TimeControlModeType.FREE, units: [],
++  } as const satisfies ARIBB24CaptionData;
++  const track = {
++    kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++    cues: [] as TextTrackCue[],
++  };
++  let ranges = [[0, 4]];
++  const mediaElement = Object.assign(new EventTarget(), {
++    currentTime: 1000, paused: true, seeking: false, parentElement: {} as HTMLElement,
++    buffered: {
++      get length() { return ranges.length; },
++      start: (index: number) => ranges[index][0],
++      end: (index: number) => ranges[index][1],
++    } as TimeRanges,
++    textTracks: Object.assign(new EventTarget(), {0: track, length: 1}),
++  });
++  const media = mediaElement as unknown as HTMLVideoElement;
++  const render = vi.fn();
++  const renderer = {
++    render, clear: vi.fn(), hide: vi.fn(), show: vi.fn(), destroy: vi.fn(),
++    onAttach: vi.fn(), onDetach: vi.fn(), onContainerResize: vi.fn(() => false),
++    onVideoResize: vi.fn(() => false), onPlay: vi.fn(), onPause: vi.fn(), onSeeking: vi.fn(),
++  } satisfies Renderer;
++  const feeder = new HLSFeeder();
++  const controller = new Controller();
++  try {
++    controller.attachFeeder(feeder);
++    controller.attachRenderer(renderer);
++    controller.attachMedia(media);
++    feeder.attachMedia(media);
++    media.dispatchEvent(new Event('seeking'));
++    media.dispatchEvent(new Event('seeked'));
++    await new Promise<void>((resolve) => setImmediate(resolve));
++    expect(render).not.toHaveBeenCalled();
++
++    ranges = [[0, 4], [999, 1002]];
++    media.dispatchEvent(new Event('progress'));
++    await new Promise<void>((resolve) => setImmediate(resolve));
++    expect(render).not.toHaveBeenCalled();
++
++    track.cues.push(...[[998.8, management], [999.5, statement]].map(([startTime, caption]) => ({
++      startTime, track: track as unknown as TextTrack,
++      value: {key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([
++        0x80, 0, 0, ...new Uint8Array(mux(caption as ARIBB24CaptionData)),
++      ])},
++    })) as unknown as TextTrackCue[]);
++    media.dispatchEvent(new Event('progress'));
++    await vi.waitFor(() => expect(feeder.content(1000, 999)?.pts).toBe(999.5));
++    expect(render).toHaveBeenCalled();
++  } finally {
++    controller.detachMedia();
++    controller.detachFeeder();
++    feeder.destroy();
++  }
++});
+diff --git a/test/unit/feeder/decoding-feeder.test.ts b/test/unit/feeder/decoding-feeder.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2032a7ce36572e19148f6bf65bcb37c4efadcfcd
+--- /dev/null
++++ b/test/unit/feeder/decoding-feeder.test.ts
+@@ -0,0 +1,331 @@
++import { describe, expect, test, vi } from 'vitest';
++
++import mux from '@/lib/muxer/b24/datagroup';
++import { ARIBB24CaptionData, RollupModeType, TimeControlModeType } from '@/lib/demuxer/b24/datagroup';
++import MPEGTSFeeder from '@/runtime/browser/feeder/mpegts-feeder';
++
++const management = {
++  tag: 'CaptionManagement',
++  group: 0,
++  timeControlMode: TimeControlModeType.FREE,
++  languages: [],
++  units: [],
++} as const satisfies ARIBB24CaptionData;
++const packet = new Uint8Array([0x80, 0, 0, ...new Uint8Array(mux(management))]);
++
++describe('DecodingFeeder late metadata', () => {
++  test('decodes data that arrives after the media clock passed its DTS', async () => {
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(2);
++      feeder.content(2.1);
++      feeder.feedB24(packet, 2.05);
++      await vi.waitFor(() => expect(feeder.content(2.2)?.pts).toBe(2.05));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('decodes a cue arriving exactly at a paused media clock', async () => {
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(2);
++      feeder.content(2);
++      const changed = vi.fn();
++      feeder.setPresentationChangeHandler(changed);
++      feeder.feedB24(packet, 2);
++      await vi.waitFor(() => expect(changed).toHaveBeenCalledOnce());
++      expect(feeder.content(2)?.pts).toBe(2);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('retries a same-time statement that arrived before its management packet', async () => {
++    const managementWithLanguage = {
++      ...management,
++      languages: [{ lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++        format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00 }],
++    } as const satisfies ARIBB24CaptionData;
++    const statement = {
++      tag: 'CaptionStatement', group: 0, lang: 0,
++      timeControlMode: TimeControlModeType.FREE, units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const makePacket = (caption: ARIBB24CaptionData) =>
++      new Uint8Array([0x80, 0, 0, ...new Uint8Array(mux(caption))]);
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(2);
++      feeder.content(2);
++      feeder.feedB24(makePacket(statement), 2);
++      await new Promise<void>((resolve) => setImmediate(resolve));
++      feeder.feedB24(makePacket(managementWithLanguage), 2);
++      await vi.waitFor(() => expect(feeder.content(2)?.data).toEqual([]));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('waits for a new management group before decoding its same-time statement', async () => {
++    const baseManagement = {
++      ...management,
++      languages: [{ lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++        format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00 }],
++    } as const satisfies ARIBB24CaptionData;
++    const nextManagement = { ...baseManagement, group: 1 as const };
++    const statement = {
++      tag: 'CaptionStatement', group: 1, lang: 0,
++      timeControlMode: TimeControlModeType.FREE, units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const makePacket = (caption: ARIBB24CaptionData) =>
++      new Uint8Array([0x80, 0, 0, ...new Uint8Array(mux(caption))]);
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(1);
++      feeder.feedB24(makePacket(baseManagement), 1);
++      await vi.waitFor(() => expect(feeder.content(1)?.pts).toBe(1));
++      feeder.content(2);
++      feeder.feedB24(makePacket(statement), 2);
++      await new Promise<void>((resolve) => setImmediate(resolve));
++      feeder.feedB24(makePacket(nextManagement), 2);
++      await vi.waitFor(() => expect(feeder.content(2)?.data).toEqual([]));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('keeps a pending statement when another management group arrives first', async () => {
++    const baseManagement = {
++      ...management,
++      languages: [{ lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++        format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00 }],
++    } as const satisfies ARIBB24CaptionData;
++    const nextManagement = { ...baseManagement, group: 1 as const };
++    const statement = {
++      tag: 'CaptionStatement', group: 1, lang: 0,
++      timeControlMode: TimeControlModeType.FREE, units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const makePacket = (caption: ARIBB24CaptionData) =>
++      new Uint8Array([0x80, 0, 0, ...new Uint8Array(mux(caption))]);
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(2);
++      feeder.content(3);
++      feeder.feedB24(makePacket(statement), 2.2);
++      await new Promise<void>((resolve) => setImmediate(resolve));
++      feeder.feedB24(makePacket(baseManagement), 2);
++      await vi.waitFor(() => expect(feeder.content(3)?.pts).toBe(2));
++      feeder.feedB24(makePacket(nextManagement), 2.1);
++      await vi.waitFor(() => expect(feeder.content(3)?.pts).toBe(2.2));
++      expect(feeder.content(3)?.data).toEqual([]);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('keeps normal in-order data on the time-based path', async () => {
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(2);
++      feeder.feedB24(packet, 2.15);
++      feeder.content(2.2);
++      await vi.waitFor(() => expect(feeder.content(2.3)?.pts).toBe(2.15));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('does not decode the same late cue twice when a segment is replayed', () => {
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(2);
++      feeder.content(2.1);
++      const notify = vi.spyOn(feeder as any, 'notify');
++      feeder.feedB24(packet, 2.05);
++      feeder.feedB24(packet, 2.05);
++      expect(notify).toHaveBeenCalledTimes(1);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('decodes a changed packet at a previously notified DTS', async () => {
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(2);
++      feeder.content(2);
++      feeder.feedB24(packet, 2);
++      await vi.waitFor(() => expect(feeder.content(2)?.pts).toBe(2));
++      const first = feeder.content(2);
++      const replacement = new Uint8Array([0x80, 0, 0, ...new Uint8Array(mux({
++        ...management, group: 1,
++      }))]);
++      feeder.feedB24(replacement, 2);
++      await vi.waitFor(() => expect(feeder.content(2)).not.toBe(first));
++      expect(feeder.content(2)?.pts).toBe(2);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('a previously stored but not decoded cue can still be delivered late', () => {
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.feedB24(packet, 2.05);
++      feeder.prepare(2.1);
++      const notify = vi.spyOn(feeder as any, 'notify');
++      feeder.feedB24(packet, 2.05);
++      expect(notify).toHaveBeenCalledTimes(1);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('does not lose a new cue delivered immediately after seeking', async () => {
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.onSeeking();
++      feeder.prepare(2.1);
++      feeder.feedB24(packet, 2.05);
++      await vi.waitFor(() => expect(feeder.content(2.2)?.pts).toBe(2.05));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('replays received management from the seek target, including when play prepares the feeder', () => {
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(0);
++      feeder.feedB24(packet, 2);
++      feeder.feedB24(packet, 8);
++      feeder.content(8.2);
++
++      feeder.onSeeking();
++      const notify = vi.spyOn(feeder as any, 'notify');
++      feeder.prepare(8.5); // Controller.onPlay() runs before the next paint.
++      feeder.content(8.6);
++      expect(notify.mock.calls.filter(([segment]) => segment != null).map(([segment]) => segment.pts)).toEqual([8]);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('replays received management on a paused seek without a play event', () => {
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(0);
++      feeder.feedB24(packet, 2);
++      feeder.content(2.2);
++
++      feeder.onSeeking();
++      const notify = vi.spyOn(feeder as any, 'notify');
++      feeder.content(2.5);
++      expect(notify.mock.calls.filter(([segment]) => segment != null).map(([segment]) => segment.pts)).toEqual([2]);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('restores an already received statement after seeking within buffered media', async () => {
++    const managementWithLanguage = {
++      ...management,
++      languages: [{ lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++        format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00 }],
++    } as const satisfies ARIBB24CaptionData;
++    const statement = {
++      tag: 'CaptionStatement', group: 0, lang: 0,
++      timeControlMode: TimeControlModeType.FREE, units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const makePacket = (caption: ARIBB24CaptionData) => new Uint8Array([0x80, 0, 0, ...new Uint8Array(mux(caption))]);
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(0);
++      feeder.feedB24(makePacket(managementWithLanguage), 2);
++      feeder.feedB24(makePacket(statement), 2.5);
++      feeder.content(3);
++      await vi.waitFor(() => expect(feeder.content(3)?.pts).toBe(2.5));
++
++      feeder.onSeeking();
++      feeder.prepare(3.1, 2);
++      feeder.content(3.2, 2);
++      await vi.waitFor(() => expect(feeder.content(3.2, 2)?.pts).toBe(2.5));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('does not restore an old statement after seeking into a separate buffered range', async () => {
++    const managementWithLanguage = {
++      ...management,
++      languages: [{ lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++        format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00 }],
++    } as const satisfies ARIBB24CaptionData;
++    const statement = {
++      tag: 'CaptionStatement', group: 0, lang: 0,
++      timeControlMode: TimeControlModeType.FREE, units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const makePacket = (caption: ARIBB24CaptionData) => new Uint8Array([0x80, 0, 0, ...new Uint8Array(mux(caption))]);
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(0);
++      feeder.feedB24(makePacket(managementWithLanguage), 2);
++      feeder.feedB24(makePacket(statement), 2.5);
++      feeder.content(3);
++      await vi.waitFor(() => expect(feeder.content(3)?.pts).toBe(2.5));
++
++      feeder.onSeeking();
++      feeder.prepare(1000, null);
++      expect(feeder.content(1000, null)).toBeNull();
++      feeder.prepare(1000, 999);
++      feeder.content(1000, 999);
++      await new Promise<void>((resolve) => setImmediate(resolve));
++      expect(feeder.content(1000, 999)?.data.map((token) => token.tag)).toEqual(['ClearScreen']);
++
++      feeder.feedB24(makePacket(statement), 998.9);
++      feeder.onSeeking();
++      feeder.prepare(1000, 999);
++      await vi.waitFor(() => expect(feeder.content(1000, 999)?.pts).toBe(998.9));
++
++      feeder.onSeeking();
++      feeder.prepare(3, 2);
++      feeder.prepare(3, 2); // A play event must not discard the pending replay window.
++      await vi.waitFor(() => expect(feeder.content(3, 2)?.pts).toBe(2.5));
++
++      feeder.onSeeking();
++      feeder.prepare(3, 2);
++      feeder.onSeeking(); // A second seek supersedes the unread first window.
++      feeder.prepare(1000, 999);
++      await vi.waitFor(() => expect(feeder.content(1000, 999)?.pts).toBe(998.9));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('does not replay a distant statement when a direct caller omits bufferedStart', async () => {
++    const managementWithLanguage = {
++      ...management,
++      languages: [{ lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++        format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00 }],
++    } as const satisfies ARIBB24CaptionData;
++    const statement = {
++      tag: 'CaptionStatement', group: 0, lang: 0,
++      timeControlMode: TimeControlModeType.FREE, units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const makePacket = (caption: ARIBB24CaptionData) =>
++      new Uint8Array([0x80, 0, 0, ...new Uint8Array(mux(caption))]);
++    const feeder = new MPEGTSFeeder();
++    try {
++      feeder.prepare(0);
++      feeder.feedB24(makePacket(managementWithLanguage), 2);
++      feeder.feedB24(makePacket(statement), 2.5);
++      await vi.waitFor(() => expect(feeder.content(3)?.pts).toBe(2.5));
++
++      feeder.onSeeking();
++      feeder.prepare(1000);
++      await vi.waitFor(() => expect(feeder.content(1000)?.data.map((token) => token.tag)).toEqual(['ClearScreen']));
++    } finally {
++      feeder.destroy();
++    }
++  });
++});
+diff --git a/test/unit/feeder/hls-feeder.test.ts b/test/unit/feeder/hls-feeder.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f582efcdf59f83970de4971ee3b3472a197f6530
+--- /dev/null
++++ b/test/unit/feeder/hls-feeder.test.ts
+@@ -0,0 +1,645 @@
++import { afterEach, describe, expect, test, vi } from 'vitest';
++
++import HLSFeeder from '@/runtime/browser/feeder/hls-feeder';
++import mux from '@/lib/muxer/b24/datagroup';
++import { ARIBB24CaptionData, RollupModeType, TimeControlModeType } from '@/lib/demuxer/b24/datagroup';
++
++afterEach(() => vi.unstubAllGlobals());
++
++const buffered = (start: number, end: number): TimeRanges => ({
++  length: 1,
++  start: () => start,
++  end: () => end,
++}) as TimeRanges;
++
++describe('HLSFeeder media lifetime', () => {
++  test('enables native ID3 cues while attached and restores the prior track mode', () => {
++    const cue = { startTime: 1 } as TextTrackCue;
++    let mode: TextTrackMode = 'disabled';
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      get mode() { return mode; },
++      set mode(value: TextTrackMode) { mode = value; },
++      get cues() { return mode === 'disabled' ? null : [cue]; },
++    } as TextTrack;
++    const textTracks = Object.assign(new EventTarget(), { 0: track, length: 1 });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0, paused: true, buffered: buffered(0, 2), textTracks,
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++
++    feeder.attachMedia(media);
++    expect(track.mode).toBe('hidden');
++    expect(track.cues?.length).toBe(1);
++    feeder.destroy();
++    expect(track.mode).toBe('disabled');
++
++    mode = 'hidden';
++    const alreadyEnabled = new HLSFeeder();
++    alreadyEnabled.attachMedia(media);
++    alreadyEnabled.destroy();
++    expect(track.mode).toBe('hidden');
++
++    mode = 'disabled';
++    const changedElsewhere = new HLSFeeder();
++    changedElsewhere.attachMedia(media);
++    mode = 'showing';
++    changedElsewhere.destroy();
++    expect(track.mode).toBe('showing');
++  });
++
++  test('enables a metadata track added after media attachment and restores it on removal', () => {
++    let mode: TextTrackMode = 'disabled';
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      get mode() { return mode; },
++      set mode(value: TextTrackMode) { mode = value; },
++      get cues() { return mode === 'disabled' ? null : []; },
++    } as TextTrack;
++    const textTracks = Object.assign(new EventTarget(), { length: 0 });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0, paused: true, buffered: buffered(0, 2), textTracks,
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++
++    feeder.attachMedia(media);
++    textTracks.dispatchEvent(Object.assign(new Event('addtrack'), { track }));
++    expect(track.mode).toBe('hidden');
++    textTracks.dispatchEvent(Object.assign(new Event('removetrack'), { track }));
++    expect(track.mode).toBe('disabled');
++    feeder.destroy();
++  });
++
++  test('keeps a shared Safari track enabled until the last feeder detaches', () => {
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      mode: 'disabled', cues: [],
++    } as unknown as TextTrack;
++    const textTracks = Object.assign(new EventTarget(), { 0: track, length: 1 });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0, paused: true, buffered: buffered(0, 2), textTracks,
++    }) as unknown as HTMLVideoElement;
++    const caption = new HLSFeeder();
++    const superimpose = new HLSFeeder();
++
++    caption.attachMedia(media);
++    superimpose.attachMedia(media);
++    expect(track.mode).toBe('hidden');
++    caption.destroy();
++    expect(track.mode).toBe('hidden');
++    superimpose.destroy();
++    expect(track.mode).toBe('disabled');
++  });
++
++  test('reenables a shared Safari track disabled between feeder attachments', () => {
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      mode: 'disabled', cues: [],
++    } as unknown as TextTrack;
++    const textTracks = Object.assign(new EventTarget(), { 0: track, length: 1 });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0, paused: true, buffered: buffered(0, 2), textTracks,
++    }) as unknown as HTMLVideoElement;
++    const caption = new HLSFeeder();
++    const superimpose = new HLSFeeder();
++
++    caption.attachMedia(media);
++    track.mode = 'disabled';
++    superimpose.attachMedia(media);
++    expect(track.mode).toBe('hidden');
++    caption.destroy();
++    expect(track.mode).toBe('hidden');
++    superimpose.destroy();
++    expect(track.mode).toBe('disabled');
++  });
++
++  test('restores a Safari track added after attachment when the feeder detaches', () => {
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      mode: 'disabled', cues: [],
++    } as unknown as TextTrack;
++    const textTracks = Object.assign(new EventTarget(), { length: 0 });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0, paused: true, buffered: buffered(0, 2), textTracks,
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++
++    feeder.attachMedia(media);
++    textTracks.dispatchEvent(Object.assign(new Event('addtrack'), { track }));
++    expect(track.mode).toBe('hidden');
++    feeder.destroy();
++    expect(track.mode).toBe('disabled');
++  });
++
++  test('does not change a disabled non-Safari ID3 track', () => {
++    const track = { kind: 'metadata', label: 'id3', mode: 'disabled', cues: [] } as unknown as TextTrack;
++    const textTracks = Object.assign(new EventTarget(), { 0: track, length: 1 });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0, paused: true, buffered: buffered(0, 2), textTracks,
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++
++    feeder.attachMedia(media);
++    expect(track.mode).toBe('disabled');
++    feeder.destroy();
++    expect(track.mode).toBe('disabled');
++  });
++
++  test('feeds a native cue exposed only while the Safari track is hidden', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      pending.set(1, callback);
++      return 1;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    let mode: TextTrackMode = 'disabled';
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      get mode() { return mode; },
++      set mode(value: TextTrackMode) { mode = value; },
++      get cues() { return mode === 'disabled' ? null : [{
++        startTime: 1, track: track as unknown as TextTrack,
++        value: { key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([0x80]) },
++      }]; },
++    } as TextTrack;
++    const textTracks = Object.assign(new EventTarget(), { 0: track, length: 1 });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1.1, paused: false, seeking: false, buffered: buffered(0, 2), textTracks,
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    const received: number[] = [];
++    (feeder as unknown as { feed(data: Uint8Array, pts: number, dts: number): void }).feed = (_data, pts) => {
++      received.push(pts);
++    };
++
++    try {
++      feeder.attachMedia(media);
++      pending.get(1)!(0);
++      expect(received).toEqual([1]);
++    } finally {
++      feeder.destroy();
++    }
++    expect(track.mode).toBe('disabled');
++  });
++
++  test('scans buffered ID3 once after a paused seek without starting rAF', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      cues: [] as TextTrackCue[],
++    };
++    track.cues.push({
++      startTime: 10.2, track: track as unknown as TextTrack,
++      value: {key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([0x80])},
++    } as unknown as TextTrackCue);
++    // A TextTrackCueList supports indexed reads; scanning need not copy its
++    // entire buffered history on every frame.
++    track.cues[Symbol.iterator] = () => { throw new Error('cue list iteration'); };
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 10.5, paused: true, seeking: false, buffered: buffered(10, 12),
++      textTracks: Object.assign(new EventTarget(), {0: track, length: 1}),
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    const received: number[] = [];
++    (feeder as unknown as {feed(data: Uint8Array, pts: number, dts: number): void}).feed = (_data, pts) => {
++      received.push(pts);
++    };
++    try {
++      feeder.attachMedia(media);
++      feeder.onSeeking();
++      feeder.onSeeked();
++      expect(received).toEqual([10.2]);
++      expect(pending.size).toBe(0);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('scans a paused seek target when its media arrives after seeked', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      cues: [] as TextTrackCue[],
++    };
++    let ranges = [[0, 10]];
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1000, paused: true, seeking: false,
++      buffered: {
++        get length() { return ranges.length; },
++        start: (index: number) => ranges[index][0],
++        end: (index: number) => ranges[index][1],
++      } as TimeRanges,
++      textTracks: Object.assign(new EventTarget(), {0: track, length: 1}),
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    const received: number[] = [];
++    (feeder as unknown as {feed(data: Uint8Array, pts: number, dts: number): void}).feed = (_data, pts) => {
++      received.push(pts);
++    };
++    try {
++      feeder.attachMedia(media);
++      feeder.onSeeking();
++      feeder.onSeeked();
++      expect(received).toEqual([]);
++      track.cues.push({
++        startTime: 999.5, track: track as unknown as TextTrack,
++        value: {key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([0x80])},
++      } as unknown as TextTrackCue);
++      ranges = [[0, 10], [999, 1002]];
++      media.dispatchEvent(new Event('progress'));
++      expect(received).toEqual([999.5]);
++      expect(pending.size).toBe(0);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('keeps captions crossed during a short buffer gap, including a late cue', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      cues: [] as TextTrackCue[],
++    };
++    const addCue = (startTime: number) => track.cues.push({
++      startTime, track: track as unknown as TextTrack,
++      value: { key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([0x80]) },
++    } as unknown as TextTrackCue);
++    addCue(10);
++    let ranges = [[0, 10.00], [10.02, 10.055], [10.08, 11]];
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 9.99,
++      seeking: false,
++      buffered: {
++        get length() { return ranges.length; },
++        start: (index: number) => ranges[index][0],
++        end: (index: number) => ranges[index][1],
++      } as TimeRanges,
++      textTracks: Object.assign(new EventTarget(), { 0: track, length: 1 }),
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    const received: number[] = [];
++    (feeder as unknown as { feed(data: Uint8Array, pts: number, dts: number): void }).feed = (_data, pts) => {
++      received.push(pts);
++    };
++    const runFrame = () => {
++      const [id, callback] = pending.entries().next().value!;
++      pending.delete(id);
++      callback(0);
++    };
++    try {
++      feeder.attachMedia(media);
++      media.dispatchEvent(new Event('play'));
++      runFrame();
++      media.currentTime = 10.01;
++      runFrame(); // Buffer gap: do not discard the previous cue time.
++      media.currentTime = 10.05;
++      runFrame();
++      expect(received).toEqual([10]);
++
++      media.currentTime = 10.06;
++      runFrame();
++      addCue(10.055); // Cue list changes while the playhead is in the next gap.
++      media.currentTime = 10.09;
++      runFrame();
++      expect(received).toEqual([10, 10.055]);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('does not restore captions from an old buffer after seeking outside it', async () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    const management = {
++      tag: 'CaptionManagement', group: 0, timeControlMode: TimeControlModeType.FREE,
++      languages: [{ lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++        format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00 }], units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const statement = {
++      tag: 'CaptionStatement', group: 0, lang: 0,
++      timeControlMode: TimeControlModeType.FREE, units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      cues: [] as TextTrackCue[],
++    };
++    const addCue = (startTime: number, caption: ARIBB24CaptionData) => {
++      track.cues.push({
++        startTime, track: track as unknown as TextTrack,
++        value: { key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([
++          0x80, 0, 0, ...new Uint8Array(mux(caption)),
++        ]) },
++      } as unknown as TextTrackCue);
++    };
++    addCue(0, management);
++    addCue(600, statement);
++    let ranges = [[0, 601]];
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0,
++      buffered: {
++        get length() { return ranges.length; },
++        start: (index: number) => ranges[index][0],
++        end: (index: number) => ranges[index][1],
++      } as TimeRanges,
++      textTracks: Object.assign(new EventTarget(), { 0: track, length: 1 }),
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    const runFrame = () => {
++      const [id, callback] = pending.entries().next().value!;
++      pending.delete(id);
++      callback(0);
++    };
++    try {
++      feeder.attachMedia(media);
++      media.dispatchEvent(new Event('play'));
++      runFrame();
++      await vi.waitFor(() => expect(feeder.content(0.1)?.pts).toBe(0));
++      media.currentTime = 600.1;
++      runFrame();
++      await vi.waitFor(() => expect(feeder.content(600.1)?.pts).toBe(600));
++
++      feeder.onSeeking();
++      media.currentTime = 1800;
++      runFrame(); // The target is not buffered yet.
++      expect(feeder.content(1800)).toBeNull();
++      ranges = [[0, 601], [1799, 1820]];
++      runFrame(); // Only old cues are available in the track.
++      expect(feeder.content(1800)).toBeNull();
++
++      addCue(1799.5, management);
++      addCue(1800.05, statement);
++      media.currentTime = 1800.1;
++      runFrame();
++      await vi.waitFor(() => expect(feeder.content(1800.1)?.pts).toBe(1800.05));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('restores the statement after a backward seek when HLS runs before the controller', async () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++
++    const management = {
++      tag: 'CaptionManagement', group: 0, timeControlMode: TimeControlModeType.FREE,
++      languages: [{ lang: 0, displayMode: 0b0101, iso_639_language_code: 'jpn',
++        format: 7, rollup: RollupModeType.NOT_ROLLUP, TCS: 0b00 }],
++      units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const statement = {
++      tag: 'CaptionStatement', group: 0, lang: 0,
++      timeControlMode: TimeControlModeType.FREE, units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      cues: [] as TextTrackCue[],
++    };
++    track.cues.push(...[[0, management], [1, statement]].map(([startTime, caption]) => ({
++      startTime, track: track as unknown as TextTrack,
++      value: { key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([
++        0x80, 0, 0, ...new Uint8Array(mux(caption as ARIBB24CaptionData)),
++      ]) },
++    })) as unknown as TextTrackCue[]);
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0,
++      buffered: buffered(0, 4),
++      textTracks: Object.assign(new EventTarget(), { 0: track, length: 1 }),
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    const runFrame = () => {
++      const [id, callback] = pending.entries().next().value!;
++      pending.delete(id);
++      callback(0);
++    };
++    try {
++      feeder.attachMedia(media);
++      media.dispatchEvent(new Event('play'));
++      runFrame();
++      await vi.waitFor(() => expect(feeder.content(0.1)?.pts).toBe(0));
++      media.currentTime = 1.5;
++      runFrame();
++      await vi.waitFor(() => expect(feeder.content(1.5)?.pts).toBe(1));
++
++      feeder.onSeeking();
++      media.currentTime = 0.5;
++      runFrame(); // HLS rAF runs before the controller calls content().
++      await vi.waitFor(() => expect(feeder.content(0.5)?.pts).toBe(0));
++      feeder.onSeeking();
++      media.currentTime = 1.5;
++      runFrame();
++      await vi.waitFor(() => expect(feeder.content(1.5)?.pts).toBe(1));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test.each([
++    { name: 'Safari native HLS', label: '', dispatchType: 'com.apple.streaming' },
++    { name: 'hls.js ID3', label: 'id3', dispatchType: undefined },
++  ])('replays $name metadata in order on attach and after a backward seek', ({ label, dispatchType }) => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    const track = {
++      kind: 'metadata', label, inBandMetadataTrackDispatchType: dispatchType,
++      cues: [] as TextTrackCue[],
++    };
++    track.cues.push(...[0, 1, 2, 3].map((startTime) => ({
++      startTime, track: track as unknown as TextTrack,
++      value: { key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([0x80]) },
++    })) as unknown as TextTrackCue[]);
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 1.5,
++      buffered: buffered(0, 4),
++      textTracks: Object.assign(new EventTarget(), { 0: track, length: 1 }),
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    const order: number[] = [];
++    (feeder as unknown as { feed(data: Uint8Array, pts: number, dts: number): void }).feed = (_data, pts) => {
++      order.push(pts);
++    };
++    const runFrame = () => {
++      const [id, callback] = pending.entries().next().value!;
++      pending.delete(id);
++      callback(0);
++    };
++    try {
++      feeder.attachMedia(media);
++      media.dispatchEvent(new Event('play'));
++      runFrame();
++      expect(order).toEqual([0, 1]);
++
++      media.currentTime = 3.1;
++      runFrame();
++      order.length = 0;
++      feeder.onSeeking();
++      media.currentTime = 1.5;
++      runFrame();
++      expect(order).toEqual([0, 1]);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('feeds metadata crossed in one frame in chronological order', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      cues: [] as TextTrackCue[],
++    };
++    track.cues.push(...[1, 1.1].map((startTime) => ({
++      startTime, track: track as unknown as TextTrack,
++      value: { key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([0x80]) },
++    })) as unknown as TextTrackCue[]);
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0.1,
++      buffered: buffered(0, 4),
++      textTracks: Object.assign(new EventTarget(), { 0: track, length: 1 }),
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    const order: number[] = [];
++    (feeder as unknown as { feed(data: Uint8Array, pts: number, dts: number): void }).feed = (_data, pts) => {
++      order.push(pts);
++    };
++    const runFrame = () => {
++      const [id, callback] = pending.entries().next().value!;
++      pending.delete(id);
++      callback(0);
++    };
++    try {
++      feeder.attachMedia(media);
++      media.dispatchEvent(new Event('play'));
++      runFrame();
++      media.currentTime = 1.2;
++      runFrame();
++      expect(order).toEqual([1, 1.1]);
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('decodes native metadata discovered after content advanced past the cue time', async () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++
++    const management = {
++      tag: 'CaptionManagement', group: 0,
++      timeControlMode: TimeControlModeType.FREE,
++      languages: [], units: [],
++    } as const satisfies ARIBB24CaptionData;
++    const track = {
++      kind: 'metadata', inBandMetadataTrackDispatchType: 'com.apple.streaming',
++      cues: [] as TextTrackCue[],
++    };
++    track.cues.push(...[0, 1].map((startTime) => ({
++      startTime, track: track as unknown as TextTrack,
++      value: { key: 'PRIV', info: 'aribb24.js', data: new Uint8Array([
++        0x80, 0, 0, ...new Uint8Array(mux({ ...management, group: startTime === 0 ? 0 : 1 })),
++      ]) },
++    })) as unknown as TextTrackCue[]);
++    const textTracks = Object.assign(new EventTarget(), { 0: track, length: 1 });
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0,
++      buffered: buffered(0, 4),
++      textTracks,
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    const runFrame = () => {
++      const [id, callback] = pending.entries().next().value!;
++      pending.delete(id);
++      callback(0);
++    };
++    try {
++      feeder.attachMedia(media);
++      feeder.prepare(0);
++      media.dispatchEvent(new Event('play'));
++      runFrame(); // establish the metadata observer's starting time
++      media.currentTime = 1.1;
++      feeder.content(1.1); // Controller's rAF has already advanced its clock
++      runFrame(); // the native metadata feeder discovers the cue afterwards
++      await vi.waitFor(() => expect(feeder.content(1.2)?.pts).toBe(1));
++    } finally {
++      feeder.destroy();
++    }
++  });
++
++  test('cancels its inspection loop when the media is detached', () => {
++    const pending = new Map<number, FrameRequestCallback>();
++    let nextId = 1;
++    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
++      const id = nextId++;
++      pending.set(id, callback);
++      return id;
++    });
++    vi.stubGlobal('cancelAnimationFrame', (id: number) => pending.delete(id));
++
++    const media = Object.assign(new EventTarget(), {
++      currentTime: 0,
++      buffered: buffered(0, 4),
++      textTracks: Object.assign(new EventTarget(), { length: 0 }),
++    }) as unknown as HTMLVideoElement;
++    const feeder = new HLSFeeder();
++    feeder.attachMedia(media);
++    media.dispatchEvent(new Event('play'));
++    expect(pending.size).toBe(1);
++
++    feeder.detachMedia();
++    expect(pending.size).toBe(0);
++
++    media.dispatchEvent(new Event('play'));
++    expect(pending.size).toBe(0);
++    feeder.destroy();
++    expect((feeder as any).isDestroyed).toBe(true);
++  });
++});
+diff --git a/test/unit/parser/parser.test.ts b/test/unit/parser/parser.test.ts
+index 2a428f2ee704bb9795d02ad43444e9f8b100e2ed..a995e9ab53a65f23b3b8ebe233c59b8863890fc3 100644
+--- a/test/unit/parser/parser.test.ts
++++ b/test/unit/parser/parser.test.ts
+@@ -108,6 +108,15 @@ describe("ARIB STD-B24 Parser", () => {
+     ]);
+   });
+ 
++  test('ReplaceDRCS accepts an uppercase hash key', () => {
++    const binary = Uint8Array.from([0x01, 0x23, 0x45, 0x67]).buffer;
++    const hash = md5(binary);
++    expect(replaceDRCS(
++      [ARIBB24DRCSToken.from(2, 2, 8, binary, '\u3099')],
++      new Map([[hash.toUpperCase(), '字']]),
++    )).toStrictEqual([ARIBB24CharacterToken.from('字\u3099')]);
++  });
++
+   test('Parse SetWritingFormat (SWF) 5 (1920x1080)', () => {
+     const option = { magnification: 2 } as const satisfies ARIBB24ParserOption;
+     const parser = new ARIBB24Parser(initialState, option);
+diff --git a/test/unit/renderer/text-renderer.test.ts b/test/unit/renderer/text-renderer.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..13d43018860679df6b6e250a2d2ff2f291d77c95
+--- /dev/null
++++ b/test/unit/renderer/text-renderer.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, test } from 'vitest';
++
++import { TextRenderer } from '@/index';
++import aribInitialState from '@/lib/parser/state/ARIB';
++import { ARIBB24CharacterToken, ARIBB24ClearScreenToken } from '@/lib/tokenizer/token';
++
++describe('ARIB B24 TextRenderer', () => {
++  test('exposes the rendered text and clears it with the cue', () => {
++    const renderer = new TextRenderer();
++    const info = { association: 'ARIB' as const, language: 'jpn' };
++
++    expect(renderer.getText()).toBeNull();
++    renderer.render(aribInitialState, [ARIBB24ClearScreenToken.from(), ARIBB24CharacterToken.from('字')], info);
++    expect(renderer.getText()).toBe('字');
++
++    renderer.clear();
++    expect(renderer.getText()).toBeNull();
++    renderer.destroy();
++  });
++
++  test('starts text extraction when the first statement has no ClearScreen', () => {
++    const renderer = new TextRenderer();
++    const info = { association: 'ARIB' as const, language: 'jpn' };
++
++    renderer.render(aribInitialState, [ARIBB24CharacterToken.from('あ')], info);
++    renderer.render(aribInitialState, [ARIBB24CharacterToken.from('い')], info);
++    expect(renderer.getText()).toBe('あい');
++    renderer.destroy();
++  });
++});
+diff --git a/test/unit/util/avl.test.ts b/test/unit/util/avl.test.ts
+index 0c7789d5f7891a3f85af731d30d5ac7a707d0986..e20eace4420d2df85d331a28d34cf22b2a37b7fa 100644
+--- a/test/unit/util/avl.test.ts
++++ b/test/unit/util/avl.test.ts
+@@ -6,6 +6,35 @@ const compareNumber = (a: number, b: number) => {
+ }
+ 
+ describe("AVL", () => {
++  test('range includes both endpoints', () => {
++    const avl = new AVLTree<number, number>(compareNumber, compareNumber, (val) => val);
++    for (const value of [1, 2, 3]) avl.insert(value, value);
++    expect([...avl.range(2, 2)]).toEqual([2]);
++    expect([...avl.range(1.5, 3)]).toEqual([2, 3]);
++  });
++  test('range includes every key sharing its upper order boundary', () => {
++    const compareKey = (a: { dts: number; lang: number }, b: { dts: number; lang: number }) =>
++      compareNumber(a.dts, b.dts) || compareNumber(a.lang, b.lang);
++    const avl = new AVLTree<{ dts: number; lang: number }, string, number>(
++      compareKey, compareNumber, ({ dts }) => dts,
++    );
++    avl.insert({ dts: 1, lang: 0 }, 'management');
++    avl.insert({ dts: 1, lang: 1 }, 'statement');
++    expect([...avl.range(0, 1)]).toEqual(['management', 'statement']);
++    expect([...avl.range(1, 1)]).toEqual(['management', 'statement']);
++  });
++  test('floor and ceil retain an ancestor candidate across the opposite branch', () => {
++    for (const keys of [[5, 0, 10, 15], Array.from({length: 100}, (_, index) => index)]) {
++      const avl = new AVLTree<number, number>(compareNumber, compareNumber, (val) => val);
++      for (const value of keys) avl.insert(value, value);
++      const sorted = [...keys].sort((a, b) => a - b);
++      for (let query = sorted[0] - 1; query <= sorted.at(-1)! + 1; query++) {
++        expect(avl.floor(query)).toBe(sorted.filter(value => value <= query).at(-1));
++        expect(avl.ceil(query)).toBe(sorted.find(value => value >= query));
++      }
++    }
++  });
++
+   test('Insert', () => {
+     const avl = new AVLTree<number, number>(compareNumber, compareNumber, (val) => val);
+ 

@@ -1,0 +1,26 @@
+diff --git a/src/ts/info-panel.ts b/src/ts/info-panel.ts
+index 84ffd0df8412e897955596d85f3b9b2bc504eca6..fb0291593b9afc6cc1e2df8468fee1fa8ab5b76d 100644
+--- a/src/ts/info-panel.ts
++++ b/src/ts/info-panel.ts
+@@ -303,6 +303,21 @@ class InfoPanel {
+             } else {
+                 terms.push('autofilm: on');
+             }
++            // GPU pulldown state (present when the yadif take provides it;
++            // unknown-typed so this panel still compiles against older yadif).
++            // Shown only when the GPU path is selected; under autoFilm the
++            // CPU engine owns the cadence and stats.film does not apply.
++            const filmOption: unknown = (deinterlacer as { film?: unknown }).film;
++            if (typeof filmOption === 'boolean' && filmOption && !deinterlacer.autoFilm) {
++                const stats = this.mpeg2toh264DeinterlaceStats as unknown as { film?: unknown; filmError?: unknown };
++                const filmError = stats?.filmError;
++                if (typeof filmError === 'string' && filmError !== '') {
++                    terms.push(`film: degraded (${filmError})`);
++                } else {
++                    const locked = stats?.film;
++                    terms.push(locked === true ? 'film: on (24p locked)' : 'film: on (detecting)');
++                }
++            }
+         }
+         return terms.join(' / ');
+     }
