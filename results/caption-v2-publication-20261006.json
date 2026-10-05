@@ -1,0 +1,160 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-06",
+  "scope": "Caption v2 source candidates and reproducible Git dependencies. No playback backend, MPEG conversion, film, VCE, or production deployment changes.",
+  "adoptionOrder": ["aribb24.js", "DPlayer", "KonomiTV"],
+  "repositories": {
+    "aribb24": {
+      "repository": "https://github.com/libratechw/aribb24.js",
+      "upstreamBase": "188741850ecdadbf2c6db635eaee1313ee0a2a84",
+      "sourceBranch": "candidate/caption-v2",
+      "sourceCommit": "9046f6eb980bd02ac4f6bb5579d89cbda8277529",
+      "sourceCommitCount": 7,
+      "distributionBranch": "distribution/caption-v2",
+      "distributionCommit": "5752f2938e21563e870904be215eed5704c7bd28",
+      "distributionDelta": "One generated-dist commit after the source candidate. Source files and package/build configuration are identical.",
+      "sourceComparison": "https://github.com/libratechw/aribb24.js/compare/188741850ecdadbf2c6db635eaee1313ee0a2a84...9046f6eb980bd02ac4f6bb5579d89cbda8277529",
+      "builtModuleSha256": "3d92aa03d1b1389f64524cc8962c38b8c5991af87c480be6f6fbf1a959408187"
+    },
+    "dplayer": {
+      "repository": "https://github.com/libratechw/DPlayer",
+      "upstreamBase": "cdf2222ec007372910367c23ee81428893623585",
+      "branch": "candidate/caption-v2",
+      "sourceCommit": "e680cf63c731031e01db764b15092be2050f66f0",
+      "candidateCommit": "b26d4b5ff33cf3327d6074d896544c71666cf6a8",
+      "commitLayout": "Caption migration with tests and migration guide, followed by a distribution-only commit.",
+      "aribb24Dependency": "5752f2938e21563e870904be215eed5704c7bd28",
+      "migrationGuide": "https://github.com/libratechw/DPlayer/blob/b26d4b5ff33cf3327d6074d896544c71666cf6a8/docs/guide.md#arib-captions",
+      "builtJavaScriptSha256": "920ad9c9c56ae560ac48cb22a6e966f7f099809a7e83430d2695a1a171812183"
+    },
+    "konomitv": {
+      "repository": "https://github.com/libratechw/KonomiTV",
+      "upstreamBase": "079f0dbe14bb9e44e8944ad44be744d5a1018597",
+      "branch": "candidate/caption-v2",
+      "sourceCommit": "31ba6e1ba8dd4c2d8ecb6f99fc373f8baaa53a51",
+      "candidateCommit": "14346515d9d2a3faa0e7ce03cecf7130819f33ff",
+      "commitLayout": "Caption settings and capture integration, followed by a distribution-only commit.",
+      "dplayerDependency": "b26d4b5ff33cf3327d6074d896544c71666cf6a8",
+      "unchangedPlaybackDependencies": {
+        "mpeg2toh264": "69f2a47aa5bbeb8ffce57ecf5408eaa85a59d7d1",
+        "mpegts.js": "bf4e49d0ff004cf7546237393a62c66e4b926dca"
+      },
+      "playerControllerAsset": "PlayerController-CXvBi6F-.js",
+      "playerControllerSha256": "da9ba18d27efa9c3911ef0c738f93b3fd003f3a5b8b52a904fa36b529a9c154a",
+      "indexHtmlSha256": "c6f763ab166cc734d9e8a1aee3e85a737a10677b5fb25a6110748202dac35cce"
+    }
+  },
+  "contracts": {
+    "pictureReplayOwner": "aribb24.js Controller; DPlayer does not maintain a separate picture replay stack",
+    "workerFailure": "Report the failure, replace the failed renderer with main-thread rendering, preserve caption visibility and the displayed picture",
+    "webFonts": "Settings requiring page Web fonts use the main-thread renderer",
+    "glyphs": "aribb24.js v2 standard glyphs; existing NSZ DRCS replacements are retained; no custom arrow or emoji conversion",
+    "snapshot": "Asynchronous snapshot returns image/text/present; the recipient owns and closes a non-null ImageBitmap",
+    "capture": "KonomiTV transfers received images to CaptureCompositor, which waits for both output jobs and releases all images in finally"
+  },
+  "verification": {
+    "aribb24": {
+      "nodeVersion": "24.19.0",
+      "typescriptVersion": "6.0.3",
+      "vitestVersion": "4.1.4",
+      "unitAndIntegration": {"files": 19, "passed": 754, "failed": 0},
+      "testSelection": "The upstream Vitest configuration includes test/unit and test/integration in one invocation",
+      "eachSourceCommit": "All 7 source commits independently passed their then-current tests and TypeScript check",
+      "relatedBrowserTests": {
+        "passed": 5,
+        "failed": 0,
+        "browser": "Chrome 154.0.8037.97",
+        "mode": "headless",
+        "files": [
+          "test/e2e/renderer/canvas-worker.test.ts",
+          "test/e2e/renderer/canvas-mainthread.test.ts",
+          "test/e2e/controller/replaced-bitmap.test.ts"
+        ]
+      },
+      "knownUnrelatedFailure": "One SVG flashing snapshot differs on both the candidate and the same-environment upstream base; full browser-suite success is not claimed",
+      "builtDistribution": {"files": 407, "byteIdenticalToSourceBuild": 407},
+      "hiddenPictureRegressions": [
+        "Hidden playback with append-only cues, with and without feeder notification",
+        "An intermediate screen clear must discard the old page",
+        "Expired pictures must not reappear",
+        "A custom feeder with no retained range must not carry an unproven old picture",
+        "Partial renderer replacement must not consume the next cue twice"
+      ]
+    },
+    "dplayer": {
+      "nodeVersion": "20.19.5",
+      "freshPublicNpmCi": true,
+      "packageLockUnchanged": true,
+      "installedAribb24DistributionByteIdentical": true,
+      "testsPassed": 16,
+      "eslint": true,
+      "typeCheck": true,
+      "build": true,
+      "secondDirectoryBuild": {
+        "files": 54,
+        "byteIdentical": 53,
+        "exception": "DPlayer.min.js.map has two absolute template source paths from the build directory. All other map content is identical; runtime JS and declarations are byte-identical."
+      }
+    },
+    "konomitv": {
+      "nodeVersion": "20.19.5",
+      "yarnVersion": "1.22.22",
+      "freshPublicFrozenInstall": true,
+      "yarnLockUnchanged": true,
+      "installedDplayerDistributionByteIdentical": true,
+      "installedAribb24DistributionByteIdentical": true,
+      "vueTypeCheck": true,
+      "build": true,
+      "changedSourceFilesLint": true,
+      "sourceDiffWhitespaceCheck": true,
+      "captureOwnershipTestsPassed": 6,
+      "secondBuild": {
+        "files": 236,
+        "byteIdentical": 235,
+        "exception": "sw.js differs only in ordering of the same 234 unique precache URL/revision entries. The remaining service-worker code is identical."
+      }
+    },
+    "realTrackBrowserContract": {
+      "browser": "Chrome 154.0.8037.97",
+      "actualClasses": "DPlayer Aribb24Track, aribb24.js Controller, CanvasRenderer and TextRenderer, installed from the published dependency",
+      "input": "Synthetic caption cues and a controlled media clock, not recorded-video playback",
+      "passed": ["snapshot", "hidden visibility", "renderer recovery", "hidden append", "screen clear", "destroyed canvases removed"],
+      "notMeasured": ["video decoding", "physical scanout", "perceived smoothness", "audio", "A/V synchronization"]
+    }
+  },
+  "independentReview": {
+    "model": "Claude Opus 5.5",
+    "capability": "agent-route critical",
+    "verdict": "takeable",
+    "reviewedAribb24Source": "b506e2edfe85e054ae772a4cad8ae72952b0bfdb",
+    "publicationDelta": "Two documentation-only clarifications requested by the reviewer; no runtime change",
+    "callerScope": "DPlayer and KonomiTV caption ownership/capture contracts were reviewed; subsequent changes only update dependency pins and generated distribution"
+  },
+  "priorDeviceEvidence": {
+    "date": "2026-09-30",
+    "revisions": {"aribb24Distribution": "f2752a9", "dplayer": "ee9f4f9", "konomitv": "449c986"},
+    "device": "iPad Air / Safari",
+    "trials": "Two recordings, three minutes each, 180 playing/ready samples each",
+    "captionChanges": [20, 72],
+    "postSeekCaptionAssociatedRafGapsAtLeast100ms": [0, 0],
+    "rawSha256": [
+      "9e4cdf7445e4561d9f55a8b9c38cf48c8a478340619c91e006214b6620b3ba8b",
+      "03618ad622fa981c3f048e9d51a4611e03951282a3253a7aa0e7b1900b96c983"
+    ],
+    "capture": "1920x1080 caption JPEGs in Original, 1080p and 1080p60",
+    "userViewing": "The user reported that caption-transition stutter was no longer noticeable on an earlier candidate",
+    "limitations": "Private operational traces are retained outside this repository. The first trace has rAF interval summaries rather than a complete interval series. These are historical candidate results, not renewed all-platform acceptance of the 2026-10-06 source."
+  },
+  "notConfirmed": [
+    "All-platform viewing acceptance after updating to the current official bases",
+    "Audible audio and physical A/V synchronization on the current candidate",
+    "Long-duration viewing on the current candidate"
+  ],
+  "publication": {
+    "forkBranchesPushed": true,
+    "remoteHeadsMatched": true,
+    "upstreamPrCreated": false,
+    "upstreamPushed": false,
+    "normalDeploymentChanged": false
+  }
+}
