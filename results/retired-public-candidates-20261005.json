@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "date": "2026-10-05",
+  "updated": "2026-10-06",
   "purpose": "Historical candidate, experiment and diagnostic source preservation; not an adoption recommendation or a claim that all changes were merged.",
   "source_license": "Original repository licenses remain applicable (MIT or BSD-3-Clause); attribution is preserved. Starlette entries link to the included BSD license notice.",
   "retired_repository_replay": "For Starlette, repository identifies the official replay base and historical_repository identifies the comparison fork. recorded_tip is a historical fork tip, not an upstream commit; restore its source by applying the preserved patch. fork_verification_retired describes the end of independent verification, not confirmation that the repository was deleted.",
@@ -238,6 +239,22 @@
       "source_license_url": "https://github.com/libratechw/KonomiTV/blob/45d9a5910fda21702b7df9982373d01295a1a523/License.txt",
       "current_reference_url": "https://github.com/libratechw/konomitv-experience/issues/4",
       "historical_note": "The CSS-only center-control proposal is withdrawn. Button visibility was verified, not correct background-tap behavior. Issue #4 now tracks Galaxy Tab desktop classification and touch UI, using YouTube and other implementations as references; no replacement implementation is claimed."
+    },
+    {
+      "repository": "https://github.com/libratechw/mpeg2toh264",
+      "retired_branch": "perf/symmetric-chroma-idct",
+      "base_commit": "faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "base_url": "https://github.com/tsukumijima/mpeg2toh264/commit/faf1464e66693133fc9f4b8618992b0f557f0bc3",
+      "recorded_tip": "93c3e295f768222713bab8b75e3b67e3794dc2a0",
+      "tip_url": "https://github.com/libratechw/mpeg2toh264/commit/93c3e295f768222713bab8b75e3b67e3794dc2a0",
+      "source_patch": "mpeg2toh264-symmetric-chroma-idct-retired.patch",
+      "source_patch_sha256": "ad45e91038b68c9c2ea0ef967f6a4f1ea97323c4b051d82b5fc0a0929a932335",
+      "source_license": "MIT",
+      "source_license_url": "https://github.com/tsukumijima/mpeg2toh264/blob/faf1464e66693133fc9f4b8618992b0f557f0bc3/LICENSE",
+      "source_license_file": "mpeg2toh264-retired-source-LICENSE",
+      "current_reference_url": "https://github.com/libratechw/mpeg2toh264/tree/perf/chroma-ac-raster",
+      "replay_source_files": 10,
+      "historical_note": "The six-commit optimization collection is preserved as source history, not recommended as a whole. Chroma AC raster quantization was extracted and measured independently on the current official source base. CAVLC mask removal remains a local hold without clear POCO timing improvement; the other old changes are not part of this candidate. New extraction measurements are recorded separately in chroma-ac-raster-20261006.json."
     }
   ]
 }

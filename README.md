@@ -37,6 +37,29 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 
 以前の「完全取込2案」「完全取込＋追加3件」「CPU autoFilm最適化」とその性能表は、[当時の検証記録](https://github.com/libratechw/konomitv-experience/blob/e238e1f84ab4c5708024e865dfc05214b64c8454/README.md)として参照できます。数値は旧構成のものであり、今回の公式最新版の改善幅を示すものではありません。
 
+### [mpeg2toh264] 色差AC量子化のラスタ順化
+
+- **候補リンク**: [`perf/chroma-ac-raster`](https://github.com/libratechw/mpeg2toh264/tree/perf/chroma-ac-raster)（検証HEAD: [`64eaa6b`](https://github.com/libratechw/mpeg2toh264/commit/64eaa6bf67ce3484dd09d72635ca1373c619850d) / 基点: tsukumijima版 main [`69f2a47`](https://github.com/tsukumijima/mpeg2toh264/commit/69f2a47aa5bbeb8ffce57ecf5408eaa85a59d7d1)）
+- **変更内容**: 色差ACの乗算と丸めを連続した係数位置順に行い、その後にframe/field scan順へ並べ替えます。係数値・丸め・DC・公開API・描画方式は不変で、他の最適化を含まない2commit（sourceとdist）構成です。
+- **性能結果**（固定TS 1440x1080 1本・Worker内WASM変換、AB/BA交互8組）:
+
+| 端末 | 平均変換時間短縮 | 短縮した比較組 |
+| :--- | :--- | :--- |
+| Linux Chrome 154 headless | 4.46% | 8/8組 |
+| Windows ideapad Chrome 154 前面 | 3.69% | 8/8組 |
+| MacBook Air M1 Safari 26.6.2 前面 | 6.23% | 8/8組 |
+| POCO Android 13 Chrome 154 前面 | 2.65% | 7/8組 |
+
+- **確認済み**:
+  - 全72変換で出力全バイト・605映像サンプル・時刻情報が完全一致。
+  - `cargo test --release`（278件成功）、固定fixtureハッシュ不変、型検査通過。
+  - 候補はソースからの再ビルドでcommit済みdist（全41ファイル）および配布JS内WASMと完全一致。
+  - 本比較は公式の配布バイナリーを直接使った比較ではなく、同一ビルド条件（ローカルRust 1.93.0）による公式ソースと候補ソースの比較です（基準の再ビルドWASMは測定WASMと一致しますが、公式のcommit済み配布WASMとはバイトが異なるため）。
+- **未確認・留意点**:
+  - native CLIはばらつき範囲で明確な改善は未確認です。
+  - 外部CPU負荷・SoC温度は未定量であり、固定素材1本の結果を一般化するものではありません。
+  - MSE、デコード、YADIF、実画面表示（コマ落ち・視聴fps・起動・シーク）は未測定です（詳細要約と各組生値: [`results/chroma-ac-raster-20261006.json`](results/chroma-ac-raster-20261006.json)）。
+
 ### [DPlayer] ライブ同期計算の非有限・負値を`currentTime`へ渡さない
 - **候補**: [`fix/guard-nonfinite-live-sync`](https://github.com/libratechw/DPlayer/tree/fix/guard-nonfinite-live-sync)（検証対象: [`a937e92`](https://github.com/libratechw/DPlayer/commit/a937e92)）
 - **利用者に見える症状**: iPad SafariでTVライブストリーミングのOriginal画質を再生したとき、再生開始直後に映像が進まず、再生停止やプレイヤー再起動になることがありました。
@@ -74,7 +97,7 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 
 過去の修正候補・性能実験・診断版について、現役版にない独自変更を含め、distを除外し旧版から再適用検証済みの固定commitとソース差分を[旧候補の保存先と適用手順](results/retired-public-candidates-20261005.json)に保存しています。本記録は取り込み推奨ではなく、当時の実装を確認するための履歴参照用です。
 
-- [perf/symmetric-chroma-idct](https://github.com/libratechw/mpeg2toh264/tree/perf/symmetric-chroma-idct): 将来役立つ一部のコミットを後で選別・回収するためにブランチを保持（採用確定や性能改善を保証する候補ではない）。
+- 旧まとめブランチ [`perf/symmetric-chroma-idct`](https://github.com/libratechw/mpeg2toh264/commit/93c3e295f768222713bab8b75e3b67e3794dc2a0) の6commit由来のソース差分は [`results/mpeg2toh264-symmetric-chroma-idct-retired.patch`](results/mpeg2toh264-symmetric-chroma-idct-retired.patch)（manifest: [`results/retired-public-candidates-20261005.json`](results/retired-public-candidates-20261005.json)）に保存し、基点への再適用で10ファイルが旧先端と一致することを確認済みです。まとめ全体の採用・破棄ではなく選別を行い、色差AC処理のみを独立候補 [`perf/chroma-ac-raster`](https://github.com/libratechw/mpeg2toh264/tree/perf/chroma-ac-raster) へ回収し、明確な改善が見られなかったCAVLC不要マスク除去は保留としています。
 
 ---
 
