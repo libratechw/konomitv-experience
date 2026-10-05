@@ -1,0 +1,23 @@
+diff --git a/client/src/components/Watch/Watch.vue b/client/src/components/Watch/Watch.vue
+index e87d93c36fa1855bd7a74de751783f0fc9af014e..9196d226b3d46eb5c60d57cb3e4ecaa92a9c1ed9 100644
+--- a/client/src/components/Watch/Watch.vue
++++ b/client/src/components/Watch/Watch.vue
+@@ -168,9 +168,15 @@ export default defineComponent({
+                 left: calc(0px + 16px);
+             }
+         }
+-        .dplayer-mobile .dplayer-mobile-icon-wrap {
+-            opacity: 0.7 !important;
+-            visibility: visible !important;
++        // タッチ操作が前提の端末では UA 判定に依存せず中央ボタンを表示する。
++        // DPlayer の mobile クラス付与に依存しない。
++        // hover/pointer は実機の入力能力を示し、デスクトップのマウス操作は対象外のままにする。
++        // Live 時の前後シーク非表示は維持される。
++        @media (hover: none) and (pointer: coarse) {
++            .dplayer-mobile-icon-wrap {
++                opacity: 0.7 !important;
++                visibility: visible !important;
++            }
+         }
+     }
+ }

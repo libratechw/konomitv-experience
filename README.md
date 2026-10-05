@@ -74,6 +74,8 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 
 過去の修正候補・性能実験・診断版について、現役版にない独自変更を含め、distを除外し旧版から再適用検証済みの固定commitとソース差分を[旧候補の保存先と適用手順](results/retired-public-candidates-20261005.json)に保存しています。本記録は取り込み推奨ではなく、当時の実装を確認するための履歴参照用です。
 
+- [perf/symmetric-chroma-idct](https://github.com/libratechw/mpeg2toh264/tree/perf/symmetric-chroma-idct): 将来役立つ一部のコミットを後で選別・回収するためにブランチを保持（採用確定や性能改善を保証する候補ではない）。
+
 ---
 
 ## 2. dogfood統合検証（[`dogfood/integration`](https://github.com/libratechw/KonomiTV/tree/dogfood/integration)）
@@ -107,10 +109,10 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 
 ## 3. 設計再検討中の案
 
-### [KonomiTV] モバイル・タッチ端末の中央操作UI表示
-- **ブランチ / 対象commit**: [`candidate/touch-center-controls`](https://github.com/libratechw/KonomiTV/tree/candidate/touch-center-controls)（検証対象: [`45d9a59`](https://github.com/libratechw/KonomiTV/commit/45d9a59)）
-- **確認事実**: Galaxy実機（横画面・録画・中央実タップ）にて、CSSセレクタ補正により中央操作ボタンが表示されることを確認（[実機比較データ](results/galaxy-touch-center-controls-live-ab.json)）。
-- **再検討理由**: 画面タップ時にUIトグルではなく直接「再生／停止」がトリガーされる挙動が確認され、CSS補正単独では操作性が損なわれるため**単独での取り込みは非推奨**。デスクトップ／モバイルの操作イベント判定全体の再設計が必要。
+### [KonomiTV] Galaxy Tabの端末判定とタッチ操作UIの見直し
+
+- **旧CSS案の検証と取り下げ**: Galaxy実機で中央ボタンの表示自体は確認できたものの（[実機比較データ](results/galaxy-touch-center-controls-live-ab.json)）、背景タップがUI表示ではなく再生・一時停止を切り替えるため旧案は取り下げ、[旧CSS案の差分](results/konomitv-touch-center-controls-retired.patch)として保存しています。
+- **課題の再設定**: Galaxy Tabがデスクトップ扱いとなる要因やタッチUIとの不一致を調べるため、YouTube等の操作仕様も参考に判定を見直す方針として[Issue #4](https://github.com/libratechw/konomitv-experience/issues/4)を設定しました（現時点で新実装・新測定は未着手）。
 
 ---
 
@@ -129,9 +131,8 @@ KonomiTV本体および関連ライブラリ（DPlayer、mpeg2toh264）の作者
 
 ## 5. 外部ライブラリ（Starlette）切断問題の検証材料
 
-- **問題の所在**: クライアント切断後も`FileResponse`がバックグラウンドで不要な送信を継続し、シーク復帰性能を圧迫する問題。
-- **状況**: 上流PR [encode/starlette#3390](https://github.com/Kludex/starlette/pull/3390) へ[検証データを提供](https://github.com/Kludex/starlette/pull/3390#issuecomment-5548572632)。KonomiTV側の影響は [KonomiTV Issue #279](https://github.com/tsukumijima/KonomiTV/issues/279) にて報告。なお、切断対策の上流PR [encode/starlette#3523](https://github.com/Kludex/starlette/pull/3523) はマージ済み。
-- **検証コード**: [`codex/fix-file-response-disconnect`](https://github.com/libratechw/starlette/commit/17e3955f997c2f271a08057fe649abadcc482f77)（固定commit: [`17e3955`](https://github.com/libratechw/starlette/commit/17e3955f997c2f271a08057fe649abadcc482f77)、差分: [results/starlette-file-response-disconnect.patch](results/starlette-file-response-disconnect.patch)）は検証用材料として保持し、独自PRとしては提出しません。
+- **問題と上流の状況**: クライアント切断後もFileResponseが送信を継続する問題について、[上流PR #3390](https://github.com/Kludex/starlette/pull/3390)へ[検証データの提供](https://github.com/Kludex/starlette/pull/3390#issuecomment-5548572632)を行い、影響を[KonomiTV Issue #279](https://github.com/tsukumijima/KonomiTV/issues/279)で報告しました。切断対策の[上流PR #3523](https://github.com/Kludex/starlette/pull/3523)はマージ済みです。
+- **検証記録の保存**: 上流対応の完了に伴い独自forkの検証は終了し、過去の内容を[保存ソース差分](results/starlette-file-response-disconnect.patch)および[基点と適用手順](results/retired-public-branches-20261005.json)として保存しています（稼働中KonomiTVでの依存適用状況や、すべてのシーク問題の解消を示すものではありません）。
 
 ---
 

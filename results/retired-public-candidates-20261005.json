@@ -3,6 +3,7 @@
   "date": "2026-10-05",
   "purpose": "Historical candidate, experiment and diagnostic source preservation; not an adoption recommendation or a claim that all changes were merged.",
   "source_license": "Original repository licenses remain applicable (MIT or BSD-3-Clause); attribution is preserved. Starlette entries link to the included BSD license notice.",
+  "retired_repository_replay": "For Starlette, repository identifies the official replay base and historical_repository identifies the retired fork. recorded_tip is a historical fork tip, not an upstream commit; restore its source by applying the preserved patch.",
   "patch_format": "git diff --binary --full-index",
   "excluded_paths": [
     "dist/**",
@@ -128,7 +129,7 @@
           "archive_entry": "diagnostic/ios-lifecycle-trace"
         },
         {
-          "repository": "https://github.com/libratechw/starlette",
+          "historical_repository": "libratechw/starlette",
           "commit": "17e3955f997c2f271a08057fe649abadcc482f77",
           "archive_manifest": "retired-public-branches-20261005.json",
           "archive_entry": "codex/fix-file-response-disconnect"
@@ -177,49 +178,66 @@
       "historical_note": "A v1 backport mirror with the same tip as monyone/aribb24.js backport/v1 at cleanup. It has no independent fork changes; the source delta is preserved for restoration. The upstream backport branch is not removed."
     },
     {
-      "repository": "https://github.com/libratechw/starlette",
+      "repository": "https://github.com/Kludex/starlette",
+      "historical_repository": "libratechw/starlette",
+      "repository_retired": true,
       "retired_branch": "add-early-hints",
       "base_commit": "4f250d6b814587e20c5365f0a5f0c4d42bcb929f",
-      "base_url": "https://github.com/libratechw/starlette/commit/4f250d6b814587e20c5365f0a5f0c4d42bcb929f",
+      "base_url": "https://github.com/Kludex/starlette/commit/4f250d6b814587e20c5365f0a5f0c4d42bcb929f",
       "recorded_tip": "9e0b0bd02af5ca09b5c37505541678a79aafbfa3",
-      "tip_url": "https://github.com/libratechw/starlette/commit/9e0b0bd02af5ca09b5c37505541678a79aafbfa3",
       "source_patch": "starlette-early-hints-retired.patch",
       "source_patch_sha256": "df9b9dda3a36f31cea3d9b3c3705303de983ce64625fa8c6e6ae93eeb0a5b418",
       "source_license": "BSD-3-Clause",
-      "source_license_url": "https://github.com/libratechw/starlette/blob/9e0b0bd02af5ca09b5c37505541678a79aafbfa3/LICENSE.md",
+      "source_license_url": "https://github.com/Kludex/starlette/blob/4f250d6b814587e20c5365f0a5f0c4d42bcb929f/LICENSE.md",
       "source_license_file": "starlette-retired-source-LICENSE.md",
-      "current_reference_url": "https://github.com/libratechw/starlette/commit/39fd0ffac25593fce39466320c9a666957ce8b8c",
+      "current_reference_url": "https://github.com/Kludex/starlette",
       "historical_note": "An old Early Hints proposal with its source, tests and documentation. The full source delta is preserved, not claimed to be merged, validated for adoption or used by the current playback deployment."
     },
     {
-      "repository": "https://github.com/libratechw/starlette",
+      "repository": "https://github.com/Kludex/starlette",
+      "historical_repository": "libratechw/starlette",
+      "repository_retired": true,
       "retired_branch": "codex/add-opentelemetry-header-capture",
       "base_commit": "e4bd5981540ee0003deaae69d7f4881f11714b96",
-      "base_url": "https://github.com/libratechw/starlette/commit/e4bd5981540ee0003deaae69d7f4881f11714b96",
+      "base_url": "https://github.com/Kludex/starlette/commit/e4bd5981540ee0003deaae69d7f4881f11714b96",
       "recorded_tip": "a47fdaa565b6da4246647198e0b56abbc16d26ae",
-      "tip_url": "https://github.com/libratechw/starlette/commit/a47fdaa565b6da4246647198e0b56abbc16d26ae",
       "source_patch": "starlette-opentelemetry-header-capture-retired.patch",
       "source_patch_sha256": "311d16ee70fc2350754461490bfa535c5eb7c0a753d8f906244b4a3c47447792",
       "source_license": "BSD-3-Clause",
-      "source_license_url": "https://github.com/libratechw/starlette/blob/a47fdaa565b6da4246647198e0b56abbc16d26ae/LICENSE.md",
+      "source_license_url": "https://github.com/Kludex/starlette/blob/e4bd5981540ee0003deaae69d7f4881f11714b96/LICENSE.md",
       "source_license_file": "starlette-retired-source-LICENSE.md",
-      "current_reference_url": "https://github.com/libratechw/starlette/commit/39fd0ffac25593fce39466320c9a666957ce8b8c",
+      "current_reference_url": "https://github.com/Kludex/starlette",
       "historical_note": "An old OpenTelemetry header-capture proposal with its source, tests and documentation. The full source delta is preserved, not claimed to be merged, validated for adoption or used by the current playback deployment."
     },
     {
-      "repository": "https://github.com/libratechw/starlette",
+      "repository": "https://github.com/Kludex/starlette",
+      "historical_repository": "libratechw/starlette",
+      "repository_retired": true,
       "retired_branch": "codex/stream-testclient-responses",
       "base_commit": "e4bd5981540ee0003deaae69d7f4881f11714b96",
-      "base_url": "https://github.com/libratechw/starlette/commit/e4bd5981540ee0003deaae69d7f4881f11714b96",
+      "base_url": "https://github.com/Kludex/starlette/commit/e4bd5981540ee0003deaae69d7f4881f11714b96",
       "recorded_tip": "a728ef11f10653cc59ede2890091424bc4808786",
-      "tip_url": "https://github.com/libratechw/starlette/commit/a728ef11f10653cc59ede2890091424bc4808786",
       "source_patch": "starlette-stream-testclient-responses-retired.patch",
       "source_patch_sha256": "036d5b8e7eeb066deb8d68bd53c0fac6d28fea5839c108da0b13ff7873fac8ca",
       "source_license": "BSD-3-Clause",
-      "source_license_url": "https://github.com/libratechw/starlette/blob/a728ef11f10653cc59ede2890091424bc4808786/LICENSE.md",
+      "source_license_url": "https://github.com/Kludex/starlette/blob/e4bd5981540ee0003deaae69d7f4881f11714b96/LICENSE.md",
       "source_license_file": "starlette-retired-source-LICENSE.md",
-      "current_reference_url": "https://github.com/libratechw/starlette/commit/39fd0ffac25593fce39466320c9a666957ce8b8c",
+      "current_reference_url": "https://github.com/Kludex/starlette",
       "historical_note": "An old streaming TestClient proposal with its source and tests. The full source delta is preserved, not claimed to be merged, validated for adoption or used by the current playback deployment."
+    },
+    {
+      "repository": "https://github.com/libratechw/KonomiTV",
+      "retired_branch": "candidate/touch-center-controls",
+      "base_commit": "cc9f340cde56f9e1343dc212600a78b607a47bd8",
+      "base_url": "https://github.com/libratechw/KonomiTV/commit/cc9f340cde56f9e1343dc212600a78b607a47bd8",
+      "recorded_tip": "45d9a5910fda21702b7df9982373d01295a1a523",
+      "tip_url": "https://github.com/libratechw/KonomiTV/commit/45d9a5910fda21702b7df9982373d01295a1a523",
+      "source_patch": "konomitv-touch-center-controls-retired.patch",
+      "source_patch_sha256": "9e3e730253cdab53d9cde0288b33ecaa2d8e7dd949ea3ef7a0a0c7c60ace4e63",
+      "source_license": "MIT",
+      "source_license_url": "https://github.com/libratechw/KonomiTV/blob/45d9a5910fda21702b7df9982373d01295a1a523/License.txt",
+      "current_reference_url": "https://github.com/libratechw/konomitv-experience/issues/4",
+      "historical_note": "The CSS-only center-control proposal is withdrawn. Button visibility was verified, not correct background-tap behavior. Issue #4 now tracks Galaxy Tab desktop classification and touch UI, using YouTube and other implementations as references; no replacement implementation is claimed."
     }
   ]
 }

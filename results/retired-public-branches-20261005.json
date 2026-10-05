@@ -47,12 +47,19 @@
       "source_patch_sha256": "2c96245147e86b7cc9e23fe46fcef6a9a1dc09b6eadca9286467fc488ac5eb49"
     },
     {
-      "repository": "https://github.com/libratechw/starlette",
+      "repository": "https://github.com/Kludex/starlette",
+      "historical_repository": "libratechw/starlette",
+      "repository_retired": true,
       "retired_branch": "codex/fix-file-response-disconnect",
       "base_commit": "75735e144dca0551c2ff7eba3582355cda42da92",
       "recorded_tip": "17e3955f997c2f271a08057fe649abadcc482f77",
       "source_patch": "starlette-file-response-disconnect.patch",
-      "source_patch_sha256": "814de17ebb92b55d1e65b726c9a082a1a8bb201fa80b464e6f2b03cf0c342fdb"
+      "source_patch_sha256": "814de17ebb92b55d1e65b726c9a082a1a8bb201fa80b464e6f2b03cf0c342fdb",
+      "source_license": "BSD-3-Clause",
+      "source_license_url": "https://github.com/Kludex/starlette/blob/75735e144dca0551c2ff7eba3582355cda42da92/LICENSE.md",
+      "source_license_file": "starlette-retired-source-LICENSE.md",
+      "current_reference_url": "https://github.com/Kludex/starlette/pull/3523",
+      "historical_note": "The independent fork is retired after upstream merged its disconnect fix. Replay this historical comparison patch on the official base; recorded_tip belongs to the retired fork, not the upstream repository. No claim is made that the current KonomiTV deployment uses the upstream fix or that this patch is identical to it."
     }
   ]
 }
