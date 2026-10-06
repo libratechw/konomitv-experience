@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-06",
+  "scope": "Repaired caption-v2 candidates. No playback backend, MPEG conversion, film, VCE or normal deployment changes.",
+  "historicalPublicationEvidence": "caption-v2-publication-20261006.json",
+  "adoptionOrder": ["aribb24.js", "DPlayer", "KonomiTV"],
+  "repositories": {
+    "aribb24": {
+      "repository": "https://github.com/libratechw/aribb24.js",
+      "upstreamBase": "188741850ecdadbf2c6db635eaee1313ee0a2a84",
+      "sourceBranch": "candidate/caption-v2",
+      "sourceCommit": "3040a7fedab608ffb6ce210a1fe94ab071ba054d",
+      "sourceCommitCount": 7,
+      "distributionBranch": "distribution/caption-v2",
+      "distributionCommit": "0dfd384f6d18031627d467a578fb8b9e2885c00a",
+      "distributionDelta": "One generated-distribution commit after the source candidate. Source and build configuration are unchanged.",
+      "sourceComparison": "https://github.com/libratechw/aribb24.js/compare/188741850ecdadbf2c6db635eaee1313ee0a2a84...3040a7fedab608ffb6ce210a1fe94ab071ba054d",
+      "builtModuleSha256": "af86b6dfb0a7fe5dd551cb7b74dd90a6b08773a98d67d2afc5cfbd9316ea1719",
+      "sourceCommitPurposes": [
+        "Expose rendered caption text",
+        "Resolve uppercase DRCS replacement keys",
+        "Preserve caption state across buffered seeks, with inclusive range queries and packet deduplication in the same commit",
+        "Retain native HLS captions across track updates",
+        "Release renderer images and report Worker failures",
+        "Prune history outside retained video buffers",
+        "Repaint complete caption pictures after renderer changes"
+      ]
+    },
+    "dplayer": {
+      "repository": "https://github.com/libratechw/DPlayer",
+      "upstreamBase": "cdf2222ec007372910367c23ee81428893623585",
+      "branch": "candidate/caption-v2",
+      "sourceCommit": "b1160345f1629f2e3784a4f0af62637dbe716d1d",
+      "candidateCommit": "b9ad7fc1035510f91c9befc747664a984e957325",
+      "aribb24Dependency": "0dfd384f6d18031627d467a578fb8b9e2885c00a",
+      "commitLayout": "Caption migration, regressions and migration guide, followed by a distribution-only commit",
+      "migrationGuide": "https://github.com/libratechw/DPlayer/blob/b9ad7fc1035510f91c9befc747664a984e957325/docs/guide.md#arib-captions",
+      "builtJavaScriptSha256": "10132b0a45b2a14ab6b9cfa70f228cb058dc6d01ee001a3ab89c3edb48e4f7af"
+    },
+    "konomitv": {
+      "repository": "https://github.com/libratechw/KonomiTV",
+      "upstreamBase": "079f0dbe14bb9e44e8944ad44be744d5a1018597",
+      "branch": "candidate/caption-v2",
+      "sourceCommit": "f24903b05b551a2674cd11bd633c47a60f2d5d03",
+      "candidateCommit": "7fe02790d0361d43f23ff7f769e0aa29c054e0b0",
+      "dplayerDependency": "b9ad7fc1035510f91c9befc747664a984e957325",
+      "commitLayout": "Caption settings and capture integration, followed by a distribution-only commit",
+      "dplayerBaseNote": "The DPlayer base also contains the existing post-v1.33.2 danmaku font-size fix from PR #81",
+      "unchangedPlaybackDependencies": {
+        "mpeg2toh264": "69f2a47aa5bbeb8ffce57ecf5408eaa85a59d7d1",
+        "mpegts.js": "bf4e49d0ff004cf7546237393a62c66e4b926dca"
+      },
+      "playerControllerAsset": "PlayerController-DwnkBFui.js",
+      "playerControllerSha256": "6536ad2e485550deb0dcaa327cec2c89ad9e8cfcfdd581fd29259f2d6bd453a2",
+      "indexHtmlSha256": "72e6fd33ef7436c0cf232e0382bb52c3e158fd99ad30b4fa58924137c1e588d6"
+    }
+  },
+  "contracts": {
+    "seekReplay": "Same-group management retransmissions do not create a new caption-picture boundary",
+    "pictureOwner": "aribb24.js Controller; SBTVD replacement clears every renderer, including the DPlayer snapshot observer",
+    "bufferEviction": "Release obsolete packets and images before the earliest retained video range, preserving the full active picture and its management context. Unknown boundaries are not replaced with a fixed-size cap",
+    "delayedCues": "Reconcile late-inserted past cues, hidden playback and PTS/DTS page boundaries without restoring captions from an excluded video range",
+    "snapshot": "The recipient owns and closes returned ImageBitmaps",
+    "captureFailure": "Report failed caption/superimpose snapshots and save valid video with any remaining valid layers. Video acquisition failure remains fatal",
+    "workerFailure": "Report a failed Worker and restore main-thread rendering with caption visibility and current-picture state preserved",
+    "gitCacheIdentity": "Full-SHA git+https specifications and matching locks distinguish Git commits even when package versions are unchanged",
+    "upstreamAdoption": "The aribb24 source branch excludes generated dist. Adopt dependencies in order, then pin each upstream-maintained release or SHA; distribution is a fork-only Git-consumption artifact"
+  },
+  "verification": {
+    "aribb24": {
+      "nodeVersion": "24.19.0",
+      "unitAndIntegration": {"files": 20, "passed": 769, "failed": 0},
+      "eachSourceCommit": "All 7 source trees passed their then-current tests and tsc. Reworded publication commits have identical trees at every step",
+      "chromeTargetedTests": {"files": 3, "passed": 5, "failed": 0, "scope": "Worker bitmap transfer, malformed cue recovery, resize-send failure, replaced bitmap and main-thread Canvas renderer"},
+      "builtDistribution": {"files": 407, "byteIdenticalToSeparateSourceBuild": 407},
+      "knownUnrelatedFailure": "One SVG flashing snapshot differs on both the candidate and the same-environment upstream base; full browser-suite success is not claimed"
+    },
+    "dplayer": {
+      "nodeVersion": "24.19.0",
+      "testsPassed": 18,
+      "eslint": true,
+      "typeCheck": true,
+      "build": true,
+      "publicGitDependencyInstall": true,
+      "publicSourceRebuild": true,
+      "distributionComparison": {
+        "files": 54,
+        "byteIdentical": 53,
+        "exception": "DPlayer.min.js.map has two absolute template source paths. All other source-map content, runtime JS and declarations match exactly"
+      }
+    },
+    "konomitv": {
+      "nodeVersion": "20.19.5",
+      "yarnVersion": "1.22.22",
+      "captureTestsPassed": 10,
+      "changedSourceFilesLint": true,
+      "fullProjectYarnLint": true,
+      "lintChangedSourceFiles": false,
+      "vueTypeCheck": true,
+      "build": true,
+      "sameVersionOldCacheRetained": true,
+      "installedDependenciesMatchNewDistribution": true,
+      "publicGitDependencyInstall": true,
+      "publicSourceRebuild": true,
+      "distributionComparison": {
+        "files": 236,
+        "byteIdentical": 235,
+        "exception": "sw.js differs only in ordering of the same 234 precache URL/revision entries; all remaining code matches exactly"
+      }
+    }
+  },
+  "independentReview": {
+    "model": "Claude Opus 5.5",
+    "capability": "agent-route critical",
+    "firstAttempt": "att_a960d4f1eaee9c43",
+    "firstReviewAction": "Combined inclusive-range changes with deduplication, split retention from presentation replay, localized failure notices, retained existing comments and declared the dependency-base change",
+    "finalAttempt": "att_86d008ce4202b082",
+    "reviewedAribb24Source": "aad9b65abf138b27e61ccfd1e9225f2e281405fb",
+    "reviewedDplayerSource": "78ab10e202d63f711c3d0fd3953484806105d9e1",
+    "reviewedKonomitvSource": "0dc7589775f79036fd8ca0d8f5503ba32fd7d431",
+    "finalVerdict": "aribb24.js and DPlayer allowed as fork candidates; KonomiTV publication conditional on current-pin lint, typecheck, build and distribution verification",
+    "publicationDelta": "TextRenderer extraction behavior declared in the commit body; an unchanged CaptureManager comment restored; dependency SHAs and generated artifacts updated. No additional runtime change",
+    "conditionsVerifiedByMaintainer": "Current public dependency pins were installed before KonomiTV publication; yarn lint made no changes; typecheck, capture tests and build passed. Final distribution parents and hashes are recorded; Worker and bitmap browser tests passed"
+  },
+  "notConfirmed": [
+    "All-platform viewing acceptance of the repaired source candidates",
+    "Current-candidate audible audio, physical A/V synchronization and long-duration viewing",
+    "Bitmap decode concurrent with seek, detach and destroy in a real browser",
+    "Document PiP caption and built-in-sound continuation while the main tab is hidden; reviewer raised a possible rAF dependency risk, not a reproduced failure"
+  ],
+  "publication": {
+    "samePublicBranchNames": true,
+    "forkBranchesReplaced": true,
+    "remoteHeadsMatched": true,
+    "newPublicArchiveTagsCreated": false,
+    "upstreamPrCreated": false,
+    "upstreamPushed": false,
+    "normalDeploymentChanged": false
+  }
+}

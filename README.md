@@ -33,15 +33,15 @@ iPad AirのSafari環境において字幕の出入りで映像が引っ掛かる
 
 依存関係の順序（aribb24.js → DPlayer → KonomiTV）に沿った各変更候補は以下のとおりです。
 
-- **aribb24.js**: 同時刻字幕、seek時の再描画（再描画の責務はaribb24.jsのControllerが所有）、Native HLS、Worker障害、画像解放を修正したソース候補 [candidate/caption-v2](https://github.com/libratechw/aribb24.js/tree/candidate/caption-v2)（[9046f6e](https://github.com/libratechw/aribb24.js/commit/9046f6eb980bd02ac4f6bb5579d89cbda8277529)）です。Git依存用のビルド済みファイルは別のブランチ [distribution/caption-v2](https://github.com/libratechw/aribb24.js/tree/distribution/caption-v2)（[5752f29](https://github.com/libratechw/aribb24.js/commit/5752f2938e21563e870904be215eed5704c7bd28)）で管理しています。
+- **aribb24.js**: 同時刻字幕、seek時の再描画（再描画の責務はaribb24.jsのControllerが所有）、Native HLS、Worker障害、画像解放を修正したソース候補 [candidate/caption-v2](https://github.com/libratechw/aribb24.js/tree/candidate/caption-v2)（[3040a7f](https://github.com/libratechw/aribb24.js/commit/3040a7fedab608ffb6ce210a1fe94ab071ba054d)）です。Git依存用のビルド済みファイルは別のブランチ [distribution/caption-v2](https://github.com/libratechw/aribb24.js/tree/distribution/caption-v2)（[0dfd384](https://github.com/libratechw/aribb24.js/commit/0dfd384f6d18031627d467a578fb8b9e2885c00a)）で管理しています。同グループ管理再送後のシーク復元、過去へ遅延した字幕の復元、上書き字幕の履歴管理、古いバッファ履歴のメモリ解放を修正しています。
 
-- **DPlayer**: v2 Controller/Feeder/Rendererと各再生バックエンドの接続、Worker障害時の通知付きmain復旧、snapshotに対応した [candidate/caption-v2](https://github.com/libratechw/DPlayer/tree/candidate/caption-v2)（[b26d4b5](https://github.com/libratechw/DPlayer/commit/b26d4b5ff33cf3327d6074d896544c71666cf6a8)）です。旧flat設定や`getRawCanvas`等からの移行は [移行ガイド](https://github.com/libratechw/DPlayer/blob/b26d4b5ff33cf3327d6074d896544c71666cf6a8/docs/guide.md#arib-captions) を参照してください。
+- **DPlayer**: v2 Controller/Feeder/Rendererと各再生バックエンドの接続、Worker障害時の通知付きmain復旧、snapshotに対応した [candidate/caption-v2](https://github.com/libratechw/DPlayer/tree/candidate/caption-v2)（[b9ad7fc](https://github.com/libratechw/DPlayer/commit/b9ad7fc1035510f91c9befc747664a984e957325)）です。旧flat設定や`getRawCanvas`等からの移行は [移行ガイド](https://github.com/libratechw/DPlayer/blob/b9ad7fc1035510f91c9befc747664a984e957325/docs/guide.md#arib-captions) を参照してください。
 
-- **KonomiTV**: v2設定と字幕付きキャプチャに対応した [candidate/caption-v2](https://github.com/libratechw/KonomiTV/tree/candidate/caption-v2)（[1434651](https://github.com/libratechw/KonomiTV/commit/14346515d9d2a3faa0e7ce03cecf7130819f33ff)）です。
+- **KonomiTV**: v2設定と字幕付きキャプチャに対応した [candidate/caption-v2](https://github.com/libratechw/KonomiTV/tree/candidate/caption-v2)（[7fe0279](https://github.com/libratechw/KonomiTV/commit/7fe02790d0361d43f23ff7f769e0aa29c054e0b0)）です。キャプチャ処理時、字幕または文字スーパーのsnapshot取得に失敗した場合はユーザーへ通知を行いつつ、正常に取得できた映像や字幕レイヤーのみを用いて画像保存を継続します（映像自体の取得に失敗した場合は従来通りキャプチャ失敗として扱います）。
 
 Webフォントを使う設定はmain描画を維持します。字形はv2標準、DRCSは既存の置換表を維持し、矢印や絵文字の独自補正は行っていません。
 
-- **検証結果**: aribb24.js単体・統合754件、関連browser5件、DPlayer16件のテスト通過、型検査・ビルド、公開Git依存の新規インストールを確認済みです（SVG snapshotは同条件の基点でも1件不一致）。詳細は [検証結果](results/caption-v2-publication-20261006.json) を参照してください。
+- **検証結果**: aribb24.js単体・統合769件、Chromeの対象5件、DPlayer18件、KonomiTVのキャプチャ関連10件のテスト通過、型検査・ビルド、別ディレクトリでの配布物の再現性を確認済みです（SVG snapshotは同条件の基点でも1件不一致）。詳細は [検証結果](results/caption-v2-review-fixes-publication-20261006.json) を参照してください。
 
 - **実機確認**: 先行候補にてiPad Air録画2素材各3分の字幕切り替え、Original/1080p/1080p60での字幕付きJPEGを確認し、本人視聴で引っ掛かり解消を確認しました。最新公式基点への更新版による全端末目視・音声/A-V・長時間は未確認です。
 
